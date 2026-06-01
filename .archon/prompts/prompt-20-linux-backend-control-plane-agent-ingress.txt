@@ -1,0 +1,49 @@
+# Prompt 20 - Backend Linux com control-plane e agent ingress
+
+Objetivo:
+Consolidar o backend local Linux com as novidades do GitHub relacionadas a local agent ingress, dual local backend roles, control-plane routing, shared camera admission e desktop settings integration.
+
+Contexto obrigatorio:
+- Leia `.archon/plans/relatorio-fase19-build-pos-sync-github.md`.
+- Inspecione os arquivos integrados do GitHub, especialmente:
+  - `DrakonSite/src/worker/localAgentIngress.ts`
+  - `DrakonSite/src/worker/cameraResourceAdmission.ts`
+  - `DrakonSite/src/worker/sharedCameraAccess.ts`
+  - `DrakonSite/src/worker/workspaceLocalState.ts`
+  - `DrakonSite/src/worker/workspaceRelayClient.ts`
+  - `DrakonSite/src/worker/workspaceRelayState.ts`
+  - `AppHost/Runtime/desktop-local-server.mjs`
+  - `DrakonSite/server/index.ts`
+
+Restricoes:
+- Nao fazer push.
+- Nao colocar WinUI/WebView2 dentro da UI React comum.
+- Nao duplicar dois backends locais divergentes. O Linux deve usar o mesmo worker/backend web compartilhado.
+- Segredos/tokens nunca podem aparecer em logs, health, eventos ou relatorios.
+
+Tarefas:
+1. Mapear todas as rotas locais novas do GitHub que dependem do AppHost/Windows.
+2. Criar/adaptar handlers multiplataforma para o host Linux quando a funcionalidade for de backend/worker, nao de UI WinUI.
+3. Garantir que o Linux local backend suporte:
+   - sessao local/provisionamento;
+   - status do agente;
+   - ingress local do agente;
+   - camera resource admission;
+   - shared camera access quando aplicavel;
+   - workspace relay/local state quando aplicavel;
+   - health e diagnostico sem segredos.
+4. Adicionar testes focados para as rotas locais, usando SQLite temporario e dados sinteticos.
+5. Atualizar staging do backend Linux para incluir novos arquivos/modulos necessarios.
+
+Validacao obrigatoria:
+```bash
+cd DrakonSite && npm run test:local-sqlite-bootstrap
+cd DrakonSite && npm run build
+cd Perceptrum && cmake --build out/build/linux-debug -j$(nproc)
+./Perceptrum/linux-desktop/run-linux-dev.sh --check-backend --print-web-root --no-open
+curl -fsS http://127.0.0.1:4000/__perceptrum/health
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase20-linux-backend-control-plane-agent-ingress.md`.
+- O relatorio deve listar as rotas suportadas no Linux, rotas ainda Windows-only e justificativa tecnica.

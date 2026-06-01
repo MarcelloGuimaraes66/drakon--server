@@ -1,0 +1,50 @@
+# Prompt 17 - Preservar trabalho local e preparar sync com GitHub
+
+Objetivo:
+Tornar o estado atual 100% recuperavel antes de baixar/mesclar novidades do GitHub. Este prompt NAO deve resolver a integracao ainda; ele deve criar backups, inventario e um plano de merge seguro.
+
+Contexto obrigatorio:
+- Leia `.archon/plans/auditoria-linux-github-recursos.md`.
+- Leia os relatorios das fases 9 a 16 em `.archon/plans/`.
+- O checkout local esta atras de `origin/main` e contem mudancas nao commitadas da porta Linux.
+
+Restricoes:
+- Nao fazer push.
+- Nao rodar `git reset --hard`, `git clean`, `git checkout --`, `git restore` destrutivo ou comandos equivalentes.
+- Nao apagar dados de usuario, banco SQLite, caches ou secrets.
+- Nao sobrescrever nenhum arquivo local sem backup verificavel.
+- Nao instalar pacotes do sistema neste prompt.
+
+Tarefas:
+1. Rodar `git fetch --prune origin`.
+2. Criar um diretorio de backup em `.archon/backups/<timestamp>-pre-origin-main-sync/`.
+3. Salvar nesse diretorio:
+   - `git-status.txt` com `git status --short --branch`.
+   - `local-head.txt` com `git rev-parse HEAD` e `git log --oneline -n 20`.
+   - `remote-head.txt` com `git rev-parse origin/main` e `git log --oneline HEAD..origin/main`.
+   - `tracked.diff` com `git diff --binary`.
+   - `staged.diff` com `git diff --cached --binary`.
+   - `untracked-files.txt` com todos os untracked relevantes.
+   - `diff-vs-origin-main.txt` com `git diff --stat origin/main -- .` e lista de arquivos.
+   - `remote-files-ausentes-localmente.txt` com arquivos funcionais existentes em `origin/main` e ausentes no `HEAD` local.
+4. Criar um tar dos untracked relevantes, excluindo `.git`, `node_modules`, `dist`, `out`, `.visual-chrome-profile`, `visual-artifacts` e caches grandes.
+5. Criar uma branch/ref local de seguranca apontando para o `HEAD` atual, por exemplo:
+   - `archon/backup-before-origin-main-sync-<timestamp>`
+6. Verificar se os arquivos de backup foram criados e tem tamanho maior que zero quando aplicavel.
+7. Produzir um plano de conflitos provaveis por area:
+   - AppHost/Runtime e backend local.
+   - DrakonSite worker/backend SQLite/local runtime.
+   - UI React/Fluent.
+   - Perceptrum C++ AgentCore/Camera/Jobs.
+   - Linux host, CMake, packaging.
+
+Validacao obrigatoria:
+```bash
+git status --short --branch
+git log --oneline HEAD..origin/main
+find .archon/backups -maxdepth 2 -type f | sort | tail -n 80
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase17-preservacao-sync-github.md`.
+- O relatorio deve indicar exatamente onde esta o backup, qual e o HEAD local, qual e o `origin/main`, e se e seguro executar o Prompt 18.

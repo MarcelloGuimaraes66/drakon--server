@@ -1,0 +1,1493 @@
+import { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { useLocation, useNavigate } from "react-router";
+import { useTranslation } from "react-i18next";
+import Layout from "@/react-app/components/Layout";
+import ChatInput from "@/react-app/components/ChatInput";
+import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
+import AssistantMessage from "@/react-app/components/AssistantMessage";
+import UploadedVideoAttachment from "@/react-app/components/UploadedVideoAttachment";
+import ChatCameraRegistrationCard from "@/react-app/components/ChatCameraRegistrationCard";
+import ChatCameraBatchRegistrationCard from "@/react-app/components/ChatCameraBatchRegistrationCard";
+import ChatCameraBatchEditCard from "@/react-app/components/ChatCameraBatchEditCard";
+import ChatCameraEditCard from "@/react-app/components/ChatCameraEditCard";
+import ChatCameraAgentCard from "@/react-app/components/ChatCameraAgentCard";
+import ChatCameraAgentCreatedCard from "@/react-app/components/ChatCameraAgentCreatedCard";
+import ChatCameraAgentEditContextCard from "@/react-app/components/ChatCameraAgentEditContextCard";
+import ChatCameraAgentUpdatedCard from "@/react-app/components/ChatCameraAgentUpdatedCard";
+import ChatCameraDiscoveryCard from "@/react-app/components/ChatCameraDiscoveryCard";
+import ChatJobCreatedCard from "@/react-app/components/ChatJobCreatedCard";
+import ChatIdentityCardsPanel from "@/react-app/components/ChatIdentityCardsPanel";
+import ChatReportDocumentCard from "@/react-app/components/ChatReportDocumentCard";
+import CameraEditorModal, { type CameraEditorCamera } from "@/react-app/components/CameraEditorModal";
+import CameraCustomAgentEditorModal, {
+  type CameraAgentEditorTarget,
+  type CameraCustomAgentRow,
+  type ToastVariant,
+} from "@/react-app/components/CameraCustomAgentEditorModal";
+import MessageCopyButton from "@/react-app/components/MessageCopyButton";
+import Toast from "@/react-app/components/Toast";
+import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
+import PendingAssistantMessage from "@/react-app/components/PendingAssistantMessage";
+import CameraEventToast from "@/react-app/components/CameraEventToast";
+import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
+import { useOnboarding } from "@/react-app/hooks/useOnboarding";
+import {
+  PERCEPTRUM_CHAT_TRIAL_EXPIRED_ERROR,
+  usePerceptrumChatSession,
+} from "@/react-app/hooks/usePerceptrumChatSession";
+import { useCameraEvents } from "@/react-app/hooks/useCameraEvents";
+import {
+  buildOnboardingChatCameraStatusPrompt,
+  ONBOARDING_CHAT_PREFILL_EVENT,
+} from "@/react-app/lib/onboardingChat";
+import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
+import { ChatMessage, ChatSession, type UploadedVideoAttachment as UploadedVideoAttachmentData } from "@/shared/types";
+import { brand, getBrandStorageKey } from "@/shared/brand";
+import { AlertCircle, Bot, User, Plus, Edit2, Check, X, Trash2 } from "lucide-react";
+import {
+  type CameraAgentFormRequestMessageMetadata,
+  type CameraEditFormRequestMessageMetadata,
+  extractCameraAgentCreationResultFromMessage,
+  extractCameraAgentEditContextFromMessage,
+  extractIdentityCardsFromMessage,
+  extractHitMediaFromMessage,
+  extractCameraAgentFormRequestFromMessage,
+  extractCameraAgentUpdateResultFromMessage,
+  extractCameraEditFormRequestFromMessage,
+  extractCameraNetworkScanFromMessage,
+  extractCameraBatchEditDraftFromMessage,
+  extractCameraBatchRegistrationDraftFromMessage,
+  extractCameraRegistrationDraftFromMessage,
+  extractJobCreationResultFromMessage,
+  extractReportDocumentFromMessage,
+  extractUploadedVideoAttachmentFromMessage,
+  applyCameraEditDraftToCamera,
+  buildCameraAgentDraftForEditor,
+  extractChatProgressFromMessage,
+  formatMessageContent,
+} from "@/react-app/utils/chatUtils";
+import {
+  getCoreModelNoticeCopy,
+  shouldShowCoreModelNotice,
+} from "@/react-app/utils/coreModelNotice";
+import { CHAT_ASSISTANT_BADGE_CLASS } from "@/react-app/lib/chatAssistantStyles";
+
+type ChatModelTier = "ultra" | "ultra_plus" | "light" | "core";
+type ChatHeaderDropdown = "model" | null;
+const DEFAULT_CHAT_MODEL_TIER: ChatModelTier = "ultra";
+const DEFAULT_CHAT_CORE_RUNNING_RESOLUTION = 640;
+const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
+const CHAT_PLEXUS_BACKGROUND_ENABLED = true;
+const CHAT_VISUAL_TYPING_ENABLED = true;
+const CHAT_VISUAL_TYPING_MESSAGE_TYPES = new Set(["final", "router_ack"]);
+const CHAT_PAGE_TEXTAREA_ID = "chat-page-message-input";
+
+function normalizeChatModelTier(value: string | null | undefined): ChatModelTier {
+  if (typeof value !== "string") return DEFAULT_CHAT_MODEL_TIER;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "ultra+" || normalized === "ultra-plus" || normalized === "ultra_plus") {
+    return "ultra_plus";
+  }
+  if (normalized === "core") return "core";
+  if (normalized === "light") return "light";
+  return "ultra";
+}
+
+function getAssistantRevealId(message: ChatMessage): string {
+  return [
+    message.id,
+    message.message_type || "",
+    message.updated_at || "",
+    message.content.length,
+  ].join(":");
+}
+
+function normalizeOnboardingPromptText(value: string | null | undefined): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.trim().replace(/\s+/g, " ");
+}
+
+export default function Chat() {
+  const { t, i18n } = useTranslation();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const { cameras: dashboardCameras } = useDashboardSummary();
+  const {
+    isOpen: isOnboardingOpen,
+    currentStepId: onboardingStepId,
+    tutorialCameraId,
+    tutorialCameraName,
+    next: advanceOnboarding,
+  } = useOnboarding();
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [editingSessionId, setEditingSessionId] = useState<number | null>(null);
+  const [editingTitle, setEditingTitle] = useState("");
+  const [deletingSessionId, setDeletingSessionId] = useState<number | null>(null);
+  const [isCreatingSession, setIsCreatingSession] = useState(false);
+  const [uploadedImage, setUploadedImage] = useState<string | null>(null);
+  const [uploadedVideo, setUploadedVideo] = useState<UploadedVideoAttachmentData | null>(null);
+  const [modelTier, setModelTier] = useState<ChatModelTier>(DEFAULT_CHAT_MODEL_TIER);
+  const [toast, setToast] = useState<{
+    message: string;
+    type: "success" | "error" | "warning" | "info";
+  } | null>(null);
+  const [chatEditModalCamera, setChatEditModalCamera] = useState<CameraEditorCamera | null>(null);
+  const [isChatEditModalOpen, setIsChatEditModalOpen] = useState(false);
+  const [chatAgentModalTarget, setChatAgentModalTarget] = useState<CameraAgentEditorTarget | null>(null);
+  const [chatAgentModalInitialAgent, setChatAgentModalInitialAgent] = useState<CameraCustomAgentRow | null>(null);
+  const [isChatAgentModalOpen, setIsChatAgentModalOpen] = useState(false);
+  const [openHeaderDropdown, setOpenHeaderDropdown] = useState<ChatHeaderDropdown>(null);
+  const [isHeaderGhostedWhileScrolling, setIsHeaderGhostedWhileScrolling] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const sessionRailRef = useRef<HTMLDivElement>(null);
+  const headerGhostTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const emptyCamerasRef = useRef<any[]>([]);
+  const previousMessageCountRef = useRef(0);
+  const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
+  const shouldAutoScrollRef = useRef(true);
+  const previousMessageMetaRef = useRef(
+    new Map<number, { isPending: boolean; revealId: string; messageType: string | null }>(),
+  );
+  const animatedRevealIdsRef = useRef<Set<string>>(new Set());
+  const revealScrollFrameRef = useRef<number | null>(null);
+  const [activeRevealId, setActiveRevealId] = useState<string | null>(null);
+  const lastTutorialCameraPrefillPromptRef = useRef("");
+  const pendingTutorialCameraPromptRef = useRef<{
+    sessionId: number;
+    normalizedPrompt: string;
+  } | null>(null);
+  const { toasts: cameraEventToasts, dismissToast: dismissCameraEventToast } = useCameraEvents(
+    emptyCamerasRef.current,
+  );
+
+  const resolvedTutorialCameraName = useMemo(() => {
+    if (typeof tutorialCameraId === "number" && tutorialCameraId > 0) {
+      const matchingCamera = dashboardCameras.find((camera) => camera.id === tutorialCameraId);
+      const matchingCameraName =
+        typeof matchingCamera?.name === "string" ? matchingCamera.name.trim() : "";
+      if (matchingCameraName) {
+        return matchingCameraName;
+      }
+    }
+
+    if (typeof tutorialCameraName === "string" && tutorialCameraName.trim()) {
+      return tutorialCameraName.trim();
+    }
+
+    return null;
+  }, [dashboardCameras, tutorialCameraId, tutorialCameraName]);
+
+  const tutorialCameraStatusPrompt = useMemo(
+    () => buildOnboardingChatCameraStatusPrompt(t, resolvedTutorialCameraName),
+    [resolvedTutorialCameraName, t, i18n.language, i18n.resolvedLanguage]
+  );
+
+  const canChangeModelTier = true;
+
+  useEffect(() => {
+    const saved = localStorage.getItem(getBrandStorageKey("globalModelTier"));
+    const normalizedTier = normalizeChatModelTier(saved);
+    setModelTier(normalizedTier);
+    localStorage.setItem(getBrandStorageKey("globalModelTier"), normalizedTier);
+  }, []);
+
+  useEffect(() => {
+    const handleOnboardingChatPrefill = (event: Event) => {
+      const prompt =
+        (event as CustomEvent<{ prompt?: string }>).detail?.prompt || tutorialCameraStatusPrompt;
+      if (typeof prompt !== "string" || !prompt.trim()) {
+        return;
+      }
+
+      lastTutorialCameraPrefillPromptRef.current = normalizeOnboardingPromptText(prompt);
+      setInput(prompt);
+      window.requestAnimationFrame(() => {
+        const textarea = document.getElementById(CHAT_PAGE_TEXTAREA_ID);
+        if (!(textarea instanceof HTMLTextAreaElement)) {
+          return;
+        }
+
+        textarea.focus();
+        textarea.setSelectionRange(prompt.length, prompt.length);
+      });
+    };
+
+    window.addEventListener(
+      ONBOARDING_CHAT_PREFILL_EVENT,
+      handleOnboardingChatPrefill as EventListener
+    );
+
+    return () => {
+      window.removeEventListener(
+        ONBOARDING_CHAT_PREFILL_EVENT,
+        handleOnboardingChatPrefill as EventListener
+      );
+    };
+  }, [tutorialCameraStatusPrompt]);
+
+  const {
+    isLoading,
+    error,
+    errorCode,
+    warning,
+    pendingExecutionState,
+    sendMessage,
+    submitCameraRegistration,
+    submitCameraBatchRegistration,
+    submitCameraBatchEdit,
+    updateIdentityCard,
+    cancelMessage,
+  } = usePerceptrumChatSession({
+    sessionId: activeSessionId,
+    onMessagesUpdate: (updatedMessages) => {
+      setMessages(updatedMessages);
+    },
+  });
+  const showBillingUnlockCta =
+    brand.features.billingEnabled && errorCode === PERCEPTRUM_CHAT_TRIAL_EXPIRED_ERROR;
+
+  const pendingExecutionNotice =
+    pendingExecutionState.kind === "offline"
+      ? "Desktop agent offline. Open the EXE on this machine to continue processing this request."
+      : pendingExecutionState.kind === "stale"
+        ? "Desktop agent connection looks stale. Make sure the EXE is open and still connected."
+        : null;
+
+  const clearDraftVideo = async ({ preserveUpload = false }: { preserveUpload?: boolean } = {}) => {
+    const currentVideo = uploadedVideo;
+    setUploadedVideo(null);
+
+    if (preserveUpload || !currentVideo?.id) {
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/video-uploads/${currentVideo.id}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      if (!response.ok && response.status !== 404 && response.status !== 409) {
+        console.warn("[CHAT] Failed to clean up draft video upload:", response.status);
+      }
+    } catch (error) {
+      console.warn("[CHAT] Failed to clean up draft video upload:", error);
+    }
+  };
+
+  const openChatEditForm = async (
+    cameraId: number,
+    cameraDraftMetadata: CameraEditFormRequestMessageMetadata
+  ) => {
+    if (!cameraDraftMetadata) return;
+
+    const response = await fetch(`/api/cameras/${cameraId}`, {
+      credentials: "include",
+    });
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(
+        typeof (data as any)?.error === "string"
+          ? (data as any).error
+          : "Failed to load the camera for editing."
+      );
+    }
+
+    const mergedCamera = applyCameraEditDraftToCamera(
+      data as CameraEditorCamera,
+      cameraDraftMetadata
+    );
+    setChatEditModalCamera(mergedCamera);
+    setIsChatEditModalOpen(true);
+  };
+
+  const openChatAgentForm = async (
+    metadata: CameraAgentFormRequestMessageMetadata
+  ) => {
+    const target = metadata.editor_target ?? null;
+    const hasValidTarget =
+      !!target &&
+      (
+        (target.type === "camera" && Number.isInteger(target.camera_id) && Number(target.camera_id) > 0) ||
+        (target.type === "step_default" && Number.isInteger(target.step_id) && Number(target.step_id) > 0) ||
+        (target.type === "step_camera" &&
+          Number.isInteger(target.step_id) &&
+          Number(target.step_id) > 0 &&
+          Number.isInteger(target.camera_id) &&
+          Number(target.camera_id) > 0)
+      );
+
+    if (!hasValidTarget) {
+      throw new Error("Invalid agent target selected for the form.");
+    }
+
+    setChatAgentModalTarget(target);
+    setChatAgentModalInitialAgent(
+      buildCameraAgentDraftForEditor(metadata) as unknown as CameraCustomAgentRow
+    );
+    setIsChatAgentModalOpen(true);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (headerGhostTimeoutRef.current) {
+        clearTimeout(headerGhostTimeoutRef.current);
+        headerGhostTimeoutRef.current = null;
+      }
+
+      if (revealScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(revealScrollFrameRef.current);
+        revealScrollFrameRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (deletingSessionId === null) {
+      return;
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) {
+        return;
+      }
+
+      if (sessionRailRef.current?.contains(target)) {
+        return;
+      }
+
+      setDeletingSessionId(null);
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setDeletingSessionId(null);
+      }
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [deletingSessionId]);
+
+  useEffect(() => {
+    shouldAutoScrollRef.current = shouldAutoScroll;
+  }, [shouldAutoScroll]);
+
+  useEffect(() => {
+    previousMessageMetaRef.current = new Map();
+    animatedRevealIdsRef.current = new Set();
+    setActiveRevealId(null);
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    if (activeSessionId) {
+      previousMessageCountRef.current = 0;
+      setShouldAutoScroll(true);
+      fetchMessages(activeSessionId);
+      return;
+    }
+
+    previousMessageCountRef.current = 0;
+    setShouldAutoScroll(true);
+    setMessages([]);
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    const hasNewMessage = messages.length > previousMessageCountRef.current;
+    previousMessageCountRef.current = messages.length;
+
+    if (shouldAutoScroll && hasNewMessage && messages.length > 0) {
+      scrollToBottom();
+    }
+  }, [messages, shouldAutoScroll]);
+
+  useLayoutEffect(() => {
+    const previousMessageMeta = previousMessageMetaRef.current;
+    const nextMessageMeta = new Map<number, { isPending: boolean; revealId: string; messageType: string | null }>();
+    let nextRevealId: string | null = null;
+
+    for (const message of messages) {
+      const isPending = Number((message as any).is_pending || 0) === 1;
+      const revealId = getAssistantRevealId(message);
+      const messageType = typeof message.message_type === "string" ? message.message_type.toLowerCase() : null;
+
+      nextMessageMeta.set(message.id, {
+        isPending,
+        revealId,
+        messageType,
+      });
+
+      if (!CHAT_VISUAL_TYPING_ENABLED) {
+        continue;
+      }
+
+      const wasPending = previousMessageMeta.get(message.id)?.isPending === true;
+      const isEligibleForReveal =
+        message.role === "assistant" &&
+        !isPending &&
+        typeof message.content === "string" &&
+        message.content.trim().length > 0 &&
+        Boolean(messageType && CHAT_VISUAL_TYPING_MESSAGE_TYPES.has(messageType)) &&
+        wasPending;
+
+      if (!isEligibleForReveal || animatedRevealIdsRef.current.has(revealId)) {
+        continue;
+      }
+
+      animatedRevealIdsRef.current.add(revealId);
+
+      if (shouldAutoScrollRef.current) {
+        nextRevealId = revealId;
+      }
+    }
+
+    previousMessageMetaRef.current = nextMessageMeta;
+
+    setActiveRevealId((currentRevealId) => {
+      if (nextRevealId) {
+        return nextRevealId;
+      }
+
+      if (
+        currentRevealId &&
+        !messages.some((message) => getAssistantRevealId(message) === currentRevealId)
+      ) {
+        return null;
+      }
+
+      return currentRevealId;
+    });
+  }, [messages]);
+
+  useEffect(() => {
+    if (!isOnboardingOpen || onboardingStepId !== "chat-compose") {
+      pendingTutorialCameraPromptRef.current = null;
+      return;
+    }
+
+    const pendingPrompt = pendingTutorialCameraPromptRef.current;
+    if (!pendingPrompt || activeSessionId !== pendingPrompt.sessionId) {
+      return;
+    }
+
+    const latestMatchingUserMessage = [...messages]
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "user" &&
+          normalizeOnboardingPromptText(message.content) === pendingPrompt.normalizedPrompt
+      );
+
+    if (!latestMatchingUserMessage) {
+      return;
+    }
+
+    const hasCompletedAssistantReply = messages.some((message) => {
+      const isPending = Number((message as any).is_pending || 0) === 1;
+      return (
+        message.role === "assistant" &&
+        message.id > latestMatchingUserMessage.id &&
+        !isPending &&
+        typeof message.content === "string" &&
+        message.content.trim().length > 0
+      );
+    });
+
+    if (!hasCompletedAssistantReply) {
+      return;
+    }
+
+    pendingTutorialCameraPromptRef.current = null;
+    void advanceOnboarding();
+  }, [activeSessionId, advanceOnboarding, isOnboardingOpen, messages, onboardingStepId]);
+
+  const fetchSessions = async ({
+    preferredSessionId = null,
+    preserveDraftSelection = false,
+  }: {
+    preferredSessionId?: number | null;
+    preserveDraftSelection?: boolean;
+  } = {}) => {
+    try {
+      const response = await fetch("/api/chat/sessions");
+      const data = await response.json();
+      setSessions(data);
+
+      if (
+        preferredSessionId &&
+        data.some((s: ChatSession) => s.id === preferredSessionId)
+      ) {
+        setActiveSessionId(preferredSessionId);
+        return data as ChatSession[];
+      }
+
+      if (preferredSessionId && !preserveDraftSelection) {
+        navigate("/chat", { replace: true });
+      }
+
+      setActiveSessionId((currentActiveSessionId) => {
+        if (preserveDraftSelection) {
+          return null;
+        }
+        if (
+          currentActiveSessionId &&
+          data.some((s: ChatSession) => s.id === currentActiveSessionId)
+        ) {
+          return currentActiveSessionId;
+        }
+        return data.length > 0 ? data[0].id : null;
+      });
+      return data as ChatSession[];
+    } catch (fetchError) {
+      console.error("Failed to fetch sessions:", fetchError);
+      return [];
+    }
+  };
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const sessionParam = params.get("session");
+    const parsedSessionId = sessionParam ? parseInt(sessionParam, 10) : Number.NaN;
+
+    if (!Number.isNaN(parsedSessionId) && parsedSessionId > 0) {
+      setMessages([]);
+      void fetchSessions({ preferredSessionId: parsedSessionId, preserveDraftSelection: true });
+      return;
+    }
+
+    setActiveSessionId(null);
+    setMessages([]);
+    void fetchSessions({ preserveDraftSelection: true });
+  }, [location.search]);
+
+  const fetchMessages = async (sessionId: number) => {
+    try {
+      const response = await fetch(`/api/chat/sessions/${sessionId}/messages`);
+      const data = await response.json();
+      setMessages(data);
+    } catch (fetchError) {
+      console.error("Failed to fetch messages:", fetchError);
+    }
+  };
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "auto" });
+  };
+
+  const scheduleRevealAutoScroll = () => {
+    if (!shouldAutoScrollRef.current) {
+      return;
+    }
+
+    if (revealScrollFrameRef.current !== null) {
+      return;
+    }
+
+    revealScrollFrameRef.current = window.requestAnimationFrame(() => {
+      revealScrollFrameRef.current = null;
+      scrollToBottom();
+    });
+  };
+
+  const handleRevealComplete = (revealId: string) => {
+    setActiveRevealId((currentRevealId) => (currentRevealId === revealId ? null : currentRevealId));
+    scheduleRevealAutoScroll();
+  };
+
+  const markHeaderAsActivelyScrolling = () => {
+    if (!isHeaderGhostedWhileScrolling) {
+      setIsHeaderGhostedWhileScrolling(true);
+    }
+
+    if (headerGhostTimeoutRef.current) {
+      clearTimeout(headerGhostTimeoutRef.current);
+    }
+
+    headerGhostTimeoutRef.current = setTimeout(() => {
+      setIsHeaderGhostedWhileScrolling(false);
+      headerGhostTimeoutRef.current = null;
+    }, 160);
+  };
+
+  const handleScroll = () => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+
+    markHeaderAsActivelyScrolling();
+
+    const { scrollTop, scrollHeight, clientHeight } = container;
+    const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+    setShouldAutoScroll(distanceFromBottom < 150);
+  };
+
+  const createNewSession = async (): Promise<number | null> => {
+    if (isCreatingSession) return null;
+
+    try {
+      setIsCreatingSession(true);
+
+      const response = await fetch("/api/chat/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to create new chat");
+      }
+
+      const newSession = await response.json() as ChatSession;
+      setSessions((currentSessions) => [
+        newSession,
+        ...currentSessions.filter((session) => session.id !== newSession.id),
+      ]);
+      setActiveSessionId(newSession.id);
+      return newSession.id as number;
+    } catch (createError) {
+      console.error("Failed to create new chat:", createError);
+      return null;
+    } finally {
+      setIsCreatingSession(false);
+    }
+  };
+
+  const handleNewChat = () => {
+    setInput("");
+    setUploadedImage(null);
+    void clearDraftVideo();
+    setMessages([]);
+    setActiveSessionId(null);
+    setDeletingSessionId(null);
+    setShouldAutoScroll(true);
+    previousMessageCountRef.current = 0;
+
+    if (location.search) {
+      navigate("/chat");
+      return;
+    }
+
+    void fetchSessions({ preserveDraftSelection: true });
+  };
+
+  const handleSelectSession = (sessionId: number) => {
+    setMessages([]);
+    setActiveSessionId(sessionId);
+    setDeletingSessionId(null);
+    navigate(`/chat?session=${sessionId}`);
+  };
+
+  const handleStartEdit = (session: ChatSession) => {
+    setDeletingSessionId(null);
+    setEditingSessionId(session.id);
+    setEditingTitle(session.title);
+  };
+
+  const handleSaveEdit = async (sessionId: number) => {
+    if (!editingTitle.trim()) {
+      setEditingTitle("Untitled chat");
+    }
+
+    try {
+      const response = await fetch(`/api/chat/sessions/${sessionId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: editingTitle.trim() || "Untitled chat" }),
+      });
+
+      const updatedSession = await response.json();
+      setSessions(sessions.map((session) => (session.id === sessionId ? updatedSession : session)));
+      setEditingSessionId(null);
+    } catch (saveError) {
+      console.error("Failed to update session:", saveError);
+    }
+  };
+
+  const handleCancelEdit = () => {
+    setEditingSessionId(null);
+    setEditingTitle("");
+  };
+
+  const handleDeleteSession = async (sessionId: number) => {
+    if (!sessionId) return;
+
+    try {
+      const response = await fetch(`/api/chat/sessions/${sessionId}`, {
+        method: "DELETE",
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to delete session");
+      }
+
+      const newSessions = sessions.filter((session) => session.id !== sessionId);
+      setSessions(newSessions);
+
+      if (activeSessionId === sessionId) {
+        setMessages([]);
+        if (newSessions.length > 0) {
+          setActiveSessionId(newSessions[0].id);
+          navigate(`/chat?session=${newSessions[0].id}`, { replace: true });
+        } else {
+          setActiveSessionId(null);
+          navigate("/chat", { replace: true });
+        }
+      }
+    } catch (deleteError) {
+      console.error("Failed to delete session:", deleteError);
+      setToast({
+        message: "Failed to delete chat. Please try again.",
+        type: "error",
+      });
+    } finally {
+      setDeletingSessionId((currentSessionId) => (currentSessionId === sessionId ? null : currentSessionId));
+    }
+  };
+
+  const handleSend = async () => {
+    if ((!input.trim() && !uploadedImage && !uploadedVideo) || isCreatingSession) return;
+
+    let targetSessionId = activeSessionId;
+    if (!targetSessionId) {
+      const createdSessionId = await createNewSession();
+      if (!createdSessionId) return;
+      targetSessionId = createdSessionId;
+      navigate(`/chat?session=${createdSessionId}`, { replace: true });
+    }
+
+    const userMessage = input;
+    const imageBase64 = uploadedImage;
+    const draftVideo = uploadedVideo;
+    const videoId = uploadedVideo?.id ?? null;
+    const normalizedUserMessage = normalizeOnboardingPromptText(userMessage);
+    const normalizedTutorialCameraPrompt = normalizeOnboardingPromptText(tutorialCameraStatusPrompt);
+    const shouldTrackTutorialCameraPrompt =
+      isOnboardingOpen &&
+      onboardingStepId === "chat-compose" &&
+      normalizedUserMessage.length > 0 &&
+      (
+        normalizedUserMessage === normalizedTutorialCameraPrompt ||
+        normalizedUserMessage === lastTutorialCameraPrefillPromptRef.current
+      );
+
+    if (shouldTrackTutorialCameraPrompt) {
+      pendingTutorialCameraPromptRef.current = {
+        sessionId: targetSessionId,
+        normalizedPrompt: normalizedUserMessage,
+      };
+    } else {
+      pendingTutorialCameraPromptRef.current = null;
+    }
+
+    setInput("");
+    setUploadedImage(null);
+    void clearDraftVideo({ preserveUpload: true });
+    setShouldAutoScroll(true);
+
+    const sendSucceeded = await sendMessage({
+      sessionIdOverride: targetSessionId,
+      content: userMessage,
+      uploadedImageBase64: imageBase64,
+      uploadedVideoId: videoId,
+      modelTier,
+      modelFps: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+      runningResolution: modelTier === "core" ? DEFAULT_CHAT_CORE_RUNNING_RESOLUTION : null,
+    });
+
+    if (!sendSucceeded) {
+      pendingTutorialCameraPromptRef.current = null;
+      setInput(userMessage);
+      setUploadedImage(imageBase64);
+      if (draftVideo) {
+        setUploadedVideo(draftVideo);
+      }
+      return;
+    }
+
+    await fetchSessions({ preferredSessionId: targetSessionId });
+  };
+
+  const formatTime = (dateString: string) => {
+    const date = new Date(dateString);
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+
+    if (diffMins < 1) return "Just now";
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays === 0) return "Today";
+    if (diffDays === 1) return "Yesterday";
+    if (diffDays < 7) return `${diffDays}d ago`;
+
+    return date.toLocaleDateString();
+  };
+
+  const handleModelSelect = (tier: ChatModelTier) => {
+    const previousTier = modelTier;
+    const normalizedTier = normalizeChatModelTier(tier);
+    setModelTier(normalizedTier);
+    localStorage.setItem(getBrandStorageKey("globalModelTier"), normalizedTier);
+    setOpenHeaderDropdown(null);
+    if (shouldShowCoreModelNotice(normalizedTier, previousTier)) {
+      setToast({
+        message: getCoreModelNoticeCopy(i18n.resolvedLanguage || i18n.language).message,
+        type: "info",
+      });
+    }
+  };
+
+  const modelLabels: Record<ChatModelTier, string> = {
+    ultra_plus: t("jobs.inferenceModelOption.ultraPlus"),
+    ultra: t("jobs.inferenceModelOption.ultra"),
+    light: t("jobs.inferenceModelOption.light"),
+    core: t("jobs.inferenceModelOption.core"),
+  };
+
+  const starterPrompts = [
+    {
+      id: "chat.starterPrompt.scanNetwork",
+      text: t("chat.starterPrompt.scanNetwork"),
+    },
+    {
+      id: "chat.starterPrompt.createAgent",
+      text: t("chat.starterPrompt.createAgent"),
+    },
+    {
+      id: "chat.starterPrompt.searchRedCar",
+      text: t("chat.starterPrompt.searchRedCar"),
+    },
+  ];
+
+  const handleStarterPromptSelect = (prompt: string) => {
+    setInput(prompt);
+    window.requestAnimationFrame(() => {
+      const textarea = document.getElementById(CHAT_PAGE_TEXTAREA_ID);
+      if (!(textarea instanceof HTMLTextAreaElement)) {
+        return;
+      }
+
+      textarea.focus();
+      textarea.setSelectionRange(prompt.length, prompt.length);
+    });
+  };
+
+  const renderMessage = (message: ChatMessage) => {
+    const msg = message as any;
+    const isPending = msg.is_pending === 1;
+
+    if (isPending) {
+      const progress = extractChatProgressFromMessage(message);
+      return (
+        <PendingAssistantMessage
+          key={message.id}
+          content={msg.content}
+          progress={progress}
+          notice={pendingExecutionNotice}
+          variant="chat-page"
+        />
+      );
+    }
+
+    if (message.role === "user") {
+      const userMsg = message as any;
+      const formattedUserContent = formatMessageContent(message.content);
+      const uploadedVideoAttachment = extractUploadedVideoAttachmentFromMessage(message);
+      const hasUserText = formattedUserContent.trim().length > 0;
+
+      return (
+        <div key={message.id} className="flex justify-end gap-4 animate-slide-up">
+          <div className="flex min-w-0 flex-1 justify-end">
+            <div className="group flex w-full max-w-full min-w-0 flex-col md:max-w-[42rem]">
+              <div className="w-full min-w-0 overflow-hidden rounded-[26px] border border-blue-300/10 bg-gradient-to-br from-blue-500/90 via-blue-500/82 to-cyan-500/78 px-4 py-3 text-white shadow-[0_24px_60px_-30px_rgba(74,149,255,0.8)] md:px-5">
+                {userMsg.uploaded_image_base64 && (
+                  <img
+                    src={userMsg.uploaded_image_base64}
+                    alt="Uploaded"
+                    className="mb-3 max-h-40 rounded-2xl shadow-md"
+                  />
+                )}
+                {uploadedVideoAttachment ? (
+                  <UploadedVideoAttachment attachment={uploadedVideoAttachment} mode="message" />
+                ) : null}
+                {hasUserText ? (
+                  <p
+                    className="break-words whitespace-pre-wrap text-sm leading-relaxed"
+                    style={{ overflowWrap: "anywhere" }}
+                  >
+                    {formattedUserContent}
+                  </p>
+                ) : null}
+              </div>
+              {hasUserText ? (
+                <div className="mt-1.5 flex justify-end pr-2">
+                  <MessageCopyButton
+                    text={formattedUserContent}
+                    className="border-white/10 bg-white/[0.08] text-white/80 hover:bg-white/[0.14]"
+                  />
+                </div>
+              ) : null}
+            </div>
+          </div>
+          <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 to-cyan-500">
+            <User className="h-4 w-4 text-white md:h-5 md:w-5" />
+          </div>
+        </div>
+      );
+    }
+
+    const hitMedia = extractHitMediaFromMessage(message);
+    const cameraRegistrationDraft = extractCameraRegistrationDraftFromMessage(message);
+    const cameraBatchRegistrationDraft = extractCameraBatchRegistrationDraftFromMessage(message);
+    const cameraBatchEditDraft = extractCameraBatchEditDraftFromMessage(message);
+    const cameraAgentFormRequest = extractCameraAgentFormRequestFromMessage(message);
+    const cameraAgentCreationResult = extractCameraAgentCreationResultFromMessage(message);
+    const jobCreationResult = extractJobCreationResultFromMessage(message);
+    const cameraAgentEditContext = extractCameraAgentEditContextFromMessage(message);
+    const cameraAgentUpdateResult = extractCameraAgentUpdateResultFromMessage(message);
+    const cameraEditFormRequest = extractCameraEditFormRequestFromMessage(message);
+    const cameraNetworkScan = extractCameraNetworkScanFromMessage(message);
+    const reportDocument = extractReportDocumentFromMessage(message);
+    const identityCards = extractIdentityCardsFromMessage(message);
+    const cameraLabel = message.camera_ids ? `Camera #${message.camera_ids}` : null;
+    const revealId = getAssistantRevealId(message);
+    const shouldAnimateReveal = CHAT_VISUAL_TYPING_ENABLED && activeRevealId === revealId;
+    const workflowSupplementalContent =
+      reportDocument ? (
+        <ChatReportDocumentCard metadata={reportDocument} />
+      ) : cameraRegistrationDraft ? (
+        <ChatCameraRegistrationCard
+          messageId={message.id}
+          metadata={cameraRegistrationDraft}
+          onSubmit={(sourceMessageId, draft) =>
+            submitCameraRegistration({
+              sessionIdOverride: activeSessionId,
+              sourceMessageId,
+              draft,
+            })
+          }
+        />
+      ) : cameraBatchRegistrationDraft ? (
+        <ChatCameraBatchRegistrationCard
+          messageId={message.id}
+          metadata={cameraBatchRegistrationDraft}
+          onSubmit={(sourceMessageId) =>
+            submitCameraBatchRegistration({
+              sessionIdOverride: activeSessionId,
+              sourceMessageId,
+            })
+          }
+        />
+      ) : cameraBatchEditDraft ? (
+        <ChatCameraBatchEditCard
+          messageId={message.id}
+          metadata={cameraBatchEditDraft}
+          onSubmit={(sourceMessageId) =>
+            submitCameraBatchEdit({
+              sessionIdOverride: activeSessionId,
+              sourceMessageId,
+            })
+          }
+        />
+      ) : cameraAgentFormRequest ? (
+        <ChatCameraAgentCard
+          metadata={cameraAgentFormRequest}
+          onOpen={() => openChatAgentForm(cameraAgentFormRequest)}
+        />
+      ) : cameraAgentEditContext ? (
+        <ChatCameraAgentEditContextCard metadata={cameraAgentEditContext} />
+      ) : cameraAgentUpdateResult ? (
+        <ChatCameraAgentUpdatedCard metadata={cameraAgentUpdateResult} />
+      ) : jobCreationResult ? (
+        <ChatJobCreatedCard metadata={jobCreationResult} />
+      ) : cameraAgentCreationResult ? (
+        <ChatCameraAgentCreatedCard metadata={cameraAgentCreationResult} />
+      ) : cameraEditFormRequest ? (
+        <ChatCameraEditCard
+          metadata={cameraEditFormRequest}
+          onOpen={() =>
+            openChatEditForm(cameraEditFormRequest.camera_id, cameraEditFormRequest)
+          }
+        />
+      ) : cameraNetworkScan ? (
+        <ChatCameraDiscoveryCard metadata={cameraNetworkScan} />
+      ) : null;
+
+    const supplementalContent = (
+      <>
+        {workflowSupplementalContent}
+        {identityCards.length > 0 ? (
+          <ChatIdentityCardsPanel
+            cards={identityCards}
+            busy={isLoading}
+            onUpdateIdentityCard={updateIdentityCard}
+          />
+        ) : null}
+      </>
+    );
+
+    return (
+      <AssistantMessage
+        key={message.id}
+        content={message.content}
+        hitMedia={hitMedia}
+        cameraLabel={cameraLabel}
+        variant="chat-page"
+        animateReveal={shouldAnimateReveal}
+        revealId={revealId}
+        onRevealProgress={scheduleRevealAutoScroll}
+        onRevealComplete={handleRevealComplete}
+        supplementalContent={supplementalContent}
+      />
+    );
+  };
+
+  return (
+    <Layout>
+      <div className="flex h-[calc(100vh-10rem)] gap-5 md:h-[calc(100vh-8rem)]">
+        <div
+          ref={sessionRailRef}
+          className="hidden md:flex w-[18.75rem] flex-col overflow-hidden rounded-[28px] border border-white/[0.06] bg-gradient-to-b from-[#171a22]/96 via-[#13161d]/98 to-[#101216] shadow-[0_30px_120px_-55px_rgba(0,0,0,0.96)] backdrop-blur-xl"
+        >
+          <div className="border-b border-white/[0.06] p-4">
+            <button
+              onClick={handleNewChat}
+              className={`w-full rounded-[18px] border px-4 py-4 text-left text-sm font-medium transition-all ${
+                activeSessionId === null
+                  ? "border-blue-400/25 bg-blue-500/10 text-white shadow-[0_18px_44px_-32px_rgba(74,149,255,0.95)]"
+                  : "border-white/[0.08] bg-white/[0.03] text-gray-100 hover:border-blue-400/30 hover:bg-white/[0.06] hover:text-white"
+              }`}
+            >
+              <span className="flex items-center gap-3">
+                <span className="flex h-9 w-9 items-center justify-center rounded-2xl bg-white/[0.05] text-blue-300">
+                  <Plus className="h-4 w-4" />
+                </span>
+                <span>New chat</span>
+              </span>
+            </button>
+          </div>
+
+          <div className="px-5 pb-2 pt-4">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-gray-500">
+              History
+            </p>
+          </div>
+
+          <div className="flex-1 overflow-y-auto px-3 pb-4 scrollbar-thin">
+            <div className="space-y-1.5">
+              {sessions.length === 0 && (
+                <div className="rounded-2xl border border-dashed border-white/[0.08] px-4 py-6 text-center text-sm text-gray-500">
+                  No chats yet
+                </div>
+              )}
+
+              {sessions.map((session) => {
+                const isPendingDelete = deletingSessionId === session.id;
+
+                return (
+                  <div
+                    key={session.id}
+                    onClick={() => {
+                      if (editingSessionId) {
+                        return;
+                      }
+
+                      if (isPendingDelete) {
+                        setDeletingSessionId(null);
+                        return;
+                      }
+
+                      handleSelectSession(session.id);
+                    }}
+                    className={`group relative cursor-pointer rounded-[20px] px-4 py-3 transition-all ${
+                      activeSessionId === session.id
+                        ? "border border-blue-400/20 bg-blue-500/12 shadow-[0_20px_50px_-35px_rgba(74,149,255,0.95)]"
+                        : "border border-transparent hover:border-white/[0.06] hover:bg-white/[0.04]"
+                    }`}
+                  >
+                    {editingSessionId === session.id ? (
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={editingTitle}
+                          onChange={(e) => setEditingTitle(e.target.value)}
+                          spellCheck={false}
+                          autoCorrect="off"
+                          autoCapitalize="off"
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              handleSaveEdit(session.id);
+                            } else if (e.key === "Escape") {
+                              handleCancelEdit();
+                            }
+                          }}
+                          className="flex-1 rounded-xl border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          autoFocus
+                          onClick={(e) => e.stopPropagation()}
+                        />
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleSaveEdit(session.id);
+                          }}
+                          className="p-1 text-green-400 hover:text-green-300"
+                        >
+                          <Check className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleCancelEdit();
+                          }}
+                          className="p-1 text-red-400 hover:text-red-300"
+                        >
+                          <X className="h-4 w-4" />
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="mb-1 flex items-start justify-between gap-2">
+                          <h3 className="flex-1 truncate text-sm font-medium text-gray-100">
+                            {session.title}
+                          </h3>
+                          <div
+                            className={`flex min-h-7 items-center justify-end gap-1 transition-opacity ${
+                              isPendingDelete
+                                ? "opacity-100"
+                                : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+                            }`}
+                          >
+                            {!isPendingDelete ? (
+                              <>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleStartEdit(session);
+                                  }}
+                                  className="rounded-md p-1 text-gray-500 hover:bg-white/[0.05] hover:text-gray-200"
+                                >
+                                  <Edit2 className="h-3 w-3" />
+                                </button>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setDeletingSessionId(session.id);
+                                  }}
+                                  className="rounded-md p-1 text-gray-500 hover:bg-white/[0.05] hover:text-red-400"
+                                >
+                                  <Trash2 className="h-3 w-3" />
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void handleDeleteSession(session.id);
+                                }}
+                                className="inline-flex h-7 items-center rounded-full border border-red-400/20 bg-red-500/12 px-3 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/18 hover:text-red-200"
+                              >
+                                Confirm
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                        <p className="text-xs text-gray-500">{formatTime(session.updated_at)}</p>
+                      </>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        <div className="relative flex-1 min-w-0 overflow-hidden rounded-[30px] border border-white/[0.06] bg-[radial-gradient(circle_at_top,rgba(84,90,130,0.34),rgba(29,31,44,0.96)_42%,rgba(15,16,20,1)_100%)] shadow-[0_40px_140px_-60px_rgba(0,0,0,0.98)]">
+          {CHAT_PLEXUS_BACKGROUND_ENABLED ? <ChatPlexusBackground /> : null}
+          <div
+            className={`pointer-events-none absolute inset-x-0 top-0 h-40 bg-gradient-to-b from-white/[0.05] to-transparent transition-opacity duration-200 ${
+              isHeaderGhostedWhileScrolling ? "opacity-[0.04]" : "opacity-100"
+            }`}
+          />
+          <div className="relative flex h-full flex-col">
+            <div
+              className={`absolute inset-x-0 top-0 z-20 px-4 pb-4 pt-5 transition-[opacity,background-color,backdrop-filter] duration-200 md:px-8 md:pb-5 md:pt-6 ${
+                isHeaderGhostedWhileScrolling
+                  ? "bg-transparent opacity-[0.08] backdrop-blur-0"
+                  : "bg-gradient-to-b from-[#171c2b]/92 via-[#171c2b]/70 to-transparent opacity-100 backdrop-blur-[2px]"
+              }`}
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className={`flex h-12 w-12 items-center justify-center rounded-[22px] ${CHAT_ASSISTANT_BADGE_CLASS}`}>
+                    <Bot className="h-6 w-6 text-white" />
+                  </div>
+                  <div>
+                    <h1 className="text-2xl font-semibold tracking-tight text-white md:text-[2rem]">
+                      {t("chat.title")}
+                    </h1>
+                    <p className="mt-1 text-sm text-gray-400 md:text-base">
+                      {t("chat.subtitle")}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="relative flex flex-wrap items-center justify-end gap-2">
+                  {openHeaderDropdown && (
+                    <div className="fixed inset-0 z-40" onClick={() => setOpenHeaderDropdown(null)} />
+                  )}
+                  <button
+                    onClick={() => {
+                      if (!canChangeModelTier) return;
+                      setOpenHeaderDropdown((current) => (current === "model" ? null : "model"));
+                    }}
+                    disabled={!canChangeModelTier}
+                    className={`flex items-center gap-2 rounded-2xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-sm font-medium text-gray-100 transition-colors ${
+                      canChangeModelTier ? "hover:bg-white/[0.08]" : "cursor-not-allowed opacity-60"
+                    }`}
+                  >
+                    <span className="hidden text-gray-400 sm:inline">Model</span>
+                    <span className="text-blue-300">{modelLabels[modelTier]}</span>
+                    <ModelHostingBadge modelTier={modelTier} compact />
+                    <svg className="h-4 w-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </button>
+
+                  {canChangeModelTier && openHeaderDropdown === "model" && (
+                      <div className="absolute right-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-2xl border border-white/[0.08] bg-[#1f2230]/96 shadow-2xl backdrop-blur-xl">
+                        <button
+                          onClick={() => handleModelSelect("ultra_plus")}
+                          className="w-full px-4 py-3 text-left text-sm text-gray-100 transition-colors hover:bg-white/[0.06]"
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="font-medium">{t("jobs.inferenceModelOption.ultraPlus")}</span>
+                            <div className="flex items-center gap-2">
+                              <ModelHostingBadge modelTier="ultra_plus" compact />
+                              {modelTier === "ultra_plus" && <span className="text-blue-300">&#10003;</span>}
+                            </div>
+                          </div>
+                        </button>
+                        <button
+                          onClick={() => handleModelSelect("ultra")}
+                          className="w-full px-4 py-3 text-left text-sm text-gray-100 transition-colors hover:bg-white/[0.06]"
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="font-medium">{t("jobs.inferenceModelOption.ultra")}</span>
+                            <div className="flex items-center gap-2">
+                              <ModelHostingBadge modelTier="ultra" compact />
+                              {modelTier === "ultra" && <span className="text-blue-300">&#10003;</span>}
+                            </div>
+                          </div>
+                        </button>
+                        <button
+                          onClick={() => handleModelSelect("light")}
+                          className="w-full px-4 py-3 text-left text-sm text-gray-100 transition-colors hover:bg-white/[0.06]"
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="font-medium">{t("jobs.inferenceModelOption.light")}</span>
+                            <div className="flex items-center gap-2">
+                              <ModelHostingBadge modelTier="light" compact />
+                              {modelTier === "light" && <span className="text-blue-300">&#10003;</span>}
+                            </div>
+                          </div>
+                        </button>
+                        <button
+                          onClick={() => handleModelSelect("core")}
+                          className="w-full px-4 py-3 text-left text-sm text-gray-100 transition-colors hover:bg-white/[0.06]"
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="font-medium">{t("jobs.inferenceModelOption.core")}</span>
+                            <div className="flex items-center gap-2">
+                              <ModelHostingBadge modelTier="core" compact />
+                              {modelTier === "core" && <span className="text-blue-300">&#10003;</span>}
+                            </div>
+                          </div>
+                        </button>
+                      </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div
+              ref={messagesContainerRef}
+              onScroll={handleScroll}
+              onWheel={(e) => {
+                markHeaderAsActivelyScrolling();
+                if (e.deltaY < 0) {
+                  setShouldAutoScroll(false);
+                }
+              }}
+              onTouchMove={markHeaderAsActivelyScrolling}
+              className="flex-1 overflow-y-auto px-4 pb-6 pt-[7.5rem] md:px-8 md:pb-8 md:pt-[8.5rem] scrollbar-thin touch-pan-y"
+            >
+              <div className="mx-auto flex w-full max-w-[1080px] flex-col gap-6">
+                {messages.length === 0 && (
+                  <div className="mx-auto flex max-w-4xl flex-col items-center justify-center px-4 py-10 text-center md:py-16">
+                    <div className={`flex h-24 w-24 items-center justify-center rounded-[30px] ${CHAT_ASSISTANT_BADGE_CLASS}`}>
+                      <Bot className="h-11 w-11 text-white" />
+                    </div>
+                    <h3 className="mt-8 text-3xl font-semibold tracking-tight text-white md:text-5xl">
+                      {t("chat.emptyStateTitle")}
+                    </h3>
+                    <p className="mt-4 max-w-2xl text-base leading-8 text-gray-400 md:text-lg">
+                      {t("chat.emptyStateDescription")}
+                    </p>
+                    <div className="mt-10 grid w-full max-w-4xl gap-4 md:grid-cols-3">
+                      {starterPrompts.map((prompt) => (
+                        <button
+                          key={prompt.id}
+                          type="button"
+                          onClick={() => handleStarterPromptSelect(prompt.text)}
+                          className="rounded-[24px] border border-white/[0.08] bg-white/[0.04] p-5 text-left transition-all hover:-translate-y-0.5 hover:border-blue-300/25 hover:bg-white/[0.06]"
+                        >
+                          <p className="text-sm font-medium leading-7 text-gray-100">{prompt.text}</p>
+                          <p className="mt-3 text-sm leading-6 text-gray-500">
+                            {t("chat.starterPromptHint")}
+                          </p>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {error && (
+                  <div className="rounded-[24px] border border-red-500/30 bg-red-500/10 p-4 backdrop-blur-sm">
+                    <p className="text-sm text-red-300">{error}</p>
+                    {showBillingUnlockCta ? (
+                      <button
+                        type="button"
+                        onClick={() => navigate("/billing")}
+                        className="mt-3 inline-flex items-center text-sm font-medium text-blue-200 transition-colors hover:text-blue-100"
+                      >
+                        Open Billing
+                      </button>
+                    ) : null}
+                  </div>
+                )}
+
+                {warning && (
+                  <div className="rounded-[24px] border border-amber-500/25 bg-amber-500/10 p-4 backdrop-blur-sm">
+                    <p className="text-sm text-amber-200">{warning}</p>
+                  </div>
+                )}
+
+                {pendingExecutionNotice && (
+                  <div className="rounded-[24px] border border-amber-400/25 bg-amber-400/10 p-4 backdrop-blur-sm">
+                    <div className="flex items-start gap-3">
+                      <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-300" />
+                      <p className="text-sm leading-6 text-amber-100">{pendingExecutionNotice}</p>
+                    </div>
+                  </div>
+                )}
+
+                {messages.map((message) => renderMessage(message))}
+
+                <div ref={messagesEndRef} />
+              </div>
+            </div>
+
+            <div className="border-t border-white/[0.06] bg-gradient-to-t from-black/25 via-black/10 to-transparent px-4 pb-4 pt-4 md:px-8 md:pb-6">
+              <div className="mx-auto w-full max-w-[1080px]">
+                <ChatInput
+                  value={input}
+                  onChange={setInput}
+                  onSend={handleSend}
+                  onCancel={cancelMessage}
+                  isRunning={isLoading}
+                  disabled={isCreatingSession}
+                  placeholder={t("chat.placeholder")}
+                  textareaId={CHAT_PAGE_TEXTAREA_ID}
+                  containerTargetId={
+                    isOnboardingOpen && onboardingStepId === "chat-compose"
+                      ? ONBOARDING_TARGETS.chatComposer
+                      : undefined
+                  }
+                  variant="chat-page"
+                  uploadedImage={uploadedImage}
+                  onImageUpload={setUploadedImage}
+                  onImageRemove={() => setUploadedImage(null)}
+                  uploadedVideo={uploadedVideo}
+                  onVideoUpload={setUploadedVideo}
+                  onVideoRemove={() => void clearDraftVideo()}
+                />
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-2 px-1 text-xs text-gray-500">
+                  <span>{`${brand.chatName} can make mistakes. Consider verifying important details.`}</span>
+                  <span>Chat uses the API key configured for the selected model in Settings.</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <CameraEditorModal
+        isOpen={isChatEditModalOpen}
+        camera={chatEditModalCamera}
+        onClose={() => {
+          setIsChatEditModalOpen(false);
+          setChatEditModalCamera(null);
+        }}
+        onSaved={(saved) => {
+          const savedName = saved?.cameraName || chatEditModalCamera?.name || "camera";
+          setToast({
+            message: `Camera ${savedName} updated.`,
+            type: "success",
+          });
+        }}
+      />
+
+      <CameraCustomAgentEditorModal
+        open={isChatAgentModalOpen && chatAgentModalTarget !== null}
+        editorTarget={chatAgentModalTarget}
+        initialAgent={chatAgentModalInitialAgent}
+        onClose={() => {
+          setIsChatAgentModalOpen(false);
+          setChatAgentModalTarget(null);
+          setChatAgentModalInitialAgent(null);
+        }}
+        onSaved={() => {
+          const fallbackName =
+            chatAgentModalInitialAgent?.config_json &&
+            typeof chatAgentModalInitialAgent.config_json === "object" &&
+            !Array.isArray(chatAgentModalInitialAgent.config_json) &&
+            typeof (chatAgentModalInitialAgent.config_json as Record<string, unknown>).display_name === "string"
+              ? String((chatAgentModalInitialAgent.config_json as Record<string, unknown>).display_name)
+              : "agent";
+          setToast({
+            message: `Agent ${fallbackName || "agent"} saved.`,
+            type: "success",
+          });
+        }}
+        showToast={(title: string, description: string, variant?: ToastVariant) => {
+          setToast({
+            message: title ? `${title}: ${description}` : description,
+            type:
+              variant === "destructive"
+                ? "error"
+                : variant === "default"
+                  ? "success"
+                  : "info",
+          });
+        }}
+      />
+
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+      <CameraEventToast toasts={cameraEventToasts} onDismiss={dismissCameraEventToast} />
+    </Layout>
+  );
+}

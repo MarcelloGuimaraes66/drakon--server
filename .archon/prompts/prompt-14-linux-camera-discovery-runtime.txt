@@ -1,0 +1,32 @@
+# Prompt 14 - Camera discovery no runtime Linux
+
+Objetivo:
+Fazer camera discovery funcionar no app Linux via backend Node/local endpoints, sem ainda ativar CameraSession C++ completo.
+
+Escopo:
+- Validar endpoints de camera discovery em `DrakonSite/server` e `src/worker`.
+- Garantir que permissao/rede no Ubuntu esta documentada.
+- Garantir que UI Cameras consegue abrir discovery modal e receber resposta local.
+- Manter RTSP/captura como gate separado.
+
+Restricoes:
+- Nao ativar AgentCore completo.
+- Nao ativar CameraSession/FrameDiskWriter/JobRuntime.
+- Nao alterar AppHost, `.vcxproj`, `.sln`.
+- Nao fazer commit/push.
+
+Validacao obrigatoria:
+
+```bash
+cd DrakonSite
+npm run build
+npm run test:platform-boundaries
+
+cd ../Perceptrum
+cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build out/build/linux-debug -j$(nproc)
+ctest --test-dir out/build/linux-debug --output-on-failure
+```
+
+Relatorio:
+Criar `.archon/plans/relatorio-fase14-linux-camera-discovery-runtime.md` com o que funciona sem RTSP e o que fica para a fase 15.

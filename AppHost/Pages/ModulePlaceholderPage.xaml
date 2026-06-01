@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Background="Transparent">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <Grid Padding="24">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="24" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <StackPanel Spacing="8">
+                <TextBlock
+                    x:Name="TitleText"
+                    Style="{StaticResource DrakonDisplayTitleTextStyle}"
+                    Text="Modulo em conversao" />
+                <TextBlock
+                    x:Name="SubtitleText"
+                    Style="{StaticResource DrakonBodyTextStyle}"
+                    Text="Esta tela sera portada a seguir com base no codigo-fonte original." />
+            </StackPanel>
+
+            <Grid
+                Grid.Row="2"
+                ColumnSpacing="16">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="2*" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border
+                    Grid.Column="0"
+                    Style="{StaticResource DrakonHeroPanelStyle}">
+                    <StackPanel Spacing="14">
+                        <TextBlock
+                            Style="{StaticResource DrakonSectionTitleTextStyle}"
+                            Text="Origem confirmada" />
+                        <TextBlock
+                            x:Name="SourceText"
+                            Style="{StaticResource DrakonBodyTextStyle}"
+                            Text="Caminho-fonte ainda sera detalhado." />
+                        <InfoBar
+                            IsOpen="True"
+                            IsClosable="False"
+                            Message="Placeholder navegavel criado para sustentar a sequencia de conversao do shell sem bloquear a compilacao."
+                            Severity="Informational" />
+                    </StackPanel>
+                </Border>
+
+                <Border
+                    Grid.Column="1"
+                    Style="{StaticResource DrakonInsetPanelStyle}">
+                    <StackPanel Spacing="12">
+                        <TextBlock
+                            Style="{StaticResource DrakonSectionTitleTextStyle}"
+                            Text="Próxima entrega" />
+                        <TextBlock
+                            Style="{StaticResource DrakonBodyTextStyle}"
+                            Text="Portar layout XAML" />
+                        <TextBlock
+                            Style="{StaticResource DrakonBodyTextStyle}"
+                            Text="Acoplar serviços nativos" />
+                        <TextBlock
+                            Style="{StaticResource DrakonBodyTextStyle}"
+                            Text="Conectar persistência e runtime" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </Grid>
+    </ScrollViewer>
+</Page>

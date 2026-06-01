@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Background="Transparent"
+    RequestedTheme="Dark">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <Grid Padding="24">
+            <StackPanel
+                MaxWidth="1600"
+                HorizontalAlignment="Center"
+                Spacing="20">
+                <StackPanel Spacing="6">
+                    <TextBlock
+                        Style="{StaticResource DrakonDisplayTitleTextStyle}"
+                        Text="AI Agents" />
+                    <TextBlock
+                        Style="{StaticResource DrakonBodyTextStyle}"
+                        Text="Port nativo da grade de agentes do DrakonSite. Esta tela mantém busca, start/stop, gate de billing e ponte operacional para edição de câmeras."
+                        TextWrapping="WrapWholeWords" />
+                </StackPanel>
+
+                <InfoBar
+                    x:Name="AgentsInfoBar"
+                    IsOpen="False"
+                    IsClosable="True"
+                    Severity="Informational" />
+
+                <Border Style="{StaticResource DrakonPanelStyle}">
+                    <StackPanel Spacing="16">
+                        <Grid
+                            x:Name="DesktopHeaderActions"
+                            ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+
+                            <TextBox
+                                x:Name="AgentSearchTextBox"
+                                PlaceholderText="Search cameras..."
+                                MinWidth="280" />
+
+                            <Button
+                                x:Name="RefreshAgentsButton"
+                                Grid.Column="1"
+                                Content="Refresh agents" />
+
+                            <Button
+                                x:Name="OpenCamerasButton"
+                                Grid.Column="2"
+                                Content="Add / Edit cameras"
+                                Style="{StaticResource AccentButtonStyle}" />
+                        </Grid>
+
+                        <StackPanel
+                            x:Name="CompactHeaderActions"
+                            Visibility="Collapsed"
+                            Spacing="12">
+                            <TextBox
+                                x:Name="CompactAgentSearchTextBox"
+                                PlaceholderText="Search cameras..." />
+
+                            <Grid ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+
+                                <Button
+                                    x:Name="CompactRefreshAgentsButton"
+                                    Content="Refresh" />
+                                <Button
+                                    x:Name="CompactOpenCamerasButton"
+                                    Grid.Column="1"
+                                    Content="Cameras"
+                                    Style="{StaticResource AccentButtonStyle}" />
+                            </Grid>
+                        </StackPanel>
+
+                        <TextBlock
+                            Style="{StaticResource DrakonCaptionTextStyle}"
+                            Text="Os cartões seguem a mesma intenção funcional do DrakonSite: busca, status operacional, start/stop, edição e entrada para configuração de algoritmos."
+                            TextWrapping="WrapWholeWords" />
+                    </StackPanel>
+                </Border>
+
+                <StackPanel
+                    x:Name="CardsRowsHost"
+                    Spacing="16" />
+            </StackPanel>
+        </Grid>
+    </ScrollViewer>
+</Page>

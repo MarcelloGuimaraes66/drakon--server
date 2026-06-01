@@ -1,0 +1,254 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Background="{StaticResource DrakonShellBackgroundBrush}">
+
+    <Page.Resources>
+        <Style x:Key="DrakonFloatingBackButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="MinWidth" Value="0" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="VerticalContentAlignment" Value="Stretch" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Grid>
+                            <Border
+                                x:Name="HoverGlow"
+                                Margin="-3"
+                                Background="{StaticResource DrakonAccentBrush}"
+                                CornerRadius="999"
+                                Opacity="0" />
+
+                            <Border
+                                x:Name="RootBorder"
+                                Padding="8,8,18,8"
+                                Background="{StaticResource DrakonPanelBrush}"
+                                BorderBrush="{StaticResource DrakonShellChipBorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="999">
+                                <Border.RenderTransform>
+                                    <CompositeTransform x:Name="RootTransform" />
+                                </Border.RenderTransform>
+
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <Border
+                                        x:Name="IconBadge"
+                                        Width="36"
+                                        Height="36"
+                                        Background="{StaticResource DrakonShellActiveBrush}"
+                                        CornerRadius="18">
+                                        <FontIcon
+                                            x:Name="BackIcon"
+                                            Glyph="&#xE72B;"
+                                            FontSize="13"
+                                            Foreground="{StaticResource DrakonAccentBrush}"
+                                            HorizontalAlignment="Center"
+                                            VerticalAlignment="Center" />
+                                    </Border>
+
+                                    <StackPanel
+                                        Spacing="0"
+                                        VerticalAlignment="Center">
+                                        <TextBlock
+                                            x:Name="BackTitleText"
+                                            FontSize="15"
+                                            FontWeight="SemiBold"
+                                            Foreground="{StaticResource DrakonStrongTextBrush}"
+                                            Text="Voltar" />
+                                        <TextBlock
+                                            x:Name="BackSubtitleText"
+                                            FontSize="11"
+                                            Foreground="{StaticResource DrakonSecondaryTextBrush}"
+                                            Opacity="0.88"
+                                            Text="Retornar ao app" />
+                                    </StackPanel>
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+
+                        <VisualStateManager.VisualStateGroups>
+                            <VisualStateGroup x:Name="CommonStates">
+                                <VisualState x:Name="Normal" />
+                                <VisualState x:Name="PointerOver">
+                                    <VisualState.Setters>
+                                        <Setter Target="HoverGlow.Opacity" Value="0.18" />
+                                        <Setter Target="RootBorder.Background" Value="{StaticResource DrakonShellHoverBrush}" />
+                                        <Setter Target="RootBorder.BorderBrush" Value="{StaticResource DrakonShellActiveBorderBrush}" />
+                                        <Setter Target="RootTransform.ScaleX" Value="1.015" />
+                                        <Setter Target="RootTransform.ScaleY" Value="1.015" />
+                                        <Setter Target="RootTransform.TranslateY" Value="-1" />
+                                        <Setter Target="IconBadge.Background" Value="{StaticResource DrakonAccentBrush}" />
+                                        <Setter Target="BackIcon.Foreground" Value="{StaticResource DrakonShellBackgroundBrush}" />
+                                        <Setter Target="BackTitleText.Foreground" Value="White" />
+                                        <Setter Target="BackSubtitleText.Foreground" Value="{StaticResource DrakonStrongTextBrush}" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Pressed">
+                                    <VisualState.Setters>
+                                        <Setter Target="HoverGlow.Opacity" Value="0.1" />
+                                        <Setter Target="RootBorder.Background" Value="{StaticResource DrakonShellActiveBrush}" />
+                                        <Setter Target="RootBorder.BorderBrush" Value="{StaticResource DrakonShellActiveBorderBrush}" />
+                                        <Setter Target="RootBorder.Opacity" Value="0.94" />
+                                        <Setter Target="RootTransform.ScaleX" Value="0.99" />
+                                        <Setter Target="RootTransform.ScaleY" Value="0.99" />
+                                        <Setter Target="IconBadge.Background" Value="{StaticResource DrakonAccentBrush}" />
+                                        <Setter Target="BackIcon.Foreground" Value="{StaticResource DrakonShellBackgroundBrush}" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Disabled">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootBorder.Opacity" Value="0.45" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                            </VisualStateGroup>
+
+                            <VisualStateGroup x:Name="FocusStates">
+                                <VisualState x:Name="Focused">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootBorder.BorderBrush" Value="{StaticResource DrakonAccentBrush}" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="PointerFocused">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootBorder.BorderBrush" Value="{StaticResource DrakonAccentBrush}" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Unfocused" />
+                            </VisualStateGroup>
+                        </VisualStateManager.VisualStateGroups>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Page.Resources>
+
+    <Grid Background="{StaticResource DrakonShellBackgroundBrush}">
+        <WebView2 x:Name="SiteWebView" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
+
+        <Border
+            x:Name="BackButtonHost"
+            Margin="18,18,0,0"
+            HorizontalAlignment="Left"
+            VerticalAlignment="Top"
+            CornerRadius="999"
+            Visibility="Collapsed">
+            <Button
+                x:Name="BackButton"
+                AutomationProperties.Name="Voltar para o aplicativo"
+                Style="{StaticResource DrakonFloatingBackButtonStyle}" />
+        </Border>
+
+        <Grid
+            x:Name="LoadingOverlay"
+            Background="{StaticResource DrakonOverlayBrush}"
+            Visibility="Collapsed">
+            <Border
+                MaxWidth="760"
+                Padding="34"
+                Background="{StaticResource DrakonPanelBrush}"
+                BorderBrush="{StaticResource DrakonPanelBorderBrush}"
+                BorderThickness="1"
+                CornerRadius="24"
+                HorizontalAlignment="Center"
+                VerticalAlignment="Center">
+                <Grid ColumnSpacing="28">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Grid
+                        Width="104"
+                        Height="104"
+                        HorizontalAlignment="Left"
+                        VerticalAlignment="Top">
+                        <Border
+                            Width="104"
+                            Height="104"
+                            Background="{StaticResource DrakonHeroBrush}"
+                            CornerRadius="30"
+                            Opacity="0.9" />
+                        <Border
+                            Width="76"
+                            Height="76"
+                            Background="{StaticResource DrakonShellBackgroundBrush}"
+                            BorderBrush="{StaticResource DrakonShellChipBorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="24"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center">
+                            <Image
+                                Width="42"
+                                Height="42"
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Center"
+                                Source="ms-appx:///Assets/Branding/icon-dark.png"
+                                Stretch="Uniform" />
+                        </Border>
+                        <ProgressRing
+                            x:Name="LoadingProgressRing"
+                            Width="104"
+                            Height="104"
+                            Foreground="{StaticResource DrakonAccentBrush}"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            IsActive="True" />
+                    </Grid>
+
+                    <StackPanel
+                        Grid.Column="1"
+                        Spacing="18"
+                        VerticalAlignment="Center">
+                        <Image
+                            Height="34"
+                            HorizontalAlignment="Left"
+                            Source="ms-appx:///Assets/Branding/wordmark-dark.png"
+                            Stretch="Uniform" />
+
+                        <StackPanel Spacing="8">
+                            <TextBlock
+                                x:Name="StatusTitleText"
+                                FontSize="30"
+                                FontWeight="SemiBold"
+                                Foreground="{StaticResource DrakonStrongTextBrush}"
+                                Text="Preparando o aplicativo" />
+                            <TextBlock
+                                x:Name="StatusDetailText"
+                                TextWrapping="WrapWholeWords"
+                                Style="{StaticResource DrakonBodyTextStyle}"
+                                Text="Estamos abrindo a interface local com a identidade do produto." />
+                        </StackPanel>
+
+                        <StackPanel
+                            x:Name="OverlayActionsHost"
+                            Orientation="Horizontal"
+                            Spacing="12"
+                            Visibility="Collapsed">
+                            <Button
+                                x:Name="ReloadButton"
+                                Padding="16,10"
+                                Background="{StaticResource DrakonAccentBrush}"
+                                Foreground="White"
+                                Content="Recarregar" />
+                            <Button
+                                x:Name="OpenInBrowserButton"
+                                Padding="16,10"
+                                Background="{StaticResource DrakonShellChipBrush}"
+                                BorderBrush="{StaticResource DrakonShellChipBorderBrush}"
+                                BorderThickness="1"
+                                Foreground="{StaticResource DrakonStrongTextBrush}"
+                                Content="Abrir no navegador" />
+                        </StackPanel>
+                    </StackPanel>
+                </Grid>
+            </Border>
+        </Grid>
+    </Grid>
+</Page>

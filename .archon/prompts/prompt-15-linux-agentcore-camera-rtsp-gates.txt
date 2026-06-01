@@ -1,0 +1,42 @@
+# Prompt 15 - AgentCore, camera, RTSP e frame writer por gates Linux
+
+Objetivo:
+Comecar a ativar capacidades reais do AgentCore no Linux por gates pequenos, removendo dependencias Win32 dos caminhos necessarios para camera/RTSP/thumbnail.
+
+Escopo:
+- Auditar chamadas Win32 em:
+  - `AgentCore.cpp`
+  - `CameraSession.cpp`
+  - `FrameDiskWriter.cpp`
+  - `JobRuntime.cpp`
+- Criar adaptadores POSIX onde necessario.
+- Ativar primeiro somente o menor caminho para:
+  - carregar config;
+  - iniciar uma camera RTSP;
+  - gerar thumbnail;
+  - publicar evento/health.
+- Manter `PERCEPTRUM_ENABLE_*` gates.
+- Nunca ligar tudo de uma vez.
+
+Restricoes:
+- Nao alterar AppHost, `.vcxproj`, `.sln`.
+- Nao quebrar Windows/macOS.
+- Nao fazer commit/push.
+- Nao remover guards `_WIN32`, `__linux__`, `__APPLE__` sem justificativa.
+
+Validacao obrigatoria:
+
+```bash
+cd Perceptrum
+cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build out/build/linux-debug -j$(nproc)
+ctest --test-dir out/build/linux-debug --output-on-failure
+```
+
+Relatorio:
+Criar `.archon/plans/relatorio-fase15-linux-agentcore-camera-rtsp-gates.md` com:
+- gates ativados;
+- fontes pesados que entraram;
+- fontes que continuam fora;
+- testes de regressao;
+- riscos restantes.

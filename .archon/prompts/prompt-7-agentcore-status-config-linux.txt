@@ -1,0 +1,316 @@
+PROMPT 7 - CONTRATO LEVE DE STATUS/CONFIG DO AGENTCORE PARA LINUX
+
+Atue como engenheiro senior de C++23, CMake, Linux/Ubuntu, arquitetura multiplataforma, runtime headless, AgentCore, contratos portaveis, feature gates, pairing seguro, logging seguro, CTest e refatoracao segura.
+
+Contexto:
+Estou no Ubuntu, no projeto:
+
+/home/marcello-guimaraes/dev/perceptrum_desktop_aspp
+
+As Fases 1 a 6 ja foram executadas.
+
+Estado atual apos a Fase 6:
+- Existe base Linux CMake reprodutivel.
+- Existe perceptrum-agent.
+- Existe perceptrum-desktop stub.
+- APP_RUNTIME_* funciona.
+- XDG fallback funciona.
+- logs e agent_health.json funcionam.
+- pairing/provisioning/config funcionam no agente Linux minimo.
+- HeadlessService.cpp compila no build Linux com PERCEPTRUM_LINUX_BUILD.
+- Interfaces portaveis existem em Perceptrum/Perceptrum/runtime/interfaces/.
+- Adaptadores Linux existem em Perceptrum/linux/LinuxRuntimeAdapters.h/.cpp.
+- LinuxMinimalAgentRuntime substituiu o antigo Noop.
+- Feature gates pesados existem e ficam OFF por padrao:
+  PERCEPTRUM_ENABLE_AGENT_CORE
+  PERCEPTRUM_ENABLE_CAMERA_CAPTURE
+  PERCEPTRUM_ENABLE_RTSP_CAPTURE
+  PERCEPTRUM_ENABLE_JOB_RUNTIME
+  PERCEPTRUM_ENABLE_FRAME_WRITER
+- CTest passou com 30/30 testes.
+- AppHost, .vcxproj e .sln nao foram alterados.
+- Nenhum commit foi feito.
+
+Relatorio anterior:
+.archon/plans/relatorio-fase6-linux-agentruntime-minimo.md
+
+Recomendacao do relatorio:
+Extrair um contrato leve de status/config de AgentCore que nao inclua CameraSession, FrameDiskWriter, OpenCV ou Win32; depois migrar PairingClient legado para RuntimePaths/ITokenStore e preparar um AgentCore parcial Linux que continue com camera/RTSP/jobs atras dos gates.
+
+Objetivo desta Fase 7:
+Criar uma fronteira portavel e compilavel no Linux para status/config do AgentCore, sem integrar o AgentCore completo ainda.
+
+Esta fase deve aproximar o Linux do runtime real, mas apenas por contratos leves e testaveis:
+1. definir tipos/contratos portaveis de status/config do AgentCore;
+2. expor esses contratos no LinuxMinimalAgentRuntime;
+3. preparar um caminho de AgentCore parcial Linux sem puxar CameraSession, FrameDiskWriter, OpenCV, Win32, RTSP ou JobRuntime;
+4. auditar PairingClient legado e, se for baixo risco, iniciar alinhamento a RuntimePaths/ITokenStore; caso contrario, documentar bloqueios claramente;
+5. preservar Windows/macOS.
+
+Esta fase NAO deve:
+- converter interface desktop completa;
+- implementar telas;
+- ativar camera real;
+- ativar RTSP;
+- ativar FrameDiskWriter real;
+- ativar JobRuntime real;
+- integrar AgentCore.cpp completo se ele ainda arrastar Win32/OpenCV/camera/jobs;
+- alterar AppHost;
+- alterar .vcxproj;
+- alterar .sln;
+- fazer commit;
+- fazer push;
+- instalar pacotes apt.
+
+Arquivos a ler antes de alterar:
+- .archon/plans/relatorio-fase6-linux-agentruntime-minimo.md
+- .archon/plans/relatorio-fase5-headless-interfaces-logging-linux.md
+- .archon/plans/relatorio-fase4-headlessservice-linux-safe.md
+- .archon/plans/anchor-riscos-multiplataforma.md
+- .archon/plans/anchor-matriz-paridade-windows-linux.md
+- Perceptrum/CMakeLists.txt
+- Perceptrum/linux/main.cpp
+- Perceptrum/linux/RuntimePaths.h
+- Perceptrum/linux/RuntimePaths.cpp
+- Perceptrum/linux/LinuxHeadlessRuntime.h
+- Perceptrum/linux/LinuxHeadlessRuntime.cpp
+- Perceptrum/linux/LinuxRuntimeAdapters.h
+- Perceptrum/linux/LinuxRuntimeAdapters.cpp
+- Perceptrum/Perceptrum/runtime/interfaces/IRuntimeLogger.h
+- Perceptrum/Perceptrum/runtime/interfaces/ITokenStore.h
+- Perceptrum/Perceptrum/runtime/interfaces/IAgentRuntime.h
+- Perceptrum/Perceptrum/runtime/interfaces/IHeadlessRuntime.h
+- Perceptrum/Perceptrum/runtime/HeadlessService.cpp
+- Perceptrum/Perceptrum/runtime/HeadlessService.h
+- Perceptrum/Perceptrum/runtime/BrandingRuntime.cpp
+- Perceptrum/Perceptrum/runtime/BrandingRuntime.h
+- Perceptrum/Perceptrum/logging/Logging.cpp
+- Perceptrum/Perceptrum/logging/Logging.h
+- Perceptrum/Perceptrum/core/AgentCore.cpp
+- Perceptrum/Perceptrum/core/AgentCore.h
+- Perceptrum/Perceptrum/camera/CameraSession.cpp
+- Perceptrum/Perceptrum/camera/CameraSession.h
+- Perceptrum/Perceptrum/camera/FrameDiskWriter.cpp
+- Perceptrum/Perceptrum/camera/FrameDiskWriter.h
+- Perceptrum/Perceptrum/jobs/JobRuntime.cpp
+- Perceptrum/Perceptrum/jobs/JobRuntime.h
+- Perceptrum/Perceptrum/comm/PairingClient.cpp
+- Perceptrum/Perceptrum/comm/PairingClient.h
+- Perceptrum/Perceptrum/comm/BackendConfig.h
+- Perceptrum/Perceptrum/comm/SecureLocalStore.cpp
+- Perceptrum/Perceptrum/comm/SecureLocalStore.h
+- Perceptrum/Perceptrum/orchestrator/ChatModelConfig.cpp
+- Perceptrum/Perceptrum/orchestrator/ChatModelConfig.h
+- Perceptrum/Perceptrum/orchestrator/ConfigUtils.cpp
+- Perceptrum/Perceptrum/orchestrator/ConfigUtils.h
+- Perceptrum/Perceptrum/platform/platform_common.cpp
+- Perceptrum/Perceptrum/platform/platform_common.h
+- Perceptrum/Perceptrum/platform/platform_secure_store.cpp
+- Perceptrum/Perceptrum/platform/platform_secure_store.h
+- brand.config.json
+
+Regras absolutas:
+1. Nao fazer commit.
+2. Nao fazer push.
+3. Nao executar git reset --hard.
+4. Nao apagar codigo.
+5. Nao alterar AppHost.
+6. Nao alterar .vcxproj.
+7. Nao alterar .sln.
+8. Nao quebrar Windows.
+9. Nao quebrar macOS.
+10. Nao copiar codigo de Perceptrum/out como fonte.
+11. Perceptrum/out e artefato historico, nao fonte canonica.
+12. Nao transformar Linux em site externo.
+13. Nao implementar interface completa.
+14. Nao ativar camera/RTSP.
+15. Nao ativar FrameDiskWriter real.
+16. Nao ativar JobRuntime real.
+17. Nao expor tokens/secrets em log, terminal, status ou health JSON.
+18. Usar somente Codex/gpt-5.5.
+19. Nao usar Claude, opus, sonnet ou haiku.
+20. Se precisar de apt install, parar e informar exatamente o comando.
+
+Implementar nesta fase:
+
+A. Contrato leve de status/config do AgentCore
+Criar uma fronteira portavel, pequena e sem dependencias pesadas para status/config do AgentCore.
+
+Sugestoes de local/nome, ajustar conforme o design mais limpo:
+- Perceptrum/Perceptrum/runtime/interfaces/IAgentCoreStatusProvider.h
+- Perceptrum/Perceptrum/runtime/interfaces/AgentCoreStatusContract.h
+- Perceptrum/Perceptrum/core/AgentCoreStatus.h
+
+O contrato deve evitar:
+- AgentCore.h se ele incluir CameraSession/FrameDiskWriter;
+- CameraSession;
+- FrameDiskWriter;
+- OpenCV;
+- Win32;
+- RTSP;
+- JobRuntime;
+- headers *_old.
+
+O contrato deve permitir reportar, no minimo:
+1. nome do provedor/status provider;
+2. se AgentCore completo esta ativo;
+3. se existe modo parcial/leve;
+4. quais capacidades estao disponiveis;
+5. quais capacidades estao bloqueadas por gates;
+6. motivo tecnico de bloqueio quando houver;
+7. origem da config usada pelo runtime Linux;
+8. estado de config carregada ou invalida;
+9. versao/contract_version.
+
+B. Integracao com LinuxMinimalAgentRuntime
+Atualizar LinuxMinimalAgentRuntime para usar esse contrato leve.
+
+Comportamento esperado:
+1. por padrao, AgentCore completo continua desativado;
+2. agent_core_enabled continua false enquanto AgentCore completo nao estiver seguro;
+3. se houver contrato parcial, agent_core_partial pode ser true somente se houver implementacao real do contrato leve;
+4. health/status deve expor campos claros como:
+   - agent_core_status_provider
+   - agent_core_contract_version
+   - agent_core_partial
+   - agent_core_blocked_reason
+   - agent_core_config_source
+   - agent_core_capabilities
+5. nao expor tokens.
+
+C. Preparar AgentCore parcial sem puxar o AgentCore completo
+Auditar AgentCore.h/.cpp e identificar se existe uma fatia leve extraivel agora.
+
+Se for baixo risco:
+1. mover apenas tipos simples/status/config para um header/source portavel;
+2. compilar esse componente no Linux;
+3. nao puxar AgentCore.cpp completo;
+4. nao puxar CameraSession, FrameDiskWriter, OpenCV, Win32, RTSP ou JobRuntime;
+5. adicionar teste CTest confirmando que o componente leve entra no alvo e o AgentCore completo nao entra.
+
+Se nao for baixo risco:
+1. nao forcar;
+2. criar apenas contrato/adaptador Linux minimo;
+3. documentar no relatorio quais includes/tipos impedem a extracao agora.
+
+D. PairingClient legado e RuntimePaths/ITokenStore
+Auditar PairingClient e config legado.
+
+Se for baixo risco nesta fase:
+1. iniciar um adaptador que permita PairingClient usar RuntimePaths/ITokenStore ou config explicita;
+2. preservar API antiga para Windows;
+3. nao ler exe_token/client_id/exe_id relativos ao CWD no caminho Linux novo;
+4. nao expor token.
+
+Se nao for baixo risco:
+1. nao alterar PairingClient;
+2. documentar bloqueios concretos;
+3. manter o fluxo Linux ja validado de provision/pair do agente minimo.
+
+E. Health/status
+Atualizar agent_health.json e status para refletir o novo contrato leve.
+
+Obrigatorio:
+1. manter todos os campos existentes usados pelos testes anteriores;
+2. adicionar campos novos sem quebrar compatibilidade;
+3. manter runtime_mode=linux_minimal enquanto AgentCore completo nao estiver ativo;
+4. manter feature gates no JSON;
+5. garantir que TEST_TOKEN ou tokens reais nao aparecam em data/state/log/status/health.
+
+F. CMake
+Atualizar Perceptrum/CMakeLists.txt se necessario:
+1. adicionar apenas fontes novas leves;
+2. manter lista explicita;
+3. nao globar;
+4. nao incluir AppHost;
+5. nao incluir .vcxproj/.sln;
+6. nao incluir *_old.cpp;
+7. nao incluir CameraSession.cpp;
+8. nao incluir FrameDiskWriter.cpp;
+9. nao incluir JobRuntime.cpp;
+10. nao incluir AgentCore.cpp completo se ele ainda arrastar Win32/OpenCV/camera/jobs.
+
+G. CTest
+Adicionar ou atualizar testes para:
+1. status/health reportam agent_core_status_provider.
+2. status/health reportam agent_core_contract_version.
+3. status/health reportam agent_core_blocked_reason quando AgentCore completo esta fora.
+4. contrato leve compila no alvo Linux, se houver fonte/header novo.
+5. AgentCore.cpp completo continua fora do alvo Linux, se ainda bloqueado.
+6. CameraSession.cpp, FrameDiskWriter.cpp e JobRuntime.cpp continuam fora do alvo Linux.
+7. feature gates pesados continuam OFF por padrao.
+8. ativar gate pesado ainda retorna erro funcional claro.
+9. status/health/logs nao expoem secrets.
+10. AppHost/.vcxproj/.sln continuam intocados.
+11. testes anteriores continuam passando.
+
+Validacao obrigatoria:
+Executar:
+
+cd Perceptrum
+cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build out/build/linux-debug -j$(nproc)
+ctest --test-dir out/build/linux-debug --output-on-failure
+
+Executar tambem manualmente com runtime isolado:
+
+export APP_RUNTIME_DATA_ROOT=/tmp/perceptrum-runtime-test/data
+export APP_RUNTIME_CONFIG_ROOT=/tmp/perceptrum-runtime-test/config
+export APP_RUNTIME_CACHE_ROOT=/tmp/perceptrum-runtime-test/cache
+export APP_RUNTIME_STATE_ROOT=/tmp/perceptrum-runtime-test/state
+export APP_RUNTIME_LOG_ROOT=/tmp/perceptrum-runtime-test/state/logs
+
+rm -rf /tmp/perceptrum-runtime-test
+mkdir -p "$APP_RUNTIME_DATA_ROOT" "$APP_RUNTIME_CONFIG_ROOT" "$APP_RUNTIME_CACHE_ROOT" "$APP_RUNTIME_STATE_ROOT" "$APP_RUNTIME_LOG_ROOT"
+
+./out/build/linux-debug/perceptrum-agent --help
+./out/build/linux-debug/perceptrum-agent version
+./out/build/linux-debug/perceptrum-agent validate-config
+./out/build/linux-debug/perceptrum-agent check-deps
+
+APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 ./out/build/linux-debug/perceptrum-agent provision --base-url http://localhost:4000 --exe-token TEST_TOKEN --client-id test-client --timezone America/Manaus || true
+
+timeout 10s ./out/build/linux-debug/perceptrum-agent run || true
+./out/build/linux-debug/perceptrum-agent status || true
+./out/build/linux-debug/perceptrum-agent healthcheck || true
+
+find /tmp/perceptrum-runtime-test -maxdepth 5 -type f -print
+grep -R "TEST_TOKEN" /tmp/perceptrum-runtime-test/data /tmp/perceptrum-runtime-test/state 2>/dev/null || true
+
+Saida obrigatoria:
+Gerar relatorio em:
+
+.archon/plans/relatorio-fase7-agentcore-status-config-linux.md
+
+O relatorio deve conter:
+1. Arquivos lidos.
+2. Arquivos criados.
+3. Arquivos alterados.
+4. Contrato leve de AgentCore criado.
+5. Campos novos de health/status.
+6. Estado de AgentCore completo no build Linux.
+7. Se AgentCore completo entrou ou nao, e por que.
+8. Estado de CameraSession/FrameDiskWriter/JobRuntime no build Linux.
+9. Auditoria de PairingClient e decisao tomada.
+10. Como tokens/logs ficaram protegidos.
+11. Quais testes foram adicionados/alterados.
+12. Resultado do CMake.
+13. Resultado do build.
+14. Resultado do ctest.
+15. Resultado dos comandos manuais.
+16. Confirmacao de que AppHost nao foi alterado.
+17. Confirmacao de que .vcxproj e .sln nao foram alterados.
+18. Confirmacao de que nenhum commit foi feito.
+19. Riscos pendentes.
+20. Proxima fase recomendada.
+
+Criterio de sucesso:
+A Fase 7 so e considerada concluida se:
+- build Linux continuar reprodutivel;
+- ctest passar;
+- existir contrato leve de status/config do AgentCore;
+- LinuxMinimalAgentRuntime reportar esse contrato;
+- AgentCore completo/camera/RTSP/FrameDiskWriter/JobRuntime nao forem ativados indevidamente;
+- status/health/logs nao expuserem secrets;
+- AppHost/.vcxproj/.sln nao forem alterados;
+- nenhum commit for feito.

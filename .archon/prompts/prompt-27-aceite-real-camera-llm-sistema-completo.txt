@@ -1,0 +1,65 @@
+# Prompt 27 - Aceite real de camera, LLM e sistema completo
+
+Objetivo:
+Executar aceite funcional completo no Ubuntu com o maximo possivel de recursos reais, e separar claramente o que depende de hardware/chaves externas.
+
+Contexto obrigatorio:
+- Leia `.archon/plans/relatorio-fase26-secure-store-logging-packaging-final.md`.
+- Use o app integrado e empacotado.
+
+Restricoes:
+- Nao fazer push.
+- Nao imprimir chaves.
+- Nao chamar LLM pago sem chave explicitamente configurada pelo usuario no ambiente/banco.
+- Nao apagar banco/dados do usuario.
+- Se precisar de camera real ou chave real e elas nao estiverem disponiveis, registrar bloqueador objetivo e continuar com teste sintetico.
+
+Tarefas:
+1. Subir o app Linux via script dev e via binario/pacote quando possivel.
+2. Validar UI:
+   - dashboard;
+   - cameras;
+   - jobs;
+   - chat;
+   - events;
+   - billing;
+   - settings;
+   - account/workspace/shared camera.
+3. Validar backend:
+   - health;
+   - local session;
+   - SQLite;
+   - R2/local storage;
+   - camera discovery.
+4. Validar agente:
+   - status;
+   - healthcheck;
+   - start/stop;
+   - comandos.
+5. Validar camera:
+   - sinteticamente com `lavfi`;
+   - se houver `APP_AGENT_RTSP_URL` real, validar captura real;
+   - validar thumbnails, clips, events e recordings nos diretorios corretos.
+6. Validar jobs:
+   - criar job de teste;
+   - iniciar/parar;
+   - verificar comandos/tabelas/results.
+7. Validar LLM:
+   - provider fake/local em teste automatizado;
+   - provider real somente se chave estiver configurada;
+   - verificar erros claros quando chave faltar.
+8. Validar visual:
+   - Linux host dark/light;
+   - browser dark/light;
+   - registrar pendencia Windows WebView2 se nao estiver em Windows.
+
+Validacao obrigatoria:
+```bash
+./Perceptrum/linux-desktop/run-linux-dev.sh --check-backend --print-web-root --no-open
+cd DrakonSite && npm run visual:linux
+cd Perceptrum && ctest --test-dir out/build/linux-release --output-on-failure
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase27-aceite-real-camera-llm-sistema-completo.md`.
+- O relatorio deve ser binario por recurso: OK, OK sintetico, BLOQUEADO por hardware/chave, ou FALHA com log/caminho.

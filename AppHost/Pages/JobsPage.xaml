@@ -1,0 +1,397 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Background="Transparent"
+    RequestedTheme="Dark">
+
+    <Grid Padding="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="16" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="16" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Spacing="6">
+            <TextBlock
+                Style="{StaticResource DrakonDisplayTitleTextStyle}"
+                Text="Jobs" />
+            <TextBlock
+                Style="{StaticResource DrakonBodyTextStyle}"
+                Text="Port nativo do cockpit de jobs do DrakonSite com catalogo, agenda recorrente, start-stop, steps e sincronizacao com o runtime de orquestracao."
+                TextWrapping="WrapWholeWords" />
+        </StackPanel>
+
+        <InfoBar
+            x:Name="JobsInfoBar"
+            Grid.Row="2"
+            IsOpen="False"
+            IsClosable="True"
+            Severity="Informational" />
+
+        <ScrollViewer
+            Grid.Row="4"
+            VerticalScrollBarVisibility="Auto">
+            <StackPanel Spacing="16">
+                <Border Style="{StaticResource DrakonHeroPanelStyle}">
+                    <Grid ColumnSpacing="16" RowSpacing="12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <StackPanel Spacing="8">
+                            <TextBlock
+                                Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                Text="Agendamento recorrente, steps e disparo manual do runtime" />
+                            <TextBlock
+                                Style="{StaticResource DrakonBodyTextStyle}"
+                                Text="A pagina WinUI 3 ja cobre lista de jobs, CRUD basico, steps, start-stop e leitura de estado operacional. O editor avancado de agents, alerts e regions entra no proximo slice."
+                                TextWrapping="WrapWholeWords" />
+                            <TextBlock
+                                x:Name="JobsTimezoneText"
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Timezone global: UTC" />
+                        </StackPanel>
+
+                        <Button
+                            x:Name="JobsRefreshButton"
+                            Grid.Column="1"
+                            Content="Refresh"
+                            HorizontalAlignment="Right"
+                            VerticalAlignment="Top"
+                            Style="{StaticResource AccentButtonStyle}" />
+                    </Grid>
+                </Border>
+
+                <Grid
+                    x:Name="JobsMetricsGrid"
+                    ColumnSpacing="16"
+                    RowSpacing="16">
+                    <Grid.RowDefinitions>
+                        <RowDefinition x:Name="JobsMetricsFirstRow" Height="Auto" />
+                        <RowDefinition x:Name="JobsMetricsSecondRow" Height="0" />
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition x:Name="JobsMetricsFirstColumn" Width="*" />
+                        <ColumnDefinition x:Name="JobsMetricsSecondColumn" Width="*" />
+                        <ColumnDefinition x:Name="JobsMetricsThirdColumn" Width="*" />
+                        <ColumnDefinition x:Name="JobsMetricsFourthColumn" Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Border
+                        x:Name="TotalJobsMetricBorder"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <StackPanel Spacing="8">
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Jobs" />
+                            <TextBlock
+                                x:Name="TotalJobsMetricValueText"
+                                FontSize="28"
+                                FontWeight="SemiBold"
+                                Text="0" />
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Catalogo sincronizado do modulo operacional." />
+                        </StackPanel>
+                    </Border>
+
+                    <Border
+                        x:Name="ActiveJobsMetricBorder"
+                        Grid.Column="1"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <StackPanel Spacing="8">
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Agendados" />
+                            <TextBlock
+                                x:Name="ActiveJobsMetricValueText"
+                                FontSize="28"
+                                FontWeight="SemiBold"
+                                Text="0" />
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Jobs em draft ou schedule ativo no cockpit." />
+                        </StackPanel>
+                    </Border>
+
+                    <Border
+                        x:Name="RuntimeJobsMetricBorder"
+                        Grid.Column="2"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <StackPanel Spacing="8">
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Runtime" />
+                            <TextBlock
+                                x:Name="RuntimeJobsMetricValueText"
+                                FontSize="28"
+                                FontWeight="SemiBold"
+                                Text="0" />
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Jobs em running, stopping ou falha." />
+                        </StackPanel>
+                    </Border>
+
+                    <Border
+                        x:Name="CamerasMetricBorder"
+                        Grid.Column="3"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <StackPanel Spacing="8">
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Cameras" />
+                            <TextBlock
+                                x:Name="CamerasMetricValueText"
+                                FontSize="28"
+                                FontWeight="SemiBold"
+                                Text="0" />
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Inventario usado pelos jobs do runtime." />
+                        </StackPanel>
+                    </Border>
+                </Grid>
+
+                <Grid
+                    x:Name="JobsTopGrid"
+                    ColumnSpacing="16"
+                    RowSpacing="16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition x:Name="JobsTopFirstColumn" Width="*" />
+                        <ColumnDefinition x:Name="JobsTopSecondColumn" Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Border
+                        x:Name="CreateJobBorder"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock
+                                Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                Text="Novo job" />
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Sintaxe de agenda: weekly = Monday 08:00-18:00; monthly = 15 08:00-18:00; yearly = 12/25 08:00-18:00"
+                                TextWrapping="WrapWholeWords" />
+
+                            <TextBox
+                                x:Name="CreateJobNameTextBox"
+                                PlaceholderText="Nome do job" />
+                            <TextBox
+                                x:Name="CreateJobDescriptionTextBox"
+                                AcceptsReturn="True"
+                                MinHeight="96"
+                                PlaceholderText="Descricao operacional do job..."
+                                TextWrapping="Wrap" />
+                            <ComboBox x:Name="CreateScheduleModeComboBox" />
+                            <TextBox
+                                x:Name="CreateScheduleTextBox"
+                                AcceptsReturn="True"
+                                MinHeight="96"
+                                PlaceholderText="Monday 08:00-18:00; Tuesday 09:00-17:00"
+                                TextWrapping="Wrap" />
+                            <Grid ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+
+                                <TextBox
+                                    x:Name="CreateActiveFromTextBox"
+                                    PlaceholderText="Active from (YYYY-MM-DD)" />
+                                <TextBox
+                                    x:Name="CreateActiveUntilTextBox"
+                                    Grid.Column="1"
+                                    PlaceholderText="Active until (YYYY-MM-DD or blank)" />
+                            </Grid>
+
+                            <Button
+                                x:Name="CreateJobButton"
+                                Content="Criar job"
+                                Style="{StaticResource AccentButtonStyle}" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border
+                        x:Name="CatalogJobsBorder"
+                        Grid.Column="1"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <Grid RowSpacing="12">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="Catalogo de jobs" />
+                                <TextBlock
+                                    x:Name="JobsCatalogSummaryText"
+                                    Style="{StaticResource DrakonCaptionTextStyle}"
+                                    Text="0 job(s) carregados." />
+                            </StackPanel>
+
+                            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                                <StackPanel
+                                    x:Name="JobsCatalogItemsHost"
+                                    Spacing="12" />
+                            </ScrollViewer>
+                        </Grid>
+                    </Border>
+                </Grid>
+
+                <Grid
+                    x:Name="JobsBottomGrid"
+                    ColumnSpacing="16"
+                    RowSpacing="16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition x:Name="JobsBottomFirstColumn" Width="*" />
+                        <ColumnDefinition x:Name="JobsBottomSecondColumn" Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Border
+                        x:Name="SelectedJobBorder"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock
+                                Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                Text="Job selecionado" />
+
+                            <StackPanel Spacing="4">
+                                <TextBlock
+                                    x:Name="SelectedJobTitleText"
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="Nenhum job selecionado" />
+                                <TextBlock
+                                    x:Name="SelectedJobStatusText"
+                                    Style="{StaticResource DrakonCaptionTextStyle}"
+                                    Text="Abra um job para editar schedule e operacao." />
+                                <TextBlock
+                                    x:Name="SelectedJobScheduleText"
+                                    Style="{StaticResource DrakonBodyTextStyle}"
+                                    Text="Sem agenda carregada."
+                                    TextWrapping="WrapWholeWords" />
+                            </StackPanel>
+
+                            <TextBox
+                                x:Name="EditJobNameTextBox"
+                                PlaceholderText="Nome do job" />
+                            <TextBox
+                                x:Name="EditJobDescriptionTextBox"
+                                AcceptsReturn="True"
+                                MinHeight="88"
+                                PlaceholderText="Descricao operacional..."
+                                TextWrapping="Wrap" />
+                            <ComboBox x:Name="EditScheduleModeComboBox" />
+                            <TextBox
+                                x:Name="EditScheduleTextBox"
+                                AcceptsReturn="True"
+                                MinHeight="96"
+                                PlaceholderText="Monday 08:00-18:00; Tuesday 09:00-17:00"
+                                TextWrapping="Wrap" />
+                            <Grid ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+
+                                <TextBox
+                                    x:Name="EditActiveFromTextBox"
+                                    PlaceholderText="Active from (YYYY-MM-DD)" />
+                                <TextBox
+                                    x:Name="EditActiveUntilTextBox"
+                                    Grid.Column="1"
+                                    PlaceholderText="Active until (YYYY-MM-DD or blank)" />
+                            </Grid>
+
+                            <StackPanel
+                                Orientation="Horizontal"
+                                Spacing="10">
+                                <Button
+                                    x:Name="SaveSelectedJobButton"
+                                    Content="Salvar"
+                                    Style="{StaticResource AccentButtonStyle}" />
+                                <Button
+                                    x:Name="StartSelectedJobButton"
+                                    Content="Start" />
+                                <Button
+                                    x:Name="StopSelectedJobButton"
+                                    Content="Stop" />
+                                <Button
+                                    x:Name="DeleteSelectedJobButton"
+                                    Content="Excluir" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <Border
+                        x:Name="StepsBorder"
+                        Grid.Column="1"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <Grid RowSpacing="12">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="Steps" />
+                                <TextBlock
+                                    x:Name="StepsSummaryText"
+                                    Style="{StaticResource DrakonCaptionTextStyle}"
+                                    Text="Selecione um job para ver os steps." />
+                            </StackPanel>
+
+                            <Grid
+                                Grid.Row="1"
+                                ColumnSpacing="10"
+                                RowSpacing="10">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+
+                                <TextBox
+                                    x:Name="CreateStepNameTextBox"
+                                    PlaceholderText="Nome do step" />
+                                <TextBox
+                                    x:Name="CreateStepOrderTextBox"
+                                    Grid.Column="1"
+                                    MinWidth="72"
+                                    PlaceholderText="Ordem" />
+                                <TextBox
+                                    x:Name="CreateStepTimeoutTextBox"
+                                    Grid.Column="2"
+                                    MinWidth="96"
+                                    PlaceholderText="Timeout s" />
+                                <Button
+                                    x:Name="CreateStepButton"
+                                    Grid.Column="3"
+                                    Content="Add step" />
+                            </Grid>
+
+                            <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+                                <StackPanel
+                                    x:Name="StepsItemsHost"
+                                    Spacing="12" />
+                            </ScrollViewer>
+                        </Grid>
+                    </Border>
+                </Grid>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</Page>

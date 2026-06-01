@@ -1,0 +1,73 @@
+# Prompt 29 - Corrigir causa raiz do Start da camera no Linux
+
+Objetivo:
+Corrigir a falha atual em que a UI enfileira `start_camera`, mas o backend marca timeout com `camera start timed out waiting for Linux agent`. Antes de refatorar captura profunda, alinhar host, backend, agente, banco, pairing, heartbeat e paths para garantir que o agente residente realmente receba comandos do mesmo runtime que a UI usa.
+
+Contexto obrigatorio:
+- Leia os prompts e relatorios das fases 20 a 28.
+- Leia estes arquivos:
+  - `Perceptrum/linux-desktop/main.cpp`
+  - `Perceptrum/linux-desktop/run-linux-dev.sh`
+  - `Perceptrum/linux/RuntimePaths.cpp`
+  - `Perceptrum/linux/LinuxHeadlessRuntime.cpp`
+  - `Perceptrum/linux/LinuxRuntimeAdapters.cpp`
+  - `Perceptrum/linux/LinuxJobRuntime.cpp`
+  - `DrakonSite/server/index.ts`
+  - `DrakonSite/server/brand.ts`
+  - `DrakonSite/src/worker/index.ts`
+  - `AppHost/Runtime/desktop-local-server.mjs`
+- Inspecione tambem o banco local real usado pelo Ubuntu, mas nao grave segredos no relatorio:
+  - `~/.local/share/PerceptrumData/storage/sqlite/local-site/perceptrum_site.sqlite`
+  - `~/.local/share/PerceptrumData/local-site/perceptrum_site.sqlite`
+
+Diagnostico esperado:
+- Confirmar qual backend esta ativo em `127.0.0.1:4000`.
+- Confirmar qual `SQLITE_DB_PATH`, `STORAGE_ROOT`, `APP_RUNTIME_DATA_ROOT`, `APP_RUNTIME_CONFIG_ROOT`, `APP_RUNTIME_CACHE_ROOT`, `APP_RUNTIME_STATE_ROOT` e `APP_RUNTIME_LOG_ROOT` o backend e o agente recebem.
+- Confirmar se `perceptrum-agent run` fica residente enquanto a janela esta aberta.
+- Confirmar se o agente usa o mesmo `client_id`, `exe_id`, token e base URL que o backend usa para selecionar `commands`.
+- Confirmar se `/api/agent/commands?client_id=...` retorna comandos pendentes quando chamado com o token do agente.
+
+Restricoes:
+- Nao fazer commit.
+- Nao fazer push.
+- Nao apagar dados do usuario.
+- Nao imprimir API keys, tokens, senhas ou hashes de token completos em relatorio.
+- Nao mascarar falhas: se o agente nao iniciar, relatar o erro real e corrigir.
+
+Tarefas:
+1. Corrigir o launcher Linux para que backend e agente sempre usem os mesmos roots XDG e o mesmo banco SQLite absoluto. Evitar `SQLITE_DB_PATH` relativo como `storage/sqlite/local-site/perceptrum_site.sqlite` quando o runtime esta em modo desktop.
+2. Corrigir `LaunchResidentAgentProcess` para registrar log claro quando o agente sai imediatamente, incluindo exit code e stderr quando disponivel.
+3. Adicionar health/heartbeat robusto:
+   - o host deve considerar snapshot stale como agente nao ativo;
+   - o backend deve conseguir expor diagnostico local do agente sem segredos;
+   - o Start da camera deve falhar cedo com `linux_agent_not_running` se nao houver agente realmente pollando.
+4. Garantir que `run-linux-dev.sh` derrube ou evite backend antigo que esteja ocupando porta 4000 com build divergente, ou use porta alternativa explicitamente e propague para agente/backend/UI.
+5. Adicionar teste/smoke que simule:
+   - provisionamento local;
+   - agente pollando `/api/agent/commands`;
+   - comando `probe_webcams` ou `start_camera` chegando ao agente;
+   - resultado voltando ao backend antes de timeout.
+6. Atualizar `RUNBOOK-LINUX.md` com comandos de diagnostico:
+   - processos ativos;
+   - env do backend;
+   - agent health;
+   - commands pendentes;
+   - logs.
+
+Validacao obrigatoria:
+```bash
+git status --short --branch
+(cd DrakonSite && npm run build)
+(cd Perceptrum && cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPERCEPTRUM_ENABLE_AGENT_CORE=ON -DPERCEPTRUM_ENABLE_CAMERA_CAPTURE=ON -DPERCEPTRUM_ENABLE_RTSP_CAPTURE=ON -DPERCEPTRUM_ENABLE_FRAME_WRITER=ON -DPERCEPTRUM_ENABLE_JOB_RUNTIME=ON)
+(cd Perceptrum && cmake --build out/build/linux-debug -j$(nproc))
+(cd Perceptrum && ctest --test-dir out/build/linux-debug -R 'agent|linux|job|camera' --output-on-failure)
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase29-linux-camera-start-root-cause-session-alignment.md`.
+- O relatorio deve conter:
+  - causa raiz encontrada;
+  - arquivos alterados;
+  - comandos executados;
+  - como saber se backend e agente estao usando o mesmo banco;
+  - comando exato para abrir o app e confirmar que o agente esta pollando.

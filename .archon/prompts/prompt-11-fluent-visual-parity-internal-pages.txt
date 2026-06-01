@@ -1,0 +1,46 @@
+# Prompt 11 - Paridade visual Fluent nas paginas internas
+
+Objetivo:
+Consolidar as paginas internas do React nos mesmos tokens Fluent usados pelo shell, eliminando cards, sombras, bordas, gradientes e cores soltas que criem diferenca visual entre Windows WebView2 e Linux WebKitGTK.
+
+Escopo:
+- Auditar `DrakonSite/src/react-app/index.css`, `Layout.tsx` e paginas internas:
+  - Dashboard
+  - Cameras
+  - AIAgents
+  - Jobs
+  - Chat
+  - Settings
+  - Events
+  - Billing
+- Trocar estilos locais por tokens/classes comuns.
+- Manter experiencia visual bonita, densa e operacional, sem landing page.
+- Usar a bateria visual existente em `DrakonSite/scripts/visual-battery.mjs`.
+- Expandir a bateria visual se necessario para cobrir rotas e temas.
+
+Restricoes:
+- Nao colocar WinUI/WebView2/GTK no React comum.
+- Nao alterar AppHost.
+- Nao alterar `.vcxproj` ou `.sln`.
+- Nao fazer commit/push.
+- Nao reduzir a UI para visual generico; preservar identidade Perceptrum.
+
+Validacao obrigatoria:
+
+```bash
+cd DrakonSite
+npm run build
+npm run test:platform-boundaries
+npm run visual:browser -- --routes=/dashboard,/cameras,/ai-agents,/jobs,/chat,/settings --themes=dark,light
+npm run visual:linux -- --routes=/dashboard,/cameras,/ai-agents,/jobs,/chat,/settings --themes=dark,light
+```
+
+Se alguma dependencia visual local estiver ausente, documentar. Nao instalar apt sem parar e informar o comando.
+
+Relatorio:
+Criar `.archon/plans/relatorio-fase11-fluent-visual-parity-internal-pages.md` com:
+- paginas auditadas;
+- componentes/classes consolidadas;
+- artefatos visuais gerados;
+- diferencas restantes entre browser/Linux/Windows;
+- confirmacao de que React comum segue sem dependencia WinUI/GTK.

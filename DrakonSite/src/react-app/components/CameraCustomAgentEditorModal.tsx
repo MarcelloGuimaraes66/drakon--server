@@ -1,0 +1,4200 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Maximize2, Minimize2, Sparkles, Trash2, X } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { useOnboarding } from "@/react-app/hooks/useOnboarding";
+import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
+import {
+  FACE_ID_MAX_IMAGE_SIDE_PX,
+  FACE_ID_MAX_UPLOAD_BYTES,
+  normalizeFaceIdImage,
+} from "@/react-app/utils/faceIdImage";
+import {
+  emitOpenAiKeyRequiredPrompt,
+  emitZAiKeyRequiredPrompt,
+  isOpenAiKeyRequiredError,
+  isZAiKeyRequiredError,
+} from "@/react-app/utils/openAiKeyGuard";
+import {
+  getCoreModelNoticeCopy,
+  shouldShowCoreModelNotice,
+} from "@/react-app/utils/coreModelNotice";
+import { isGeneratedCustomAgentName } from "@/react-app/utils/chatUtils";
+import {
+  fetchSavedAgentLibrary,
+  getSavedAgentLibraryOptionLabel,
+  type SavedAgentLibraryEntry,
+} from "@/react-app/utils/savedAgentLibrary";
+import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
+
+export type ToastVariant = "default" | "destructive";
+
+export interface NegativeReferenceImage {
+  id: number;
+  image_url: string;
+}
+
+export interface FaceTargetImage {
+  id: number;
+  image_url: string;
+}
+
+export interface FaceTarget {
+  id: number;
+  name: string;
+  description: string;
+  image_count: number;
+  images: FaceTargetImage[];
+}
+
+export interface AnalysisRegionPoint {
+  x: number;
+  y: number;
+}
+
+export interface FrameWindowNorm {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface AnalysisRegion {
+  region_id: string;
+  label: string;
+  description: string;
+  enabled: boolean;
+  full_frame: boolean;
+  polygon_norm: AnalysisRegionPoint[];
+  draw_ref_width: number;
+  draw_ref_height: number;
+  context_padding_pct: number;
+  prompt_core: string;
+  alert_condition: string;
+  negative_condition: string;
+  face_target_ids: number[];
+  negative_image_ids: number[];
+  frame_window_norm?: FrameWindowNorm | null;
+}
+
+type PromptEditorFields = {
+  prompt_template: string;
+  alert_condition: string;
+  negative_condition: string;
+};
+
+type PromptEnhanceSuggestion = PromptEditorFields & {
+  model_name?: string;
+  snapshot_source?: string;
+};
+
+export interface CameraCustomAgentRow {
+  id: number;
+  algorithm_type: string;
+  is_enabled: number | boolean;
+  input_type?: string | null;
+  video_packaging_mode?: string | null;
+  inference_model?: string | null;
+  model_fps?: number | null;
+  run_every?: number | null;
+  running_resolution?: number | null;
+  only_capture_on_motion?: number | boolean | null;
+  prompt_template?: string | null;
+  alert_condition?: string | null;
+  negative_condition?: string | null;
+  priority_level?: CameraAgentPriority | null;
+  face_target_ids?: number[];
+  negative_reference_images?: NegativeReferenceImage[];
+  analysis_regions?: unknown;
+  config_json?: unknown;
+  params?: unknown;
+}
+
+type StepAgentExecutionBackend = "llm" | "opencv_portal_counter";
+
+type PortalCounterConfig = {
+  region_id: string;
+  min_count_to_alert: number;
+  min_area: number;
+  max_area: number;
+  warmup_frames: number;
+  min_track_frames_for_count: number;
+  max_missed_frames: number;
+  min_path_length_px: number;
+  max_proof_frames: number;
+  save_annotated_video: boolean;
+};
+
+export type CameraAgentEditorTarget = {
+  type: "camera" | "step_default" | "step_camera";
+  camera_id?: number | null;
+  camera_name?: string | null;
+  step_id?: number | null;
+  step_title?: string | null;
+  job_id?: number | null;
+  job_name?: string | null;
+};
+
+type Props = {
+  open: boolean;
+  editorTarget: CameraAgentEditorTarget | null;
+  initialAgent: CameraCustomAgentRow | null;
+  onClose: () => void;
+  onSaved: (savedAgentId?: number | null) => Promise<void> | void;
+  showToast: (title: string, description: string, variant?: ToastVariant) => void;
+};
+
+const ANALYSIS_REGION_MAX = 6;
+const ANALYSIS_REGION_MIN_POINTS = 3;
+const ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH = 1920;
+const ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT = 1080;
+const NEGATIVE_REFERENCE_MAX_IMAGES = 3;
+const FACE_TARGET_MAX_IMAGES = 4;
+const SNAPSHOT_REFRESH_COOLDOWN_MS = 3000;
+const DEFAULT_FRAME_WINDOW: FrameWindowNorm = { x: 0, y: 0, width: 1, height: 1 };
+const FRAME_WINDOW_MAX_ZOOM = 6;
+type PreviewViewportMetrics = {
+  width: number;
+  height: number;
+  naturalWidth: number;
+  naturalHeight: number;
+};
+
+const getSafeSnapshotNaturalSize = (
+  naturalWidth: number,
+  naturalHeight: number
+): { width: number; height: number } => ({
+  width: Math.max(1, Math.round(Number(naturalWidth) || ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH)),
+  height: Math.max(1, Math.round(Number(naturalHeight) || ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT)),
+});
+
+const buildPreviewViewportMetrics = (
+  hostWidth: number,
+  hostHeight: number,
+  naturalWidth: number,
+  naturalHeight: number
+): PreviewViewportMetrics | null => {
+  if (hostWidth <= 1 || hostHeight <= 1) return null;
+  const safeNatural = getSafeSnapshotNaturalSize(naturalWidth, naturalHeight);
+
+  return {
+    width: hostWidth,
+    height: hostHeight,
+    naturalWidth: safeNatural.width,
+    naturalHeight: safeNatural.height,
+  };
+};
+type CameraAgentRunEverySeconds = 10 | 60;
+const CAMERA_AGENT_RUN_EVERY_OPTIONS: ReadonlyArray<CameraAgentRunEverySeconds> = [60, 10];
+type CameraAgentPriority = "CRITIC" | "HIGH" | "MEDIUM" | "LOW";
+const CAMERA_AGENT_PRIORITY_OPTIONS: ReadonlyArray<CameraAgentPriority> = [
+  "CRITIC",
+  "HIGH",
+  "MEDIUM",
+  "LOW",
+];
+type CameraAgentInferenceModel = "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core";
+type CameraVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
+type CameraAgentRunningResolution = 640 | 1024;
+const DEFAULT_CAMERA_AGENT_INFERENCE_MODEL: CameraAgentInferenceModel = "ultra";
+const DEFAULT_CAMERA_VIDEO_PACKAGING_MODE: CameraVideoPackagingMode = "frame_sequence";
+const DEFAULT_LIGHT_VIDEO_PACKAGING_MODE: CameraVideoPackagingMode = "mosaic_2x2";
+const DEFAULT_CORE_RUNNING_RESOLUTION: CameraAgentRunningResolution = 640;
+const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
+const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
+const PORTAL_COUNTER_EXECUTION_BACKEND: StepAgentExecutionBackend = "opencv_portal_counter";
+const DEFAULT_PORTAL_COUNTER_SUMMARY =
+  "Counts portal passages with native OpenCV analysis after the step finishes.";
+const DEFAULT_PORTAL_COUNTER_CONFIG: PortalCounterConfig = {
+  region_id: "",
+  min_count_to_alert: 1,
+  min_area: 1800,
+  max_area: 70000,
+  warmup_frames: 60,
+  min_track_frames_for_count: 3,
+  max_missed_frames: 12,
+  min_path_length_px: 85,
+  max_proof_frames: 6,
+  save_annotated_video: true,
+};
+const AGENT_EDITOR_ONBOARDING_STEPS = new Set([
+  "agent-model",
+  "agent-input-type",
+  "agent-fields",
+  "agent-enhance",
+  "agent-polygons",
+  "agent-execution",
+  "agent-save",
+]);
+const OPTIONAL_SUFFIX_PATTERN = /([(\uFF08][^)\uFF09]*[)\uFF09])\s*$/u;
+const PROMPT_DOCUMENT_BLOCK_CLASS = "overflow-hidden rounded-xl border border-gray-700 bg-gray-800/70";
+const PROMPT_DOCUMENT_SECTION_CLASS = "space-y-2 px-4 py-4";
+const PROMPT_DOCUMENT_EXPANDED_SHEET_CLASS =
+  "rounded-xl border border-gray-700 bg-gray-800/70 shadow-[0_40px_120px_-50px_rgba(0,0,0,1)]";
+const PROMPT_DOCUMENT_EXPANDED_CONTENT_CLASS =
+  "max-h-[84vh] overflow-y-auto px-4 py-4 sm:px-5 sm:py-5";
+const PROMPT_DOCUMENT_INPUT_CLASS =
+  "w-full border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
+const PROMPT_DOCUMENT_TEXTAREA_CLASS =
+  "w-full border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
+const PROMPT_DOCUMENT_EXPANDED_TEXTAREA_CLASS =
+  "w-full resize-none overflow-hidden border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
+const PROMPT_DOCUMENT_TOGGLE_BUTTON_CLASS =
+  "inline-flex h-7 w-7 items-center justify-center rounded border border-gray-600 bg-gray-800 text-gray-300 transition-colors hover:border-gray-500 hover:text-gray-100";
+
+const parseAgentParamsObject = (value: unknown): Record<string, unknown> => {
+  if (!value) return {};
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as Record<string, unknown> | null;
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return typeof value === "object" && !Array.isArray(value) ? { ...(value as Record<string, unknown>) } : {};
+};
+
+const normalizeStepAgentExecutionBackend = (
+  value: unknown
+): StepAgentExecutionBackend => {
+  return String(value || "").trim().toLowerCase() === PORTAL_COUNTER_EXECUTION_BACKEND
+    ? PORTAL_COUNTER_EXECUTION_BACKEND
+    : "llm";
+};
+
+const clampInteger = (value: unknown, fallback: number, min: number, max: number): number => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+};
+
+const hasPolygonRegion = (region: AnalysisRegion | null | undefined): boolean =>
+  !!region &&
+  !region.full_frame &&
+  Array.isArray(region.polygon_norm) &&
+  region.polygon_norm.length >= ANALYSIS_REGION_MIN_POINTS;
+
+const normalizePortalCounterConfig = (value: unknown): PortalCounterConfig => {
+  const raw =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const regionId =
+    typeof raw.region_id === "string"
+      ? raw.region_id.trim()
+      : typeof raw.regionId === "string"
+      ? raw.regionId.trim()
+      : "";
+  return {
+    region_id: regionId,
+    min_count_to_alert: clampInteger(raw.min_count_to_alert ?? raw.minCountToAlert, 1, 0, 9999),
+    min_area: clampInteger(raw.min_area ?? raw.minArea, 1800, 1, 500000),
+    max_area: clampInteger(raw.max_area ?? raw.maxArea, 70000, 1, 1000000),
+    warmup_frames: clampInteger(raw.warmup_frames ?? raw.warmupFrames, 60, 0, 10000),
+    min_track_frames_for_count: clampInteger(
+      raw.min_track_frames_for_count ?? raw.minTrackFramesForCount,
+      3,
+      1,
+      300
+    ),
+    max_missed_frames: clampInteger(raw.max_missed_frames ?? raw.maxMissedFrames, 12, 1, 300),
+    min_path_length_px: clampInteger(raw.min_path_length_px ?? raw.minPathLengthPx, 85, 1, 5000),
+    max_proof_frames: clampInteger(raw.max_proof_frames ?? raw.maxProofFrames, 6, 1, 24),
+    save_annotated_video:
+      raw.save_annotated_video === false || raw.saveAnnotatedVideo === false ? false : true,
+  };
+};
+
+const extractOptionalSuffix = (label: string): string => {
+  const match = String(label || "").match(OPTIONAL_SUFFIX_PATTERN);
+  return match ? ` ${match[1].trim()}` : " (optional)";
+};
+
+const formatPromptDocumentHeading = (
+  label: string,
+  options?: { optional?: boolean; optionalSuffix?: string }
+): string => `# ${label}${options?.optional ? options.optionalSuffix || " (optional)" : ""}`;
+
+type AutoGrowingTextareaProps = {
+  ariaLabel: string;
+  className: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  readOnly?: boolean;
+  rows?: number;
+  value: string;
+};
+
+function AutoGrowingTextarea({
+  ariaLabel,
+  className,
+  onChange,
+  placeholder,
+  readOnly = false,
+  rows = 1,
+  value,
+}: AutoGrowingTextareaProps) {
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "0px";
+    textarea.style.height = `${textarea.scrollHeight}px`;
+    textarea.style.overflowY = "hidden";
+  }, [rows, value]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      textarea.style.height = "0px";
+      textarea.style.height = `${textarea.scrollHeight}px`;
+      textarea.style.overflowY = "hidden";
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  return (
+    <textarea
+      ref={textareaRef}
+      aria-label={ariaLabel}
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      rows={rows}
+      readOnly={readOnly}
+      spellCheck={false}
+      autoCorrect="off"
+      autoCapitalize="off"
+      className={className}
+      placeholder={placeholder}
+    />
+  );
+}
+
+const clamp01 = (v: number) => Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
+
+const normalizeFrameWindowFromUnknown = (value: unknown): FrameWindowNorm => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return DEFAULT_FRAME_WINDOW;
+  }
+  const row = value as Record<string, unknown>;
+  const width = clamp01(Number(row.width));
+  const height = clamp01(Number(row.height));
+  const nextWidth = width > 0 ? width : 1;
+  const nextHeight = height > 0 ? height : 1;
+  const maxX = Math.max(0, 1 - nextWidth);
+  const maxY = Math.max(0, 1 - nextHeight);
+  return {
+    x: Math.min(maxX, Math.max(0, Number(row.x) || 0)),
+    y: Math.min(maxY, Math.max(0, Number(row.y) || 0)),
+    width: nextWidth,
+    height: nextHeight,
+  };
+};
+
+const isFullFrameWindow = (value: FrameWindowNorm | null | undefined): boolean => {
+  if (!value) return true;
+  return (
+    value.width >= 0.999 &&
+    value.height >= 0.999 &&
+    value.x <= 0.001 &&
+    value.y <= 0.001
+  );
+};
+
+const getFrameWindowPayload = (value: FrameWindowNorm): FrameWindowNorm | null =>
+  isFullFrameWindow(value)
+    ? null
+    : {
+        x: Math.round(clamp01(value.x) * 1000000) / 1000000,
+        y: Math.round(clamp01(value.y) * 1000000) / 1000000,
+        width: Math.round(clamp01(value.width) * 1000000) / 1000000,
+        height: Math.round(clamp01(value.height) * 1000000) / 1000000,
+      };
+
+const buildBaseFrameWindowForViewport = (
+  metrics: PreviewViewportMetrics | null | undefined
+): FrameWindowNorm => {
+  if (!metrics) return DEFAULT_FRAME_WINDOW;
+  const imageAspect = metrics.naturalWidth / metrics.naturalHeight;
+  const viewportAspect = metrics.width / metrics.height;
+  if (!Number.isFinite(imageAspect) || imageAspect <= 0 || !Number.isFinite(viewportAspect) || viewportAspect <= 0) {
+    return DEFAULT_FRAME_WINDOW;
+  }
+
+  const normalizedAspect = viewportAspect / imageAspect;
+  if (!Number.isFinite(normalizedAspect) || normalizedAspect <= 0) {
+    return DEFAULT_FRAME_WINDOW;
+  }
+
+  if (normalizedAspect >= 1) {
+    const height = Math.min(1, 1 / normalizedAspect);
+    return {
+      x: 0,
+      y: (1 - height) / 2,
+      width: 1,
+      height,
+    };
+  }
+
+  const width = Math.min(1, normalizedAspect);
+  return {
+    x: (1 - width) / 2,
+    y: 0,
+    width,
+    height: 1,
+  };
+};
+
+const getFrameWindowZoom = (
+  value: FrameWindowNorm | null | undefined
+): number => {
+  const normalized = normalizeFrameWindowFromUnknown(value);
+  const dominantSpan = Math.max(normalized.width, normalized.height, 0.000001);
+  return Math.min(FRAME_WINDOW_MAX_ZOOM, Math.max(1, 1 / dominantSpan));
+};
+
+const areFrameWindowsClose = (
+  a: FrameWindowNorm | null | undefined,
+  b: FrameWindowNorm | null | undefined,
+  epsilon = 0.0005
+): boolean => {
+  if (!a || !b) return false;
+  return (
+    Math.abs(a.x - b.x) <= epsilon &&
+    Math.abs(a.y - b.y) <= epsilon &&
+    Math.abs(a.width - b.width) <= epsilon &&
+    Math.abs(a.height - b.height) <= epsilon
+  );
+};
+
+const constrainFrameWindow = (
+  candidate: FrameWindowNorm,
+  metrics: PreviewViewportMetrics | null | undefined
+): FrameWindowNorm => {
+  const normalizedCandidate = normalizeFrameWindowFromUnknown(candidate);
+  if (!metrics) {
+    return normalizedCandidate;
+  }
+  const base = buildBaseFrameWindowForViewport(metrics);
+  const rawWidth = clamp01(normalizedCandidate.width) || base.width;
+  const rawHeight = clamp01(normalizedCandidate.height) || base.height;
+  const zoom = getFrameWindowZoom(normalizedCandidate);
+  const width = base.width / zoom;
+  const height = base.height / zoom;
+  const centerX = clamp01(normalizedCandidate.x + rawWidth / 2);
+  const centerY = clamp01(normalizedCandidate.y + rawHeight / 2);
+  const maxX = Math.max(0, 1 - width);
+  const maxY = Math.max(0, 1 - height);
+  return {
+    x: Math.min(maxX, Math.max(0, centerX - width / 2)),
+    y: Math.min(maxY, Math.max(0, centerY - height / 2)),
+    width,
+    height,
+  };
+};
+
+const extractFrameWindowFromAnalysisRegions = (regionsRaw: unknown): FrameWindowNorm => {
+  if (!Array.isArray(regionsRaw)) return DEFAULT_FRAME_WINDOW;
+  for (const row of regionsRaw) {
+    if (!row || typeof row !== "object") continue;
+    const normalized = normalizeFrameWindowFromUnknown(
+      (row as Record<string, unknown>).frame_window_norm ??
+        (row as Record<string, unknown>).frameWindowNorm
+    );
+    if (!isFullFrameWindow(normalized)) {
+      return normalized;
+    }
+  }
+  return DEFAULT_FRAME_WINDOW;
+};
+
+const normalizeBool = (value: unknown, fallback = false): boolean => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const n = value.trim().toLowerCase();
+    if (["1", "true", "yes", "on"].includes(n)) return true;
+    if (["0", "false", "no", "off"].includes(n)) return false;
+  }
+  return fallback;
+};
+
+const normalizeRunEverySeconds = (
+  value: unknown,
+  fallback: CameraAgentRunEverySeconds = 60
+): CameraAgentRunEverySeconds => {
+  const parseValue = (candidate: unknown): number | null => {
+    if (typeof candidate === "number" && Number.isFinite(candidate)) return Math.round(candidate);
+    if (typeof candidate === "string" && candidate.trim()) {
+      const parsed = Number.parseInt(candidate.trim(), 10);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  };
+  const normalizeValue = (candidate: unknown): CameraAgentRunEverySeconds | null => {
+    const parsed = parseValue(candidate);
+    if (parsed === null || parsed <= 0) return null;
+    return parsed <= 10 ? 10 : 60;
+  };
+  return normalizeValue(value) ?? normalizeValue(fallback) ?? 60;
+};
+
+const normalizeInferenceModel = (
+  value: unknown,
+  fallback: CameraAgentInferenceModel = DEFAULT_CAMERA_AGENT_INFERENCE_MODEL
+): CameraAgentInferenceModel => {
+  if (typeof value !== "string") return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "ultra+" || normalized === "ultra-plus" || normalized === "ultra_plus") {
+    return "ultra_plus";
+  }
+  if (
+    normalized === "legacy" ||
+    normalized === "pro" ||
+    normalized === "ultra" ||
+    normalized === "ultra_plus" ||
+    normalized === "light" ||
+    normalized === "core"
+  ) {
+    return normalized;
+  }
+  return fallback;
+};
+
+const normalizeCameraAgentPriority = (
+  value: unknown,
+  fallback: CameraAgentPriority = "MEDIUM"
+): CameraAgentPriority => {
+  if (typeof value !== "string") return fallback;
+  const normalized = value.trim().toUpperCase();
+  if (normalized === "MEDUIM") return "MEDIUM";
+  if (normalized === "CRITIC" || normalized === "HIGH" || normalized === "MEDIUM" || normalized === "LOW") {
+    return normalized;
+  }
+  return fallback;
+};
+
+const supportsAdjustableVideoFps = (model: CameraAgentInferenceModel): boolean =>
+  model === "ultra" || model === "ultra_plus" || model === "light";
+
+const normalizeRunningResolution = (
+  value: unknown,
+  fallback: CameraAgentRunningResolution = DEFAULT_CORE_RUNNING_RESOLUTION
+): CameraAgentRunningResolution => {
+  const parseValue = (candidate: unknown): number | null => {
+    if (typeof candidate === "number" && Number.isFinite(candidate)) return Math.round(candidate);
+    if (typeof candidate === "string" && candidate.trim()) {
+      const parsed = Number.parseInt(candidate.trim(), 10);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  };
+  const parsed = parseValue(value);
+  if (parsed === 640 || parsed === 1024) return parsed;
+  return fallback;
+};
+
+const normalizeModelFps = (
+  value: unknown,
+  fallback = DEFAULT_ULTRA_VIDEO_MODEL_FPS
+): number => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const rounded = Math.round(value);
+    return Math.min(MAX_ULTRA_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, rounded));
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number.parseInt(value.trim(), 10);
+    if (Number.isFinite(parsed)) {
+      return Math.min(MAX_ULTRA_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, parsed));
+    }
+  }
+  return normalizeModelFps(fallback, DEFAULT_ULTRA_VIDEO_MODEL_FPS);
+};
+
+const normalizeVideoPackagingMode = (
+  value: unknown,
+  fallback: CameraVideoPackagingMode = DEFAULT_CAMERA_VIDEO_PACKAGING_MODE
+): CameraVideoPackagingMode => {
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (
+      normalized === "frame_sequence" ||
+      normalized === "frame-sequence" ||
+      normalized === "full_frame" ||
+      normalized === "full-frame" ||
+      normalized === "frames" ||
+      normalized === "high_resolution" ||
+      normalized === "high-resolution" ||
+      normalized === "high resolution"
+    ) {
+      return "frame_sequence";
+    }
+    if (
+      normalized === "mosaic_2x2" ||
+      normalized === "mosaic-2x2" ||
+      normalized === "2x2" ||
+      normalized === "standard_resolution" ||
+      normalized === "standard-resolution" ||
+      normalized === "standard resolution"
+    ) {
+      return "mosaic_2x2";
+    }
+    if (
+      normalized === "mosaic" ||
+      normalized === "mosaic_3x3" ||
+      normalized === "mosaic-3x3" ||
+      normalized === "3x3" ||
+      normalized === "compact_resolution" ||
+      normalized === "compact-resolution" ||
+      normalized === "compact resolution"
+    ) {
+      return "mosaic_3x3";
+    }
+  }
+  return fallback;
+};
+
+const hasConfiguredVideoPackagingMode = (value: unknown): boolean =>
+  typeof value === "string" && value.trim().length > 0;
+
+const getAutoVideoPackagingModeForModel = (
+  model: CameraAgentInferenceModel
+): CameraVideoPackagingMode =>
+  model === "light" ? DEFAULT_LIGHT_VIDEO_PACKAGING_MODE : DEFAULT_CAMERA_VIDEO_PACKAGING_MODE;
+
+const isSelectableVideoPackagingMode = (
+  mode: CameraVideoPackagingMode
+): mode is Exclude<CameraVideoPackagingMode, "mosaic_3x3"> =>
+  mode === "frame_sequence" || mode === "mosaic_2x2";
+
+const getVideoPackagingSelectValue = (mode: CameraVideoPackagingMode): CameraVideoPackagingMode | "" =>
+  isSelectableVideoPackagingMode(mode) ? mode : "";
+
+const applyExecutionConstraints = (
+  inputType: "video" | "image",
+  inferenceModel: CameraAgentInferenceModel,
+  runEvery: CameraAgentRunEverySeconds,
+  runningResolution: CameraAgentRunningResolution,
+  modelFps: number
+) => {
+  if (inferenceModel === "core") {
+    return {
+      inputType: "video" as const,
+      inferenceModel,
+      runEvery: 60 as CameraAgentRunEverySeconds,
+      runningResolution: normalizeRunningResolution(runningResolution),
+      modelFps: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+    };
+  }
+
+  const normalizedInputType: "video" | "image" = inputType === "image" ? "image" : "video";
+  return {
+    inputType: normalizedInputType,
+    inferenceModel,
+    runEvery: normalizeRunEverySeconds(runEvery, 60),
+    runningResolution: normalizeRunningResolution(runningResolution),
+    modelFps:
+      supportsAdjustableVideoFps(inferenceModel) && normalizedInputType === "video"
+        ? normalizeModelFps(modelFps)
+        : DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+  };
+};
+
+type TutorialProviderAvailability = {
+  openai: boolean;
+  zai: boolean;
+};
+
+const getTutorialInferenceModel = (
+  providerStatus: TutorialProviderAvailability
+): CameraAgentInferenceModel => {
+  if (providerStatus.openai) {
+    return "ultra";
+  }
+
+  if (providerStatus.zai) {
+    return "core";
+  }
+
+  return DEFAULT_CAMERA_AGENT_INFERENCE_MODEL;
+};
+
+const sanitizeRegionId = (value: unknown, idx: number): string => {
+  const raw = typeof value === "string" ? value.trim() : "";
+  const normalized = raw
+    .replace(/[^a-zA-Z0-9._-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return (normalized || `region-${idx + 1}`).slice(0, 64);
+};
+
+const toSvgPoints = (points: AnalysisRegionPoint[], options?: { clamp?: boolean }) =>
+  points
+    .map((p) => {
+      const x = options?.clamp === false ? p.x : clamp01(p.x);
+      const y = options?.clamp === false ? p.y : clamp01(p.y);
+      return `${Math.round(x * 1000) / 10},${Math.round(y * 1000) / 10}`;
+    })
+    .join(" ");
+
+const buildRectPolygonFromPoints = (a: AnalysisRegionPoint, b: AnalysisRegionPoint): AnalysisRegionPoint[] => {
+  const x1 = clamp01(Math.min(a.x, b.x));
+  const y1 = clamp01(Math.min(a.y, b.y));
+  const x2 = clamp01(Math.max(a.x, b.x));
+  const y2 = clamp01(Math.max(a.y, b.y));
+  if (Math.abs(x2 - x1) < 0.002 || Math.abs(y2 - y1) < 0.002) return [];
+  return [
+    { x: x1, y: y1 },
+    { x: x2, y: y1 },
+    { x: x2, y: y2 },
+    { x: x1, y: y2 },
+  ];
+};
+
+const pointInPolygon = (point: AnalysisRegionPoint, polygon: AnalysisRegionPoint[]): boolean => {
+  if (!Array.isArray(polygon) || polygon.length < 3) return false;
+  const px = clamp01(point.x);
+  const py = clamp01(point.y);
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
+    const xi = clamp01(polygon[i].x);
+    const yi = clamp01(polygon[i].y);
+    const xj = clamp01(polygon[j].x);
+    const yj = clamp01(polygon[j].y);
+    const intersects =
+      yi > py !== yj > py &&
+      px < ((xj - xi) * (py - yi)) / ((yj - yi) || Number.EPSILON) + xi;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+};
+
+const getPolygonCentroid = (polygon: AnalysisRegionPoint[]): AnalysisRegionPoint => {
+  if (!Array.isArray(polygon) || polygon.length === 0) return { x: 0.5, y: 0.5 };
+  if (polygon.length < 3) {
+    const avg = polygon.reduce(
+      (acc, p) => ({ x: acc.x + clamp01(p.x), y: acc.y + clamp01(p.y) }),
+      { x: 0, y: 0 }
+    );
+    return { x: clamp01(avg.x / polygon.length), y: clamp01(avg.y / polygon.length) };
+  }
+
+  let area = 0;
+  let cx = 0;
+  let cy = 0;
+  for (let i = 0; i < polygon.length; i += 1) {
+    const p1 = polygon[i];
+    const p2 = polygon[(i + 1) % polygon.length];
+    const x1 = clamp01(p1.x);
+    const y1 = clamp01(p1.y);
+    const x2 = clamp01(p2.x);
+    const y2 = clamp01(p2.y);
+    const cross = x1 * y2 - x2 * y1;
+    area += cross;
+    cx += (x1 + x2) * cross;
+    cy += (y1 + y2) * cross;
+  }
+  area *= 0.5;
+  if (Math.abs(area) < 1e-7) {
+    const avg = polygon.reduce(
+      (acc, p) => ({ x: acc.x + clamp01(p.x), y: acc.y + clamp01(p.y) }),
+      { x: 0, y: 0 }
+    );
+    return { x: clamp01(avg.x / polygon.length), y: clamp01(avg.y / polygon.length) };
+  }
+  return {
+    x: clamp01(cx / (6 * area)),
+    y: clamp01(cy / (6 * area)),
+  };
+};
+
+const mapPointToViewport = (
+  point: AnalysisRegionPoint,
+  frameWindow: FrameWindowNorm
+): AnalysisRegionPoint => ({
+  x: (point.x - frameWindow.x) / Math.max(frameWindow.width, 0.000001),
+  y: (point.y - frameWindow.y) / Math.max(frameWindow.height, 0.000001),
+});
+
+const mapPointsToViewport = (
+  points: AnalysisRegionPoint[],
+  frameWindow: FrameWindowNorm
+): AnalysisRegionPoint[] => points.map((point) => mapPointToViewport(point, frameWindow));
+
+const parsePromptTemplate = (
+  template: string | null | undefined,
+  fallbackAlert?: string | null,
+  fallbackNegative?: string | null
+): PromptEditorFields => {
+  const raw = String(template || "");
+  const lower = raw.toLowerCase();
+  const alertIdx = lower.lastIndexOf("alert_condition:");
+  const negativeIdx = lower.lastIndexOf("negative_condition:");
+  if (alertIdx < 0 && negativeIdx < 0) {
+    return {
+      prompt_template: raw,
+      alert_condition: String(fallbackAlert || "").trim(),
+      negative_condition: String(fallbackNegative || "").trim(),
+    };
+  }
+  const indexes = [
+    { key: "alert" as const, idx: alertIdx, marker: "alert_condition:" },
+    { key: "negative" as const, idx: negativeIdx, marker: "negative_condition:" },
+  ]
+    .filter((r) => r.idx >= 0)
+    .sort((a, b) => a.idx - b.idx);
+
+  const parsed: PromptEditorFields = {
+    prompt_template: raw.slice(0, indexes[0].idx).trimEnd(),
+    alert_condition: "",
+    negative_condition: "",
+  };
+
+  for (let i = 0; i < indexes.length; i += 1) {
+    const start = indexes[i].idx + indexes[i].marker.length;
+    const end = i + 1 < indexes.length ? indexes[i + 1].idx : raw.length;
+    const value = raw.slice(start, end).trim();
+    if (indexes[i].key === "alert") parsed.alert_condition = value;
+    else parsed.negative_condition = value;
+  }
+
+  if (!parsed.alert_condition) parsed.alert_condition = String(fallbackAlert || "").trim();
+  if (!parsed.negative_condition) parsed.negative_condition = String(fallbackNegative || "").trim();
+  return parsed;
+};
+
+const normalizeFields = (f: PromptEditorFields): PromptEditorFields => ({
+  prompt_template: String(f.prompt_template || "").trim(),
+  alert_condition: String(f.alert_condition || "").trim(),
+  negative_condition: String(f.negative_condition || "").trim(),
+});
+
+const normalizeFaceTargetIds = (values: unknown): number[] => {
+  if (!Array.isArray(values)) return [];
+  return Array.from(new Set(values.map((v) => Number(v)).filter((v) => Number.isInteger(v) && v > 0)));
+};
+
+const normalizeNegativeImages = (rows: unknown): NegativeReferenceImage[] => {
+  if (!Array.isArray(rows)) return [];
+  return rows
+    .map((row: any) => {
+      const id = Number(row?.id);
+      const image_url = typeof row?.image_url === "string" ? row.image_url.trim() : "";
+      if (!Number.isInteger(id) || id <= 0 || !image_url) return null;
+      return { id, image_url } as NegativeReferenceImage;
+    })
+    .filter(Boolean) as NegativeReferenceImage[];
+};
+
+const getFaceTargetImageCount = (target: FaceTarget | null | undefined): number => {
+  if (!target) return 0;
+  const fromImages = Array.isArray(target.images) ? target.images.length : 0;
+  const fromCounter = Number(target.image_count);
+  if (Number.isFinite(fromCounter) && fromCounter >= 0) {
+    return Math.max(fromImages, Math.floor(fromCounter));
+  }
+  return fromImages;
+};
+
+const normalizeRegionsFromApi = (
+  regionsRaw: unknown,
+  fields: PromptEditorFields,
+  faceTargetIds: number[],
+  negativeImageIds: number[]
+): AnalysisRegion[] => {
+  if (!Array.isArray(regionsRaw)) return [];
+  const out: AnalysisRegion[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < regionsRaw.length && out.length < ANALYSIS_REGION_MAX; i += 1) {
+    const row = regionsRaw[i] as any;
+    if (!row || typeof row !== "object") continue;
+    const pointsRaw = Array.isArray(row?.polygon_norm) ? row.polygon_norm : [];
+    const points = pointsRaw
+      .map((p: any) => ({ x: clamp01(Number(p?.x)), y: clamp01(Number(p?.y)) }))
+      .filter((p: AnalysisRegionPoint) => Number.isFinite(p.x) && Number.isFinite(p.y));
+    if (points.length < ANALYSIS_REGION_MIN_POINTS) continue;
+    const region_id = sanitizeRegionId(row?.region_id, i);
+    if (seen.has(region_id)) continue;
+    seen.add(region_id);
+    out.push({
+      region_id,
+      label: typeof row?.label === "string" && row.label.trim() ? row.label.trim() : `Region ${i + 1}`,
+      description: typeof row?.description === "string" ? row.description.trim() : "",
+      enabled: normalizeBool(row?.enabled, true),
+      full_frame: false,
+      polygon_norm: points,
+      draw_ref_width: Math.max(1, Math.round(Number(row?.draw_ref_width ?? ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH))),
+      draw_ref_height: Math.max(1, Math.round(Number(row?.draw_ref_height ?? ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT))),
+      context_padding_pct: 0,
+      prompt_core: fields.prompt_template,
+      alert_condition: fields.alert_condition,
+      negative_condition: fields.negative_condition,
+      face_target_ids: faceTargetIds,
+      negative_image_ids: negativeImageIds,
+      frame_window_norm: normalizeFrameWindowFromUnknown(
+        row?.frame_window_norm ?? row?.frameWindowNorm
+      ),
+    });
+  }
+  return out;
+};
+
+const normalizeRegionsForPayload = (
+  polygonRegions: AnalysisRegion[],
+  fields: PromptEditorFields,
+  faceTargetIds: number[],
+  negativeImageIds: number[],
+  frameWindow: FrameWindowNorm
+): AnalysisRegion[] => {
+  const normalized = normalizeFields(fields);
+  const cleanFaceIds = normalizeFaceTargetIds(faceTargetIds);
+  const cleanNegativeIds = Array.from(new Set(negativeImageIds.filter((id) => Number.isInteger(id) && id > 0)));
+  const frameWindowPayload = getFrameWindowPayload(frameWindow);
+  const polygons = (Array.isArray(polygonRegions) ? polygonRegions : [])
+    .filter((r) => Array.isArray(r.polygon_norm) && r.polygon_norm.length >= ANALYSIS_REGION_MIN_POINTS)
+    .slice(0, ANALYSIS_REGION_MAX)
+    .map((r, idx) => ({
+      region_id: sanitizeRegionId(r.region_id, idx),
+      label: String(r.label || "").trim() || `Region ${idx + 1}`,
+      description: String(r.description || "").trim(),
+      enabled: r.enabled !== false,
+      full_frame: false,
+      polygon_norm: r.polygon_norm.map((p) => ({ x: clamp01(p.x), y: clamp01(p.y) })),
+      draw_ref_width: Math.max(1, Math.round(Number(r.draw_ref_width) || ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH)),
+      draw_ref_height: Math.max(1, Math.round(Number(r.draw_ref_height) || ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT)),
+      context_padding_pct: 0,
+      prompt_core: normalized.prompt_template,
+      alert_condition: normalized.alert_condition,
+      negative_condition: normalized.negative_condition,
+      face_target_ids: cleanFaceIds,
+      negative_image_ids: cleanNegativeIds,
+      frame_window_norm: frameWindowPayload,
+    }))
+    .filter((r) => r.polygon_norm.length >= ANALYSIS_REGION_MIN_POINTS);
+
+  if (polygons.length > 0) return polygons;
+
+  return [
+    {
+      region_id: "full-frame",
+      label: "Full frame",
+      description: "",
+      enabled: true,
+      full_frame: true,
+      polygon_norm: [],
+      draw_ref_width: ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH,
+      draw_ref_height: ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT,
+      context_padding_pct: 0,
+      prompt_core: normalized.prompt_template,
+      alert_condition: normalized.alert_condition,
+      negative_condition: normalized.negative_condition,
+      face_target_ids: cleanFaceIds,
+      negative_image_ids: cleanNegativeIds,
+      frame_window_norm: frameWindowPayload,
+    },
+  ];
+};
+
+const getDisplayNameFromAgent = (agent: CameraCustomAgentRow | null): string => {
+  if (!agent) return "";
+  const paramsObject = parseAgentParamsObject(agent.params);
+  const topLevelDisplayName =
+    typeof (agent as unknown as { display_name?: unknown }).display_name === "string"
+      ? String((agent as unknown as { display_name?: string }).display_name).trim()
+      : "";
+  if (topLevelDisplayName && !isGeneratedCustomAgentName(topLevelDisplayName)) {
+    return topLevelDisplayName;
+  }
+  const fromParams =
+    typeof paramsObject.display_name === "string" ? String(paramsObject.display_name).trim() : "";
+  if (fromParams && !isGeneratedCustomAgentName(fromParams)) {
+    return fromParams;
+  }
+  if (agent.config_json && typeof agent.config_json === "object" && !Array.isArray(agent.config_json)) {
+    const fromCfg = typeof (agent.config_json as any).display_name === "string"
+      ? String((agent.config_json as any).display_name).trim()
+      : "";
+    if (fromCfg && !isGeneratedCustomAgentName(fromCfg)) return fromCfg;
+  }
+  const summary = getSummaryFromAgent(agent);
+  if (summary) return summary;
+  const algorithmType = String(agent.algorithm_type || "").trim();
+  if (algorithmType && !isGeneratedCustomAgentName(algorithmType)) {
+    return algorithmType;
+  }
+  const numericId = Number(agent.id);
+  return Number.isInteger(numericId) && numericId > 0 ? `Agent ${numericId}` : "";
+};
+
+const getSummaryFromAgent = (agent: CameraCustomAgentRow | null): string => {
+  if (!agent) return "";
+  const paramsObject = parseAgentParamsObject(agent.params);
+  const fromParams = typeof paramsObject.summary === "string" ? String(paramsObject.summary).trim() : "";
+  if (fromParams) return fromParams;
+  if (agent.config_json && typeof agent.config_json === "object" && !Array.isArray(agent.config_json)) {
+    const fromCfg = typeof (agent.config_json as any).summary === "string"
+      ? String((agent.config_json as any).summary).trim()
+      : "";
+    if (fromCfg) return fromCfg;
+  }
+  return "";
+};
+
+export default function CameraCustomAgentEditorModal({
+  open,
+  editorTarget,
+  initialAgent,
+  onClose,
+  onSaved,
+  showToast,
+}: Props) {
+  const { t, i18n } = useTranslation();
+  const {
+    currentStepId: onboardingStepId,
+    isOpen: isOnboardingOpen,
+    providerStatus,
+    tutorialCameraId,
+  } = useOnboarding();
+  const tutorialAgentSeededRef = useRef(false);
+  const localizedOptionalSuffix = extractOptionalSuffix(
+    t("jobs.promptEditor.targetFacesOptionalLabel", {
+      defaultValue: "Target Faces (optional)",
+    })
+  );
+  const [displayName, setDisplayName] = useState("");
+  const [isEnabled, setIsEnabled] = useState(true);
+  const [priorityLevel, setPriorityLevel] = useState<CameraAgentPriority>("MEDIUM");
+  const [inputType, setInputType] = useState<"video" | "image">("video");
+  const [videoPackagingMode, setVideoPackagingMode] = useState<CameraVideoPackagingMode>(
+    DEFAULT_CAMERA_VIDEO_PACKAGING_MODE
+  );
+  const [inferenceModel, setInferenceModel] = useState<CameraAgentInferenceModel>(
+    DEFAULT_CAMERA_AGENT_INFERENCE_MODEL
+  );
+  const [runEvery, setRunEvery] = useState<CameraAgentRunEverySeconds>(60);
+  const [runningResolution, setRunningResolution] = useState<CameraAgentRunningResolution>(
+    DEFAULT_CORE_RUNNING_RESOLUTION
+  );
+  const [modelFps, setModelFps] = useState<number>(DEFAULT_ULTRA_VIDEO_MODEL_FPS);
+  const [onlyCaptureOnMotion, setOnlyCaptureOnMotion] = useState(false);
+  const [fields, setFields] = useState<PromptEditorFields>({
+    prompt_template: "",
+    alert_condition: "",
+    negative_condition: "",
+  });
+  const [portalCounterExpanded, setPortalCounterExpanded] = useState(false);
+  const [portalCounterEnabled, setPortalCounterEnabled] = useState(false);
+  const [portalCounterConfig, setPortalCounterConfig] = useState<PortalCounterConfig>(
+    DEFAULT_PORTAL_COUNTER_CONFIG
+  );
+  const [algorithmId, setAlgorithmId] = useState<number | null>(null);
+
+  const [polygonRegions, setPolygonRegions] = useState<AnalysisRegion[]>([]);
+  const [polygonDrawEnabled, setPolygonDrawEnabled] = useState(false);
+  const [hoveredRegionId, setHoveredRegionId] = useState<string | null>(null);
+  const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
+  const [pendingRegionSeed, setPendingRegionSeed] = useState<{
+    start: AnalysisRegionPoint;
+    label: string;
+    description: string;
+    draw_ref_width: number;
+    draw_ref_height: number;
+  } | null>(null);
+  const [draftRect, setDraftRect] = useState<{ start: AnalysisRegionPoint; end: AnalysisRegionPoint } | null>(null);
+  const [isSizingRect, setIsSizingRect] = useState(false);
+  const [dragVertex, setDragVertex] = useState<{ regionId: string; index: number } | null>(null);
+  const [panDrag, setPanDrag] = useState<{
+    button: 0 | 2;
+    startClientX: number;
+    startClientY: number;
+    frameWindow: FrameWindowNorm;
+  } | null>(null);
+  const [showRegionDialog, setShowRegionDialog] = useState(false);
+  const [regionDialogLabel, setRegionDialogLabel] = useState("");
+  const [regionDialogDescription, setRegionDialogDescription] = useState("");
+  const [regionDialogAnchor, setRegionDialogAnchor] = useState<{
+    point: AnalysisRegionPoint;
+    draw_ref_width: number;
+    draw_ref_height: number;
+  } | null>(null);
+
+  const [faceTargets, setFaceTargets] = useState<FaceTarget[]>([]);
+  const [faceTargetsLoading, setFaceTargetsLoading] = useState(false);
+  const [selectedFaceTargetIds, setSelectedFaceTargetIds] = useState<number[]>([]);
+  const [newFaceTargetName, setNewFaceTargetName] = useState("");
+  const [newFaceTargetDescription, setNewFaceTargetDescription] = useState("");
+  const [newFaceTargetFile, setNewFaceTargetFile] = useState<File | null>(null);
+  const [targetFacesExpanded, setTargetFacesExpanded] = useState(false);
+  const [promptDocumentExpanded, setPromptDocumentExpanded] = useState(false);
+  const [creatingFaceTarget, setCreatingFaceTarget] = useState(false);
+  const [faceTargetUploadingId, setFaceTargetUploadingId] = useState<number | null>(null);
+  const [faceTargetDeletingImageId, setFaceTargetDeletingImageId] = useState<number | null>(null);
+  const [editingFaceTargetId, setEditingFaceTargetId] = useState<number | null>(null);
+  const [editingFaceTargetName, setEditingFaceTargetName] = useState("");
+  const [editingFaceTargetDescription, setEditingFaceTargetDescription] = useState("");
+  const [savingFaceTargetId, setSavingFaceTargetId] = useState<number | null>(null);
+  const [deletingFaceTargetId, setDeletingFaceTargetId] = useState<number | null>(null);
+
+  const [negativeImages, setNegativeImages] = useState<NegativeReferenceImage[]>([]);
+  const [selectedNegativeImageIds, setSelectedNegativeImageIds] = useState<number[]>([]);
+  const [uploadingNegativeImages, setUploadingNegativeImages] = useState(false);
+
+  const [enhancingPrompt, setEnhancingPrompt] = useState(false);
+  const [suggestion, setSuggestion] = useState<PromptEnhanceSuggestion | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [templateAgents, setTemplateAgents] = useState<SavedAgentLibraryEntry[]>([]);
+  const [templateAgentsLoading, setTemplateAgentsLoading] = useState(false);
+  const [templateAgentsError, setTemplateAgentsError] = useState<string | null>(null);
+  const [selectedTemplateAgentKey, setSelectedTemplateAgentKey] = useState("");
+  const videoPackagingWasManuallySelectedRef = useRef(false);
+
+  const previewRef = useRef<HTMLDivElement | null>(null);
+  const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const snapshotImageRef = useRef<HTMLImageElement | null>(null);
+  const [snapshotMeta, setSnapshotMeta] = useState<{ thumbnail_url: string | null; last_thumbnail_update: string | null }>({
+    thumbnail_url: null,
+    last_thumbnail_update: null,
+  });
+  const [snapshotNaturalSize, setSnapshotNaturalSize] = useState({ width: 0, height: 0 });
+  const [frameWindow, setFrameWindow] = useState<FrameWindowNorm>(DEFAULT_FRAME_WINDOW);
+  const [previewViewportMetrics, setPreviewViewportMetrics] = useState<PreviewViewportMetrics | null>(null);
+  const [snapshotImageVersion, setSnapshotImageVersion] = useState(0);
+  const [snapshotLoading, setSnapshotLoading] = useState(false);
+  const [snapshotRequesting, setSnapshotRequesting] = useState(false);
+  const [snapshotCooldownUntil, setSnapshotCooldownUntil] = useState(0);
+  const snapshotRequestingRef = useRef(false);
+  const snapshotCooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const targetType = editorTarget?.type ?? "camera";
+  const previewCameraId =
+    typeof editorTarget?.camera_id === "number" && Number.isInteger(editorTarget.camera_id) && editorTarget.camera_id > 0
+      ? Number(editorTarget.camera_id)
+      : null;
+  const stepId =
+    typeof editorTarget?.step_id === "number" && Number.isInteger(editorTarget.step_id) && editorTarget.step_id > 0
+      ? Number(editorTarget.step_id)
+      : null;
+  const isStepTarget = targetType === "step_default" || targetType === "step_camera";
+  const stepCameraId = targetType === "step_camera" ? previewCameraId : null;
+  const cameraId = previewCameraId ?? 0;
+  const isTutorialCameraEditorTarget =
+    !isStepTarget &&
+    typeof tutorialCameraId === "number" &&
+    Number.isInteger(tutorialCameraId) &&
+    tutorialCameraId > 0 &&
+    previewCameraId === tutorialCameraId;
+  const targetLabel =
+    targetType === "step_default"
+      ? editorTarget?.step_title?.trim() ||
+        (stepId ? `Step #${stepId}` : "Step default agent")
+        : targetType === "step_camera"
+          ? editorTarget?.camera_name?.trim() ||
+            (previewCameraId ? `Camera #${previewCameraId}` : "Step target camera")
+        : editorTarget?.camera_name?.trim() ||
+          (previewCameraId ? `Camera #${previewCameraId}` : "Camera");
+  const portalCounterSelectable = targetType === "step_camera";
+  const portalCounterRegionOptions = useMemo(
+    () => polygonRegions.filter((region) => hasPolygonRegion(region)),
+    [polygonRegions]
+  );
+  const hasPortalCounterRegionOptions = portalCounterRegionOptions.length > 0;
+  const isPortalCounterActive = isStepTarget && portalCounterSelectable && portalCounterEnabled;
+
+  const snapshotUrl = snapshotMeta.thumbnail_url
+    ? `/api/thumbnails/${snapshotMeta.thumbnail_url}${
+        snapshotMeta.last_thumbnail_update ? `?ts=${encodeURIComponent(snapshotMeta.last_thumbnail_update)}` : ""
+      }`
+    : null;
+
+  useEffect(() => {
+    if (!portalCounterSelectable && portalCounterEnabled) {
+      setPortalCounterEnabled(false);
+    }
+  }, [portalCounterEnabled, portalCounterSelectable]);
+
+  useEffect(() => {
+    if (!portalCounterEnabled) return;
+    if (portalCounterRegionOptions.length === 0) return;
+    const hasSelectedRegion = portalCounterRegionOptions.some(
+      (region) => region.region_id === portalCounterConfig.region_id
+    );
+    if (!hasSelectedRegion) {
+      setPortalCounterConfig((prev) => ({
+        ...prev,
+        region_id: portalCounterRegionOptions[0]?.region_id || "",
+      }));
+    }
+  }, [portalCounterConfig.region_id, portalCounterEnabled, portalCounterRegionOptions]);
+
+  useEffect(() => {
+    if (!open || !snapshotUrl) {
+      snapshotImageRef.current = null;
+      setSnapshotNaturalSize({ width: 0, height: 0 });
+      setSnapshotImageVersion((prev) => prev + 1);
+      return;
+    }
+
+    let cancelled = false;
+    const img = new Image();
+    img.decoding = "async";
+    img.onload = () => {
+      if (cancelled) return;
+      snapshotImageRef.current = img;
+      setSnapshotNaturalSize({
+        width: img.naturalWidth || 0,
+        height: img.naturalHeight || 0,
+      });
+      setSnapshotImageVersion((prev) => prev + 1);
+    };
+    img.onerror = () => {
+      if (cancelled) return;
+      snapshotImageRef.current = null;
+      setSnapshotNaturalSize({ width: 0, height: 0 });
+      setSnapshotImageVersion((prev) => prev + 1);
+    };
+    img.src = snapshotUrl;
+
+    return () => {
+      cancelled = true;
+    };
+  }, [open, snapshotUrl]);
+
+  const measurePreviewViewportMetrics = (): PreviewViewportMetrics | null => {
+    const host = previewRef.current;
+    if (!host) return null;
+    const rect = host.getBoundingClientRect();
+    return buildPreviewViewportMetrics(
+      rect.width,
+      rect.height,
+      snapshotNaturalSize.width,
+      snapshotNaturalSize.height
+    );
+  };
+  const canLoadSavedAgentTemplate = !isOnboardingOpen;
+  const selectedTemplateAgent = useMemo(() => {
+    const templateKey = selectedTemplateAgentKey.trim();
+    if (!templateKey) return null;
+    return templateAgents.find((agent) => agent.library_key === templateKey) || null;
+  }, [selectedTemplateAgentKey, templateAgents]);
+
+  const polygonCount = polygonRegions.length;
+  const snapshotRefreshBlocked =
+    !previewCameraId ||
+    snapshotLoading ||
+    snapshotRequesting ||
+    snapshotRequestingRef.current ||
+    snapshotCooldownUntil > Date.now();
+
+  const clearSnapshotCooldown = () => {
+    if (snapshotCooldownTimerRef.current) {
+      clearTimeout(snapshotCooldownTimerRef.current);
+      snapshotCooldownTimerRef.current = null;
+    }
+    setSnapshotCooldownUntil(0);
+  };
+
+  const startSnapshotCooldown = () => {
+    const until = Date.now() + SNAPSHOT_REFRESH_COOLDOWN_MS;
+    setSnapshotCooldownUntil(until);
+    if (snapshotCooldownTimerRef.current) clearTimeout(snapshotCooldownTimerRef.current);
+    snapshotCooldownTimerRef.current = setTimeout(() => {
+      snapshotCooldownTimerRef.current = null;
+      setSnapshotCooldownUntil(0);
+    }, SNAPSHOT_REFRESH_COOLDOWN_MS);
+  };
+
+  const fetchFaceTargets = async () => {
+    setFaceTargetsLoading(true);
+    try {
+      const response = await fetch("/api/face-targets");
+      if (!response.ok) throw new Error("Failed to load target faces");
+      const data = await response.json().catch(() => ({}));
+      const rows = Array.isArray(data?.targets) ? data.targets : [];
+      const normalized: FaceTarget[] = rows
+        .map((row: any) => {
+          const id = Number(row?.id);
+          if (!Number.isInteger(id) || id <= 0) return null;
+          const imagesRaw = Array.isArray(row?.images) ? row.images : [];
+          const images: FaceTargetImage[] = imagesRaw
+            .map((img: any) => {
+              const imageId = Number(img?.id);
+              const imageUrl = typeof img?.image_url === "string" ? img.image_url.trim() : "";
+              if (!Number.isInteger(imageId) || imageId <= 0 || !imageUrl) return null;
+              return { id: imageId, image_url: imageUrl } as FaceTargetImage;
+            })
+            .filter(Boolean) as FaceTargetImage[];
+          return {
+            id,
+            name: typeof row?.name === "string" ? row.name : "",
+            description: typeof row?.description === "string" ? row.description : "",
+            image_count:
+              Number.isFinite(Number(row?.image_count)) && Number(row?.image_count) >= 0
+                ? Number(row.image_count)
+                : images.length,
+            images,
+          } as FaceTarget;
+        })
+        .filter(Boolean) as FaceTarget[];
+      setFaceTargets(normalized);
+    } catch (error) {
+      console.error("Failed to fetch face targets:", error);
+      showToast("Error", "Failed to load target faces", "destructive");
+    } finally {
+      setFaceTargetsLoading(false);
+    }
+  };
+
+  const refreshSnapshotMeta = async (): Promise<boolean> => {
+    if (!previewCameraId) {
+      setSnapshotMeta({ thumbnail_url: null, last_thumbnail_update: null });
+      return false;
+    }
+    const response = await fetch(`/api/cameras/${previewCameraId}`);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.error || "Failed to load camera snapshot");
+    const thumbnail_url =
+      typeof data?.thumbnail_url === "string" && data.thumbnail_url.trim() ? data.thumbnail_url.trim() : null;
+    const last_thumbnail_update =
+      typeof data?.last_thumbnail_update === "string" && data.last_thumbnail_update.trim()
+        ? data.last_thumbnail_update.trim()
+        : null;
+    setSnapshotMeta({ thumbnail_url, last_thumbnail_update });
+    return !!thumbnail_url;
+  };
+
+  const requestSnapshotRefresh = async () => {
+    if (!previewCameraId) return;
+    if (snapshotRequestingRef.current) return;
+    if (Date.now() < snapshotCooldownUntil) return;
+    snapshotRequestingRef.current = true;
+    setSnapshotRequesting(true);
+    startSnapshotCooldown();
+    try {
+      const response = await fetch(`/api/cameras/${previewCameraId}/refresh-thumbnail`, { method: "POST" });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data?.error || "Failed to request preview capture");
+    } catch (error) {
+      showToast("Error", error instanceof Error ? error.message : "Failed to capture preview", "destructive");
+      setSnapshotRequesting(false);
+    } finally {
+      snapshotRequestingRef.current = false;
+    }
+  };
+
+  const loadNegativeImages = async (id: number) => {
+    if (!id) {
+      setNegativeImages([]);
+      setSelectedNegativeImageIds([]);
+      return;
+    }
+    const response = await fetch(
+      isStepTarget
+        ? `/api/job-step-agents/${id}/negative-images`
+        : `/api/camera-algorithms/${id}/negative-images`
+    );
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.error || "Failed to load negative images");
+    const images = normalizeNegativeImages(data?.images);
+    setNegativeImages(images);
+    setSelectedNegativeImageIds(Array.from(new Set(images.map((img) => img.id))));
+  };
+
+  const initialize = async (
+    agent: CameraCustomAgentRow | null,
+    options?: { loadMode?: "existing" | "template" }
+  ) => {
+    const loadMode = options?.loadMode === "template" ? "template" : "existing";
+    const paramsObject = parseAgentParamsObject(agent?.params);
+    const executionBackend = normalizeStepAgentExecutionBackend(paramsObject.execution_backend);
+    const parsedFields = parsePromptTemplate(agent?.prompt_template, agent?.alert_condition, agent?.negative_condition);
+    const faceIds = normalizeFaceTargetIds(agent?.face_target_ids);
+    const negativeImagesFromAgent =
+      loadMode === "template" ? [] : normalizeNegativeImages(agent?.negative_reference_images);
+    const negativeIds = Array.from(new Set(negativeImagesFromAgent.map((img) => img.id)));
+
+    const normalizedInputType =
+      String(agent?.input_type || "").trim().toLowerCase() === "image" ? "image" : "video";
+    const normalizedInferenceModel = normalizeInferenceModel(agent?.inference_model);
+    const hasExplicitVideoPackagingMode = hasConfiguredVideoPackagingMode(
+      agent?.video_packaging_mode
+    );
+    const execution = applyExecutionConstraints(
+      normalizedInputType,
+      normalizedInferenceModel,
+      normalizeRunEverySeconds(agent?.run_every, 60),
+      normalizeRunningResolution(agent?.running_resolution),
+      normalizeModelFps(agent?.model_fps)
+    );
+
+    setDisplayName(getDisplayNameFromAgent(agent));
+    setIsEnabled(normalizeBool(agent?.is_enabled, true));
+    setPriorityLevel(normalizeCameraAgentPriority(agent?.priority_level));
+    setInputType(execution.inputType);
+    setVideoPackagingMode(
+      hasExplicitVideoPackagingMode
+        ? normalizeVideoPackagingMode(agent?.video_packaging_mode)
+        : DEFAULT_CAMERA_VIDEO_PACKAGING_MODE
+    );
+    setInferenceModel(execution.inferenceModel);
+    setRunEvery(execution.runEvery);
+    setRunningResolution(execution.runningResolution);
+    setModelFps(execution.modelFps);
+    setOnlyCaptureOnMotion(normalizeBool(agent?.only_capture_on_motion, false));
+    setFields(parsedFields);
+    const normalizedRegions = normalizeRegionsFromApi(
+      agent?.analysis_regions,
+      parsedFields,
+      faceIds,
+      negativeIds
+    );
+
+    setSelectedFaceTargetIds(faceIds);
+    setNegativeImages(negativeImagesFromAgent);
+    setSelectedNegativeImageIds(negativeIds);
+    setPolygonRegions(normalizedRegions);
+    const normalizedPortalCounterConfig = normalizePortalCounterConfig(paramsObject.portal_counter);
+    const defaultPortalRegionId =
+      normalizedPortalCounterConfig.region_id ||
+      normalizedRegions.find((region) => hasPolygonRegion(region))?.region_id ||
+      "";
+    setPortalCounterEnabled(executionBackend === PORTAL_COUNTER_EXECUTION_BACKEND);
+    setPortalCounterExpanded(executionBackend === PORTAL_COUNTER_EXECUTION_BACKEND);
+    setPortalCounterConfig({
+      ...normalizedPortalCounterConfig,
+      region_id: defaultPortalRegionId,
+      save_annotated_video: true,
+    });
+    setFrameWindow(
+      constrainFrameWindow(
+        extractFrameWindowFromAnalysisRegions(agent?.analysis_regions),
+        previewViewportMetrics
+      )
+    );
+
+    const id = Number(agent?.id);
+    const safeId =
+      loadMode === "existing" && Number.isInteger(id) && id > 0 ? id : null;
+    setAlgorithmId(safeId);
+    setPolygonDrawEnabled(false);
+    setShowRegionDialog(false);
+    setPendingRegionSeed(null);
+    setDraftRect(null);
+    setIsSizingRect(false);
+    setDragVertex(null);
+    setPanDrag(null);
+    setHoveredRegionId(null);
+    setSelectedRegionId(null);
+    setSuggestion(null);
+    setTargetFacesExpanded(false);
+    setPromptDocumentExpanded(false);
+    setCreatingFaceTarget(false);
+    setFaceTargetUploadingId(null);
+    setFaceTargetDeletingImageId(null);
+    setEditingFaceTargetId(null);
+    setEditingFaceTargetName("");
+    setEditingFaceTargetDescription("");
+    setSavingFaceTargetId(null);
+    setDeletingFaceTargetId(null);
+    videoPackagingWasManuallySelectedRef.current = hasExplicitVideoPackagingMode;
+
+    if (safeId) {
+      try {
+        await loadNegativeImages(safeId);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    void initialize(initialAgent);
+    void fetchFaceTargets();
+    setSnapshotLoading(true);
+    void refreshSnapshotMeta()
+      .then((has) => {
+        if (!has) void requestSnapshotRefresh();
+      })
+      .catch(() => {
+        // ignore
+      })
+      .finally(() => setSnapshotLoading(false));
+  }, [open, initialAgent?.id, previewCameraId, stepId, targetType]);
+
+  useEffect(() => {
+    if (!promptDocumentExpanded) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setPromptDocumentExpanded(false);
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [promptDocumentExpanded]);
+
+  useEffect(() => {
+    if (!open || !snapshotUrl) {
+      setPreviewViewportMetrics(null);
+      return;
+    }
+
+    const refreshBounds = () => {
+      setPreviewViewportMetrics(measurePreviewViewportMetrics());
+    };
+
+    refreshBounds();
+    const host = previewRef.current;
+    if (!host) return;
+
+    const observer =
+      typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => refreshBounds()) : null;
+    observer?.observe(host);
+    window.addEventListener("resize", refreshBounds);
+
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", refreshBounds);
+    };
+  }, [open, snapshotUrl, snapshotNaturalSize.width, snapshotNaturalSize.height]);
+
+  useEffect(() => {
+    if (!previewViewportMetrics) return;
+    setFrameWindow((prev) => {
+      const next = constrainFrameWindow(prev, previewViewportMetrics);
+      return areFrameWindowsClose(prev, next) ? prev : next;
+    });
+  }, [previewViewportMetrics]);
+
+  useEffect(() => {
+    const canvas = previewCanvasRef.current;
+    if (!canvas) return;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+
+    const metrics = previewViewportMetrics;
+    const snapshotImage = snapshotImageRef.current;
+    if (!snapshotUrl || !metrics || !snapshotImage) {
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
+
+    const displayWidth = Math.max(1, Math.round(metrics.width));
+    const displayHeight = Math.max(1, Math.round(metrics.height));
+    const devicePixelRatio =
+      typeof window !== "undefined" && Number.isFinite(window.devicePixelRatio)
+        ? Math.max(1, window.devicePixelRatio)
+        : 1;
+    const backingWidth = Math.max(1, Math.round(displayWidth * devicePixelRatio));
+    const backingHeight = Math.max(1, Math.round(displayHeight * devicePixelRatio));
+
+    if (canvas.width !== backingWidth) canvas.width = backingWidth;
+    if (canvas.height !== backingHeight) canvas.height = backingHeight;
+
+    const naturalWidth = Math.max(1, snapshotImage.naturalWidth || metrics.naturalWidth);
+    const naturalHeight = Math.max(1, snapshotImage.naturalHeight || metrics.naturalHeight);
+    const sourceX = Math.max(0, Math.min(naturalWidth - 1, frameWindow.x * naturalWidth));
+    const sourceY = Math.max(0, Math.min(naturalHeight - 1, frameWindow.y * naturalHeight));
+    const sourceWidth = Math.max(1, Math.min(naturalWidth - sourceX, frameWindow.width * naturalWidth));
+    const sourceHeight = Math.max(1, Math.min(naturalHeight - sourceY, frameWindow.height * naturalHeight));
+
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    context.drawImage(
+      snapshotImage,
+      sourceX,
+      sourceY,
+      sourceWidth,
+      sourceHeight,
+      0,
+      0,
+      displayWidth,
+      displayHeight
+    );
+  }, [
+    frameWindow.height,
+    frameWindow.width,
+    frameWindow.x,
+    frameWindow.y,
+    previewViewportMetrics,
+    snapshotImageVersion,
+    snapshotUrl,
+  ]);
+
+  useEffect(() => {
+    if (polygonRegions.length === 0) {
+      setSelectedRegionId(null);
+      return;
+    }
+    if (!selectedRegionId || !polygonRegions.some((region) => region.region_id === selectedRegionId)) {
+      setSelectedRegionId(polygonRegions[0].region_id);
+    }
+  }, [polygonRegions, selectedRegionId]);
+
+  useEffect(() => {
+    if (!open || !canLoadSavedAgentTemplate) {
+      setTemplateAgents([]);
+      setTemplateAgentsLoading(false);
+      setTemplateAgentsError(null);
+      setSelectedTemplateAgentKey("");
+      return;
+    }
+
+    let cancelled = false;
+    setTemplateAgentsLoading(true);
+    setTemplateAgentsError(null);
+    setSelectedTemplateAgentKey("");
+
+    void (async () => {
+      try {
+        const savedAgents = await fetchSavedAgentLibrary();
+        if (!cancelled) {
+          setTemplateAgents(savedAgents);
+        }
+      } catch (error) {
+        console.error("Failed to load saved agent library:", error);
+        if (!cancelled) {
+          setTemplateAgents([]);
+          setTemplateAgentsError(
+            error instanceof Error ? error.message : "Failed to load your saved agents"
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setTemplateAgentsLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [open, canLoadSavedAgentTemplate]);
+
+  useEffect(() => {
+    if (!open || !isTutorialCameraEditorTarget) {
+      tutorialAgentSeededRef.current = false;
+      if (!open) {
+        return;
+      }
+    }
+
+    if (!open) {
+      return;
+    }
+
+    if (
+      initialAgent ||
+      !isTutorialCameraEditorTarget ||
+      !isOnboardingOpen ||
+      !onboardingStepId ||
+      !AGENT_EDITOR_ONBOARDING_STEPS.has(onboardingStepId)
+    ) {
+      return;
+    }
+
+    if (!tutorialAgentSeededRef.current) {
+      const preferredModel = getTutorialInferenceModel({
+        openai: providerStatus.openai,
+        zai: providerStatus.zai,
+      });
+      const execution = applyExecutionConstraints(
+        "video",
+        preferredModel,
+        10,
+        DEFAULT_CORE_RUNNING_RESOLUTION,
+        DEFAULT_ULTRA_VIDEO_MODEL_FPS
+      );
+
+      setDisplayName(t("tutorial.agentPreset.name"));
+      setIsEnabled(true);
+      setInputType(execution.inputType);
+      setVideoPackagingMode("frame_sequence");
+      videoPackagingWasManuallySelectedRef.current = false;
+      setInferenceModel(execution.inferenceModel);
+      setRunEvery(execution.runEvery);
+      setRunningResolution(execution.runningResolution);
+      setModelFps(execution.modelFps);
+      setOnlyCaptureOnMotion(false);
+      setFields({
+        prompt_template: t("tutorial.agentPreset.promptCore"),
+        alert_condition: t("tutorial.agentPreset.alertCondition"),
+        negative_condition: "",
+      });
+      tutorialAgentSeededRef.current = true;
+    }
+  }, [
+    initialAgent,
+    isOnboardingOpen,
+    onboardingStepId,
+    open,
+    providerStatus.openai,
+    providerStatus.zai,
+    t,
+    isTutorialCameraEditorTarget,
+  ]);
+
+  useEffect(() => {
+    if (!open) return;
+    if (!snapshotRequesting) return;
+    let cancelled = false;
+    const startedAt = Date.now();
+    const poll = async () => {
+      while (!cancelled && Date.now() - startedAt < 12000) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        try {
+          const ok = await refreshSnapshotMeta();
+          if (ok) {
+            if (!cancelled) setSnapshotRequesting(false);
+            return;
+          }
+        } catch {
+          // ignore while polling
+        }
+      }
+      if (!cancelled) setSnapshotRequesting(false);
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, snapshotRequesting]);
+
+  useEffect(() => {
+    return () => {
+      clearSnapshotCooldown();
+    };
+  }, []);
+
+  useEffect(() => {
+    const constrained = applyExecutionConstraints(
+      inputType,
+      inferenceModel,
+      runEvery,
+      runningResolution,
+      modelFps
+    );
+    if (
+      constrained.inputType !== inputType ||
+      constrained.runEvery !== runEvery ||
+      constrained.runningResolution !== runningResolution ||
+      constrained.modelFps !== modelFps
+    ) {
+      setInputType(constrained.inputType);
+      setRunEvery(constrained.runEvery);
+      setRunningResolution(constrained.runningResolution);
+      setModelFps(constrained.modelFps);
+    }
+  }, [inferenceModel, inputType, modelFps, runEvery, runningResolution]);
+
+  const selectedRegion = useMemo(() => {
+    if (polygonRegions.length === 0) return null;
+    return (
+      polygonRegions.find((region) => region.region_id === selectedRegionId) ||
+      polygonRegions.find((region) => region.region_id === hoveredRegionId) ||
+      polygonRegions[0]
+    );
+  }, [polygonRegions, selectedRegionId, hoveredRegionId]);
+
+  const togglePolygonRegionEnabled = (regionId: string) => {
+    if (!regionId) return;
+    setPolygonRegions((prev) =>
+      prev.map((region) =>
+        region.region_id === regionId ? { ...region, enabled: !region.enabled } : region
+      )
+    );
+  };
+
+  const removePolygonRegion = (regionId: string) => {
+    if (!regionId) return;
+    const remaining = polygonRegions.filter((region) => region.region_id !== regionId);
+    setPolygonRegions(remaining);
+    if (hoveredRegionId === regionId) {
+      setHoveredRegionId(null);
+    }
+    setSelectedRegionId((prev) => {
+      if (remaining.length === 0) return null;
+      if (prev && prev !== regionId && remaining.some((region) => region.region_id === prev)) {
+        return prev;
+      }
+      return remaining[0].region_id;
+    });
+  };
+
+  const getPointFromMouse = (clientX: number, clientY: number) => {
+    const host = previewRef.current;
+    const bounds = measurePreviewViewportMetrics();
+    if (!host || !bounds) return null;
+    const rect = host.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+    if (x < 0 || y < 0 || x > bounds.width || y > bounds.height) return null;
+
+    return {
+      point: {
+        x: clamp01(frameWindow.x + (x / bounds.width) * frameWindow.width),
+        y: clamp01(frameWindow.y + (y / bounds.height) * frameWindow.height),
+      },
+      draw_ref_width: bounds.naturalWidth,
+      draw_ref_height: bounds.naturalHeight,
+    };
+  };
+
+  const setConstrainedFrameWindow = (next: FrameWindowNorm) => {
+    setFrameWindow(constrainFrameWindow(next, previewViewportMetrics));
+  };
+
+  const applyFrameWindowZoom = (nextZoom: number, anchor = { x: 0.5, y: 0.5 }) => {
+    const safeZoom = Math.min(FRAME_WINDOW_MAX_ZOOM, Math.max(1, Number(nextZoom) || 1));
+    const baseFrameWindow = buildBaseFrameWindowForViewport(previewViewportMetrics);
+    const nextWidth = baseFrameWindow.width / safeZoom;
+    const nextHeight = baseFrameWindow.height / safeZoom;
+    setConstrainedFrameWindow({
+      x: frameWindow.x + anchor.x * (frameWindow.width - nextWidth),
+      y: frameWindow.y + anchor.y * (frameWindow.height - nextHeight),
+      width: nextWidth,
+      height: nextHeight,
+    });
+  };
+
+  const onPreviewWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    const host = previewRef.current;
+    const bounds = measurePreviewViewportMetrics();
+    if (!host || !bounds || !snapshotUrl) return;
+    const rect = host.getBoundingClientRect();
+    const localX = event.clientX - rect.left;
+    const localY = event.clientY - rect.top;
+    if (localX < 0 || localY < 0 || localX > bounds.width || localY > bounds.height) return;
+    event.preventDefault();
+    const anchor = { x: localX / bounds.width, y: localY / bounds.height };
+    const currentZoom = getFrameWindowZoom(frameWindow);
+    const nextZoom = currentZoom * Math.exp(-event.deltaY * 0.0025);
+    applyFrameWindowZoom(nextZoom, anchor);
+  };
+
+  const onPreviewMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
+    const shouldStartPan =
+      snapshotUrl &&
+      (event.button === 2 || (event.button === 0 && !polygonDrawEnabled && !pendingRegionSeed && !isSizingRect));
+    if (shouldStartPan) {
+      if (!snapshotUrl) return;
+      const bounds = measurePreviewViewportMetrics();
+      const host = previewRef.current;
+      if (!bounds || !host) return;
+      const rect = host.getBoundingClientRect();
+      const localX = event.clientX - rect.left;
+      const localY = event.clientY - rect.top;
+      if (localX < 0 || localY < 0 || localX > bounds.width || localY > bounds.height) return;
+      event.preventDefault();
+      setPanDrag({
+        button: event.button as 0 | 2,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        frameWindow,
+      });
+      return;
+    }
+    if (event.button !== 0) return;
+    const pointer = getPointFromMouse(event.clientX, event.clientY);
+    if (dragVertex || panDrag) return;
+
+    if (pendingRegionSeed && !isSizingRect) {
+      setIsSizingRect(true);
+      setDraftRect({
+        start: pendingRegionSeed.start,
+        end: pointer?.point ?? pendingRegionSeed.start,
+      });
+      return;
+    }
+
+    if (!polygonDrawEnabled || !pointer || !snapshotUrl) return;
+    if (polygonCount >= ANALYSIS_REGION_MAX) {
+      showToast("Validation", `Maximum ${ANALYSIS_REGION_MAX} polygons`, "destructive");
+      return;
+    }
+
+    setRegionDialogLabel(`Region ${polygonCount + 1}`);
+    setRegionDialogDescription("");
+    setRegionDialogAnchor(pointer);
+    setShowRegionDialog(true);
+  };
+
+  const onPreviewMouseMove = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (panDrag) {
+      const bounds = measurePreviewViewportMetrics();
+      if (!bounds) return;
+      const dx = event.clientX - panDrag.startClientX;
+      const dy = event.clientY - panDrag.startClientY;
+      setConstrainedFrameWindow({
+        x: panDrag.frameWindow.x - (dx / bounds.width) * panDrag.frameWindow.width,
+        y: panDrag.frameWindow.y - (dy / bounds.height) * panDrag.frameWindow.height,
+        width: panDrag.frameWindow.width,
+        height: panDrag.frameWindow.height,
+      });
+      return;
+    }
+    const pointer = getPointFromMouse(event.clientX, event.clientY);
+    if (dragVertex) {
+      if (!pointer) return;
+      setPolygonRegions((prev) =>
+        prev.map((region) => {
+          if (region.region_id !== dragVertex.regionId) return region;
+          if (!Array.isArray(region.polygon_norm) || dragVertex.index >= region.polygon_norm.length) {
+            return region;
+          }
+          const next = [...region.polygon_norm];
+          next[dragVertex.index] = pointer.point;
+          return {
+            ...region,
+            polygon_norm: next,
+            draw_ref_width: pointer.draw_ref_width,
+            draw_ref_height: pointer.draw_ref_height,
+          };
+        })
+      );
+      return;
+    }
+
+    if (isSizingRect && pendingRegionSeed) {
+      setDraftRect((prev) => ({
+        start: prev?.start || pendingRegionSeed.start,
+        end: pointer?.point || prev?.end || pendingRegionSeed.start,
+      }));
+      return;
+    }
+
+    if (!pointer) {
+      setHoveredRegionId(null);
+      return;
+    }
+
+    for (let idx = polygonRegions.length - 1; idx >= 0; idx -= 1) {
+      const region = polygonRegions[idx];
+      const poly = Array.isArray(region.polygon_norm) ? region.polygon_norm : [];
+      if (poly.length >= ANALYSIS_REGION_MIN_POINTS && region.enabled && pointInPolygon(pointer.point, poly)) {
+        setHoveredRegionId(region.region_id);
+        return;
+      }
+    }
+    setHoveredRegionId(null);
+  };
+
+  const onPreviewMouseUp = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (panDrag && event.button === panDrag.button) {
+      setPanDrag(null);
+      return;
+    }
+    if (event.button !== 0) return;
+    if (dragVertex) {
+      setDragVertex(null);
+      return;
+    }
+    if (!isSizingRect || !pendingRegionSeed) return;
+
+    const pointer = getPointFromMouse(event.clientX, event.clientY);
+    const rectPoints = buildRectPolygonFromPoints(
+      pendingRegionSeed.start,
+      pointer?.point ?? draftRect?.end ?? pendingRegionSeed.start
+    );
+    setIsSizingRect(false);
+    setDraftRect(null);
+
+    if (rectPoints.length < ANALYSIS_REGION_MIN_POINTS) {
+      setPendingRegionSeed(null);
+      showToast("Validation", "Polygon area is too small", "destructive");
+      return;
+    }
+
+    const baseId = sanitizeRegionId(pendingRegionSeed.label, polygonRegions.length);
+    const used = new Set(polygonRegions.map((region) => region.region_id));
+    let nextId = baseId;
+    let suffix = 2;
+    while (used.has(nextId)) {
+      nextId = `${baseId}-${suffix}`;
+      suffix += 1;
+    }
+
+    const nextRegion: AnalysisRegion = {
+      region_id: nextId,
+      label: pendingRegionSeed.label.trim() || `Region ${polygonRegions.length + 1}`,
+      description: pendingRegionSeed.description.trim(),
+      enabled: true,
+      full_frame: false,
+      polygon_norm: rectPoints,
+      draw_ref_width: pendingRegionSeed.draw_ref_width,
+      draw_ref_height: pendingRegionSeed.draw_ref_height,
+      context_padding_pct: 0,
+      prompt_core: fields.prompt_template,
+      alert_condition: fields.alert_condition,
+      negative_condition: fields.negative_condition,
+      face_target_ids: selectedFaceTargetIds,
+      negative_image_ids: selectedNegativeImageIds,
+    };
+    setPolygonRegions((prev) => [...prev, nextRegion]);
+    setHoveredRegionId(nextId);
+    setSelectedRegionId(nextId);
+    setPendingRegionSeed(null);
+  };
+
+  const onConfirmRegionDialog = () => {
+    if (!regionDialogAnchor) return;
+    setPendingRegionSeed({
+      start: regionDialogAnchor.point,
+      label: regionDialogLabel.trim() || `Region ${polygonCount + 1}`,
+      description: regionDialogDescription.trim(),
+      draw_ref_width: regionDialogAnchor.draw_ref_width,
+      draw_ref_height: regionDialogAnchor.draw_ref_height,
+    });
+    setShowRegionDialog(false);
+    setRegionDialogAnchor(null);
+    showToast("Info", "Click and drag on preview to size polygon", "default");
+  };
+
+  const currentZoom = useMemo(
+    () => getFrameWindowZoom(frameWindow),
+    [frameWindow]
+  );
+  const hasViewportAdjustments = useMemo(() => {
+    const baseFrameWindow = buildBaseFrameWindowForViewport(previewViewportMetrics);
+    return !areFrameWindowsClose(frameWindow, baseFrameWindow);
+  }, [frameWindow, previewViewportMetrics]);
+
+  const toggleSelectedFaceTarget = (targetId: number) => {
+    if (!Number.isInteger(targetId) || targetId <= 0) return;
+    setSelectedFaceTargetIds((prev) => {
+      const set = new Set(prev);
+      if (set.has(targetId)) set.delete(targetId);
+      else set.add(targetId);
+      return Array.from(set);
+    });
+  };
+
+  const onCreateFaceTarget = async (
+    options: { autoSelect?: boolean; silentSuccess?: boolean } = {}
+  ): Promise<number | null> => {
+    const name = newFaceTargetName.trim();
+    if (!name || !newFaceTargetFile) {
+      if (!options.silentSuccess) {
+        showToast("Validation", "Target name and image are required", "destructive");
+      }
+      return null;
+    }
+    if (!String(newFaceTargetFile.type || "").toLowerCase().startsWith("image/")) {
+      showToast("Validation", "Only image files are allowed", "destructive");
+      return null;
+    }
+    if (newFaceTargetFile.size > FACE_ID_MAX_UPLOAD_BYTES) {
+      showToast("Validation", "Image is too large. Maximum size is 10MB.", "destructive");
+      return null;
+    }
+
+    setCreatingFaceTarget(true);
+    try {
+      const normalized = await normalizeFaceIdImage(newFaceTargetFile, {
+        maxSidePx: FACE_ID_MAX_IMAGE_SIDE_PX,
+      });
+      const formData = new FormData();
+      formData.append("name", name);
+      formData.append("description", newFaceTargetDescription.trim());
+      formData.append("image", normalized.file, normalized.file.name);
+      const response = await fetch("/api/face-targets", { method: "POST", body: formData });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data?.error || "Failed to create target");
+
+      const targetId = Number(data?.target?.id);
+      setNewFaceTargetName("");
+      setNewFaceTargetDescription("");
+      setNewFaceTargetFile(null);
+      await fetchFaceTargets();
+
+      if (options.autoSelect && Number.isInteger(targetId) && targetId > 0) {
+        setSelectedFaceTargetIds((prev) => Array.from(new Set([...prev, targetId])));
+      }
+      if (!options.silentSuccess) {
+        showToast("Success", "Target face created", "default");
+      }
+      return Number.isInteger(targetId) && targetId > 0 ? targetId : null;
+    } catch (error) {
+      showToast("Error", error instanceof Error ? error.message : "Failed to create target", "destructive");
+      return null;
+    } finally {
+      setCreatingFaceTarget(false);
+    }
+  };
+
+  const startEditingFaceTarget = (target: FaceTarget) => {
+    setEditingFaceTargetId(target.id);
+    setEditingFaceTargetName(target.name || "");
+    setEditingFaceTargetDescription(target.description || "");
+  };
+
+  const cancelEditingFaceTarget = () => {
+    setEditingFaceTargetId(null);
+    setEditingFaceTargetName("");
+    setEditingFaceTargetDescription("");
+    setSavingFaceTargetId(null);
+  };
+
+  const onSaveFaceTargetMeta = async (targetId: number) => {
+    if (!Number.isInteger(targetId) || targetId <= 0) return;
+    const nextName = editingFaceTargetName.trim();
+    if (!nextName) {
+      showToast("Validation", "Target name is required", "destructive");
+      return;
+    }
+    setSavingFaceTargetId(targetId);
+    try {
+      const response = await fetch(`/api/face-targets/${targetId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: nextName,
+          description: editingFaceTargetDescription.trim(),
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data?.error || "Failed to update target face");
+      await fetchFaceTargets();
+      cancelEditingFaceTarget();
+      showToast("Success", "Target face updated", "default");
+    } catch (error) {
+      showToast(
+        "Error",
+        error instanceof Error ? error.message : "Failed to update target face",
+        "destructive"
+      );
+    } finally {
+      setSavingFaceTargetId(null);
+    }
+  };
+
+  const onDeleteFaceTarget = async (target: FaceTarget) => {
+    const targetId = Number(target?.id);
+    if (!Number.isInteger(targetId) || targetId <= 0) return;
+    if (!confirm(`Delete target "${target.name || `#${targetId}`}"?`)) return;
+
+    setDeletingFaceTargetId(targetId);
+    try {
+      const response = await fetch(`/api/face-targets/${targetId}`, {
+        method: "DELETE",
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data?.error || "Failed to delete target face");
+
+      await fetchFaceTargets();
+      setSelectedFaceTargetIds((prev) => prev.filter((id) => id !== targetId));
+      if (editingFaceTargetId === targetId) cancelEditingFaceTarget();
+      showToast("Success", "Target face deleted", "default");
+    } catch (error) {
+      showToast(
+        "Error",
+        error instanceof Error ? error.message : "Failed to delete target face",
+        "destructive"
+      );
+    } finally {
+      setDeletingFaceTargetId(null);
+    }
+  };
+
+  const onAddFaceTargetImages = async (targetId: number, files: File[]) => {
+    if (!Number.isInteger(targetId) || targetId <= 0) return;
+    if (!Array.isArray(files) || files.length === 0) return;
+
+    const target = faceTargets.find((entry) => entry.id === targetId);
+    const currentCount = getFaceTargetImageCount(target);
+    if (currentCount >= FACE_TARGET_MAX_IMAGES) {
+      showToast("Validation", `Maximum ${FACE_TARGET_MAX_IMAGES} images per target`, "destructive");
+      return;
+    }
+
+    const availableSlots = FACE_TARGET_MAX_IMAGES - currentCount;
+    const candidateFiles = files.filter((file) =>
+      String(file.type || "").toLowerCase().startsWith("image/")
+    );
+    const validSizeFiles = candidateFiles.filter((file) => file.size <= FACE_ID_MAX_UPLOAD_BYTES);
+    const filesToUpload = validSizeFiles.slice(0, availableSlots);
+    if (filesToUpload.length === 0) {
+      showToast("Validation", `Maximum ${FACE_TARGET_MAX_IMAGES} images per target`, "destructive");
+      return;
+    }
+
+    setFaceTargetUploadingId(targetId);
+    try {
+      for (const file of filesToUpload) {
+        const normalizedUpload = await normalizeFaceIdImage(file, {
+          maxSidePx: FACE_ID_MAX_IMAGE_SIDE_PX,
+        });
+        const formData = new FormData();
+        formData.append("image", normalizedUpload.file, normalizedUpload.file.name);
+        const response = await fetch(`/api/face-targets/${targetId}/images`, {
+          method: "POST",
+          body: formData,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data?.error || "Failed to upload face image");
+      }
+      await fetchFaceTargets();
+      showToast("Success", "Face image(s) uploaded", "default");
+    } catch (error) {
+      showToast("Error", error instanceof Error ? error.message : "Failed to upload face image", "destructive");
+    } finally {
+      setFaceTargetUploadingId(null);
+    }
+  };
+
+  const onDeleteFaceTargetImage = async (targetId: number, imageId: number) => {
+    if (!Number.isInteger(targetId) || targetId <= 0) return;
+    if (!Number.isInteger(imageId) || imageId <= 0) return;
+
+    setFaceTargetDeletingImageId(imageId);
+    try {
+      const response = await fetch(`/api/face-targets/${targetId}/images/${imageId}`, {
+        method: "DELETE",
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data?.error || "Failed to remove face image");
+      await fetchFaceTargets();
+      showToast("Success", "Face image removed", "default");
+    } catch (error) {
+      showToast(
+        "Error",
+        error instanceof Error ? error.message : "Failed to remove face image",
+        "destructive"
+      );
+    } finally {
+      setFaceTargetDeletingImageId(null);
+    }
+  };
+
+  const onUploadNegativeImages = async (files: File[]) => {
+    if (!algorithmId) {
+      showToast("Validation", "Save the custom agent before uploading negative images", "destructive");
+      return;
+    }
+    if (!Array.isArray(files) || files.length === 0) return;
+    const currentCount = negativeImages.length;
+    if (currentCount >= NEGATIVE_REFERENCE_MAX_IMAGES) {
+      showToast("Validation", `Maximum ${NEGATIVE_REFERENCE_MAX_IMAGES} negative images`, "destructive");
+      return;
+    }
+    const availableSlots = NEGATIVE_REFERENCE_MAX_IMAGES - currentCount;
+    const toUpload = files.slice(0, availableSlots);
+    setUploadingNegativeImages(true);
+    try {
+      for (const file of toUpload) {
+        const normalized = await normalizeFaceIdImage(file, {
+          maxSidePx: FACE_ID_MAX_IMAGE_SIDE_PX,
+        });
+        const formData = new FormData();
+        formData.append("image", normalized.file, normalized.file.name);
+        const response = await fetch(
+          isStepTarget
+            ? `/api/job-step-agents/${algorithmId}/negative-images`
+            : `/api/camera-algorithms/${algorithmId}/negative-images`,
+          {
+            method: "POST",
+            body: formData,
+          }
+        );
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data?.error || "Failed to upload negative image");
+      }
+      await loadNegativeImages(algorithmId);
+      showToast("Success", "Negative reference images updated", "default");
+    } catch (error) {
+      showToast("Error", error instanceof Error ? error.message : "Failed to upload negative image", "destructive");
+    } finally {
+      setUploadingNegativeImages(false);
+    }
+  };
+
+  const onDeleteNegativeImage = async (imageId: number) => {
+    if (!algorithmId || !imageId) return;
+    try {
+      const response = await fetch(
+        isStepTarget
+          ? `/api/job-step-agents/${algorithmId}/negative-images/${imageId}`
+          : `/api/camera-algorithms/${algorithmId}/negative-images/${imageId}`,
+        {
+          method: "DELETE",
+        }
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data?.error || "Failed to remove negative image");
+      await loadNegativeImages(algorithmId);
+    } catch (error) {
+      showToast("Error", error instanceof Error ? error.message : "Failed to remove negative image", "destructive");
+    }
+  };
+
+  const onTogglePortalCounter = (nextEnabled: boolean) => {
+    if (nextEnabled) {
+      if (!portalCounterSelectable || !stepCameraId) {
+        showToast(
+          "Validation",
+          "Portal counter can only be enabled for a step camera target",
+          "destructive"
+        );
+        return;
+      }
+      if (!hasPortalCounterRegionOptions) {
+        showToast(
+          "Validation",
+          "Draw at least one polygon region before enabling the portal counter",
+          "destructive"
+        );
+        return;
+      }
+      setPortalCounterConfig((prev) => ({
+        ...prev,
+        region_id: prev.region_id || portalCounterRegionOptions[0]?.region_id || "",
+        save_annotated_video: true,
+      }));
+      setPortalCounterExpanded(true);
+    }
+    setPortalCounterEnabled(nextEnabled);
+  };
+
+  const onEnhancePrompt = async () => {
+    if (isPortalCounterActive) {
+      showToast(
+        "Validation",
+        "Prompt enhancement is disabled while the native portal counter mode is active",
+        "destructive"
+      );
+      return;
+    }
+    const normalized = normalizeFields(fields);
+    if (!normalized.prompt_template || !normalized.alert_condition) {
+      showToast("Validation", "Prompt Core and Alert Condition are required", "destructive");
+      return;
+    }
+    if (isStepTarget) {
+      if (!stepId) {
+        showToast("Validation", "This step target is missing its step reference", "destructive");
+        return;
+      }
+      if (!previewCameraId) {
+        showToast("Validation", "Select a step camera target before enhancing the prompt", "destructive");
+        return;
+      }
+    }
+    setEnhancingPrompt(true);
+    setSuggestion(null);
+    try {
+      const response = await fetch(
+        isStepTarget
+          ? `/api/job-steps/${stepId}/agents/enhance-prompt`
+          : `/api/cameras/${cameraId}/custom-agents/enhance-prompt`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...(isStepTarget ? { camera_id: previewCameraId } : {}),
+            prompt_template: normalized.prompt_template,
+            alert_condition: normalized.alert_condition,
+            negative_condition: normalized.negative_condition,
+            language: "match_input_language",
+            analysis_regions: normalizeRegionsForPayload(
+              polygonRegions,
+              normalized,
+              selectedFaceTargetIds,
+              selectedNegativeImageIds,
+              frameWindow
+            ),
+          }),
+        }
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        if (isOpenAiKeyRequiredError(data)) {
+          emitOpenAiKeyRequiredPrompt();
+        }
+        throw new Error(data?.message || data?.error || "Failed to enqueue enhancement");
+      }
+
+      const commandId = Number(data?.command_id);
+      if (!Number.isInteger(commandId) || commandId <= 0) {
+        throw new Error("Invalid enhancement command id");
+      }
+      const timeoutAt = Date.now() + 120000;
+      while (Date.now() < timeoutAt) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const pollRes = await fetch(
+          isStepTarget
+            ? `/api/job-steps/${stepId}/agents/enhance-prompt/${commandId}`
+            : `/api/cameras/${cameraId}/custom-agents/enhance-prompt/${commandId}`
+        );
+        const pollData = await pollRes.json().catch(() => ({}));
+        if (!pollRes.ok) throw new Error(pollData?.error || "Failed to check enhancement status");
+        const status = String(pollData?.status || "").trim().toLowerCase();
+        if (status === "pending" || status === "sent") continue;
+        if (status === "failed") throw new Error(pollData?.error || "Prompt enhancement failed");
+        if (status === "completed") {
+          const next = normalizeFields({
+            prompt_template: String(pollData?.suggestion?.prompt_template || ""),
+            alert_condition: String(pollData?.suggestion?.alert_condition || ""),
+            negative_condition: String(pollData?.suggestion?.negative_condition || ""),
+          });
+          if (!next.prompt_template || !next.alert_condition) {
+            throw new Error("Invalid suggestion received");
+          }
+          setSuggestion({
+            ...next,
+            model_name: typeof pollData?.meta?.model_name === "string" ? pollData.meta.model_name : undefined,
+            snapshot_source:
+              typeof pollData?.meta?.snapshot_source === "string"
+                ? pollData.meta.snapshot_source
+                : undefined,
+          });
+          return;
+        }
+      }
+      throw new Error("Prompt enhancement timed out");
+    } catch (error) {
+      showToast("Error", error instanceof Error ? error.message : "Failed to enhance prompt", "destructive");
+    } finally {
+      setEnhancingPrompt(false);
+    }
+  };
+
+  const onLoadTemplateAgent = async () => {
+    if (!selectedTemplateAgent) {
+      showToast("Validation", "Select one of your saved agents first", "destructive");
+      return;
+    }
+
+    const requestedFaceTargetIds = normalizeFaceTargetIds(selectedTemplateAgent.face_target_ids);
+    const faceIds =
+      faceTargets.length > 0
+        ? requestedFaceTargetIds.filter((id) =>
+            faceTargets.some((target) => target.id === id)
+          )
+        : requestedFaceTargetIds;
+
+    await initialize(
+      {
+        id: selectedTemplateAgent.id,
+        algorithm_type: selectedTemplateAgent.algorithm_type || selectedTemplateAgent.agent_key,
+        is_enabled: selectedTemplateAgent.is_enabled ? 1 : 0,
+        input_type: selectedTemplateAgent.input_type,
+        video_packaging_mode: selectedTemplateAgent.video_packaging_mode,
+        inference_model: selectedTemplateAgent.inference_model,
+        model_fps:
+          selectedTemplateAgent.model_fps ?? DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+        run_every: selectedTemplateAgent.run_every ?? 60,
+        running_resolution: selectedTemplateAgent.running_resolution,
+        only_capture_on_motion: selectedTemplateAgent.only_capture_on_motion,
+        prompt_template: selectedTemplateAgent.prompt_template,
+        alert_condition: selectedTemplateAgent.alert_condition,
+        negative_condition: selectedTemplateAgent.negative_condition,
+        priority_level: normalizeCameraAgentPriority(selectedTemplateAgent.priority_level),
+        face_target_ids: faceIds,
+        negative_reference_images: [],
+        analysis_regions: selectedTemplateAgent.analysis_regions,
+        config_json: {
+          display_name: selectedTemplateAgent.display_name,
+          summary: selectedTemplateAgent.summary,
+        },
+      },
+      { loadMode: "template" }
+    );
+
+    showToast(
+      "Agent loaded",
+      initialAgent
+        ? "Loaded into the editor. Saving now will create a new agent based on this template. Negative reference images need to be uploaded again after the first save."
+        : "This draft now uses your saved agent as a starting point. Negative reference images need to be uploaded again after the first save.",
+      "default"
+    );
+  };
+
+  const onApplyAndSave = async () => {
+    const normalized = normalizeFields(fields);
+    if (!displayName.trim()) {
+      showToast("Validation", "Agent Name is required", "destructive");
+      return;
+    }
+    if (!isPortalCounterActive && (!normalized.prompt_template || !normalized.alert_condition)) {
+      showToast("Validation", "Agent Name, Prompt Core and Alert Condition are required", "destructive");
+      return;
+    }
+    if ((newFaceTargetName.trim().length > 0) !== !!newFaceTargetFile) {
+      showToast("Validation", "Fill both target name and image, or leave both empty", "destructive");
+      return;
+    }
+    if (!editorTarget) {
+      showToast("Validation", "Missing agent destination", "destructive");
+      return;
+    }
+    if (isStepTarget && !stepId) {
+      showToast("Validation", "This step target is missing its step reference", "destructive");
+      return;
+    }
+
+    let faceIds = [...selectedFaceTargetIds];
+    if (newFaceTargetName.trim() && newFaceTargetFile) {
+      const createdTargetId = await onCreateFaceTarget({
+        autoSelect: true,
+        silentSuccess: true,
+      });
+      if (typeof createdTargetId === "number" && Number.isInteger(createdTargetId) && createdTargetId > 0) {
+        faceIds = normalizeFaceTargetIds([...faceIds, createdTargetId]);
+      } else {
+        faceIds = normalizeFaceTargetIds([...selectedFaceTargetIds]);
+      }
+    }
+
+    const analysisRegions = normalizeRegionsForPayload(
+      polygonRegions,
+      normalized,
+      faceIds,
+      selectedNegativeImageIds,
+      frameWindow
+    );
+    const normalizedPortalCounterConfig = normalizePortalCounterConfig(portalCounterConfig);
+    if (isPortalCounterActive) {
+      if (!stepCameraId) {
+        showToast(
+          "Validation",
+          "Portal counter can only be saved on a step camera target",
+          "destructive"
+        );
+        return;
+      }
+      const selectedPortalRegion = analysisRegions.find(
+        (region) => region.region_id === normalizedPortalCounterConfig.region_id
+      );
+      if (!selectedPortalRegion || !hasPolygonRegion(selectedPortalRegion as AnalysisRegion)) {
+        showToast(
+          "Validation",
+          "Select a polygon region for the portal counter before saving",
+          "destructive"
+        );
+        return;
+      }
+    }
+    const modelFpsForSave =
+      supportsAdjustableVideoFps(inferenceModel) && inputType === "video"
+        ? modelFps
+        : DEFAULT_ULTRA_VIDEO_MODEL_FPS;
+    const payload = {
+      display_name: displayName.trim(),
+      prompt_template: normalized.prompt_template,
+      alert_condition: normalized.alert_condition,
+      negative_condition: normalized.negative_condition,
+      analysis_regions: analysisRegions,
+      face_target_ids: faceIds,
+      is_enabled: isEnabled ? 1 : 0,
+      priority_level: priorityLevel,
+      input_type: inputType,
+      video_packaging_mode: videoPackagingMode,
+      inference_model: inferenceModel,
+      model_fps: modelFpsForSave,
+      run_every: runEvery,
+      running_resolution: inferenceModel === "core" ? runningResolution : null,
+      only_capture_on_motion: onlyCaptureOnMotion,
+    };
+    setSaving(true);
+    try {
+      const endpoint = isStepTarget
+        ? `/api/job-steps/${stepId}/agents`
+        : algorithmId
+          ? `/api/cameras/${cameraId}/custom-agents/${algorithmId}`
+          : `/api/cameras/${cameraId}/custom-agents`;
+      const method = isStepTarget ? "POST" : algorithmId ? "PATCH" : "POST";
+      const stepPayload = isStepTarget
+        ? {
+            agent_key: isPortalCounterActive
+              ? "portal_counter"
+              : typeof initialAgent?.algorithm_type === "string" && initialAgent.algorithm_type.trim()
+                ? initialAgent.algorithm_type.trim()
+                : "custom_template",
+            prompt_template: isPortalCounterActive ? "" : normalized.prompt_template,
+            alert_condition: isPortalCounterActive ? "" : normalized.alert_condition,
+            negative_condition: isPortalCounterActive ? "" : normalized.negative_condition,
+            camera_id: stepCameraId ?? null,
+            params: JSON.stringify({
+              display_name: displayName.trim(),
+              summary: isPortalCounterActive
+                ? DEFAULT_PORTAL_COUNTER_SUMMARY
+                : getSummaryFromAgent(initialAgent) || normalized.alert_condition,
+              execution_backend: isPortalCounterActive ? PORTAL_COUNTER_EXECUTION_BACKEND : "llm",
+              ...(isPortalCounterActive
+                ? {
+                    portal_counter: {
+                      ...normalizedPortalCounterConfig,
+                      region_id: normalizedPortalCounterConfig.region_id,
+                      save_annotated_video: true,
+                    },
+                  }
+                : {}),
+            }),
+            priority_level: priorityLevel,
+            input_type: isPortalCounterActive ? "video" : inputType,
+            video_packaging_mode: isPortalCounterActive ? "frame_sequence" : videoPackagingMode,
+            inference_model: isPortalCounterActive ? "ultra" : inferenceModel,
+            model_fps: isPortalCounterActive ? DEFAULT_ULTRA_VIDEO_MODEL_FPS : modelFpsForSave,
+            run_every: isPortalCounterActive ? 60 : runEvery,
+            running_resolution:
+              isPortalCounterActive ? null : inferenceModel === "core" ? runningResolution : null,
+            only_capture_on_motion: isPortalCounterActive ? false : onlyCaptureOnMotion,
+            use_temporal_context: isPortalCounterActive ? false : undefined,
+            face_target_ids: faceIds,
+            analysis_regions: analysisRegions,
+          }
+        : payload;
+      const response = await fetch(endpoint, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(stepPayload),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        if (isOpenAiKeyRequiredError(data)) {
+          emitOpenAiKeyRequiredPrompt();
+        }
+        if (isZAiKeyRequiredError(data)) {
+          emitZAiKeyRequiredPrompt();
+        }
+        throw new Error(data?.message || data?.error || "Failed to save custom agent");
+      }
+      const savedId = Number(data?.agent?.id ?? algorithmId);
+      if (Number.isInteger(savedId) && savedId > 0) {
+        setAlgorithmId(savedId);
+        await loadNegativeImages(savedId);
+      }
+      await onSaved(savedId);
+      showToast("Success", "Custom AI agent saved", "default");
+      onClose();
+    } catch (error) {
+      showToast("Error", error instanceof Error ? error.message : "Failed to save custom agent", "destructive");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const getRunEveryOptionLabel = (seconds: CameraAgentRunEverySeconds): string => {
+    return seconds === 10
+      ? t("jobs.runEveryOption.seconds10")
+      : t("jobs.runEveryOption.seconds60");
+  };
+
+  const renderPortalCounterCollapse = () => {
+    if (!isStepTarget) return null;
+
+    return (
+      <div className="rounded-xl border border-gray-700 bg-gray-800/70">
+        <button
+          type="button"
+          onClick={() => setPortalCounterExpanded((prev) => !prev)}
+          className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left"
+        >
+          <div>
+            <div className="text-sm font-semibold text-gray-100">
+              Native Portal Counter
+            </div>
+            <div className="text-xs text-gray-400">
+              Hidden advanced option for full-step OpenCV counting.
+            </div>
+          </div>
+          {portalCounterExpanded ? (
+            <Minimize2 className="h-4 w-4 text-gray-400" />
+          ) : (
+            <Maximize2 className="h-4 w-4 text-gray-400" />
+          )}
+        </button>
+        {portalCounterExpanded ? (
+          <div className="space-y-4 border-t border-gray-700 px-4 py-4">
+            <label className="flex items-start gap-3">
+              <input
+                type="checkbox"
+                checked={portalCounterEnabled}
+                onChange={(e) => onTogglePortalCounter(e.target.checked)}
+                disabled={!portalCounterSelectable || !hasPortalCounterRegionOptions}
+                className="mt-1 h-4 w-4 rounded border-gray-600 bg-gray-900 text-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+              />
+              <div>
+                <div className="text-sm font-medium text-gray-100">
+                  Use OpenCV portal counter
+                </div>
+                <div className="text-xs text-gray-400">
+                  Captures the full step video, counts passages after timeout, and
+                  always saves an annotated MP4.
+                </div>
+              </div>
+            </label>
+            {!portalCounterSelectable ? (
+              <p className="text-xs text-amber-400">
+                This option is only available for step camera agents.
+              </p>
+            ) : !hasPortalCounterRegionOptions ? (
+              <p className="text-xs text-amber-400">
+                Draw and save at least one polygon region before enabling this mode.
+              </p>
+            ) : null}
+            {portalCounterEnabled ? (
+              <>
+                <div className="space-y-2">
+                  <label className="block text-sm font-semibold text-gray-100">
+                    Polygon Region
+                  </label>
+                  <select
+                    value={portalCounterConfig.region_id}
+                    onChange={(e) =>
+                      setPortalCounterConfig((prev) => ({
+                        ...prev,
+                        region_id: e.target.value,
+                      }))
+                    }
+                    className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                  >
+                    {portalCounterRegionOptions.map((region) => (
+                      <option key={region.region_id} value={region.region_id}>
+                        {region.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <label className="block text-sm font-semibold text-gray-100">
+                    Minimum Count To Alert
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={9999}
+                    value={portalCounterConfig.min_count_to_alert}
+                    onChange={(e) =>
+                      setPortalCounterConfig((prev) => ({
+                        ...prev,
+                        min_count_to_alert: clampInteger(e.target.value, 1, 0, 9999),
+                      }))
+                    }
+                    className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                  />
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Min Blob Area
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={500000}
+                      value={portalCounterConfig.min_area}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          min_area: clampInteger(e.target.value, 1800, 1, 500000),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Max Blob Area
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={1000000}
+                      value={portalCounterConfig.max_area}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          max_area: clampInteger(e.target.value, 70000, 1, 1000000),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Warmup Frames
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={10000}
+                      value={portalCounterConfig.warmup_frames}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          warmup_frames: clampInteger(e.target.value, 60, 0, 10000),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Min Track Frames
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={300}
+                      value={portalCounterConfig.min_track_frames_for_count}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          min_track_frames_for_count: clampInteger(e.target.value, 3, 1, 300),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Max Missed Frames
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={300}
+                      value={portalCounterConfig.max_missed_frames}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          max_missed_frames: clampInteger(e.target.value, 12, 1, 300),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Min Path Length (px)
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={5000}
+                      value={portalCounterConfig.min_path_length_px}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          min_path_length_px: clampInteger(e.target.value, 85, 1, 5000),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Proof Frames
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={24}
+                      value={portalCounterConfig.max_proof_frames}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          max_proof_frames: clampInteger(e.target.value, 6, 1, 24),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-gray-400">
+                  Annotated video evidence is always saved in this mode and will be
+                  used by the alert card when the alert threshold is met.
+                </p>
+              </>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
+  const renderPromptDocument = (options?: { expanded?: boolean }) => {
+    const expanded = options?.expanded ?? false;
+    const togglePromptDocumentLabel = expanded
+      ? t("jobs.promptEditor.collapseDocument", {
+          defaultValue: "Collapse prompt document",
+        })
+      : t("jobs.promptEditor.expandDocument", {
+          defaultValue: "Expand prompt document",
+        });
+    const sectionClassName = expanded
+      ? "space-y-2"
+      : PROMPT_DOCUMENT_SECTION_CLASS;
+    const promptCoreSectionClassName = expanded
+      ? sectionClassName
+      : `${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`;
+    const alertConditionSectionClassName = expanded
+      ? sectionClassName
+      : `${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`;
+    const negativeConditionSectionClassName = expanded
+      ? sectionClassName
+      : `${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`;
+
+    if (isPortalCounterActive) {
+      const nativeSections = (
+        <>
+          <div className={sectionClassName}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="font-mono text-[13px] font-semibold text-gray-100">
+                  {formatPromptDocumentHeading("Agent Name")}
+                </span>
+                <span className="text-red-600">*</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPromptDocumentExpanded((prev) => !prev)}
+                className={PROMPT_DOCUMENT_TOGGLE_BUTTON_CLASS}
+                title={togglePromptDocumentLabel}
+                aria-label={togglePromptDocumentLabel}
+                aria-expanded={expanded}
+              >
+                {expanded ? (
+                  <Minimize2 className="h-3.5 w-3.5" />
+                ) : (
+                  <Maximize2 className="h-3.5 w-3.5" />
+                )}
+              </button>
+            </div>
+            <input
+              aria-label="Agent Name"
+              type="text"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
+              className={PROMPT_DOCUMENT_INPUT_CLASS}
+              placeholder="Portal counter name"
+            />
+          </div>
+          <div className={promptCoreSectionClassName}>
+            <div className="rounded-lg border border-emerald-500/30 bg-emerald-950/30 px-4 py-3 text-sm text-emerald-100">
+              <div className="font-medium">Native portal counter mode</div>
+              <p className="mt-2 text-emerald-100/80">
+                Prompt Core, Alert Condition, Negative Condition and LLM inference settings are
+                disabled here. This step captures video for the full step duration, runs the
+                OpenCV portal counter only after the timeout, and always saves an annotated video
+                as evidence.
+              </p>
+            </div>
+          </div>
+        </>
+      );
+
+      if (expanded) {
+        return (
+          <div className={PROMPT_DOCUMENT_EXPANDED_SHEET_CLASS}>
+            <div className={PROMPT_DOCUMENT_EXPANDED_CONTENT_CLASS}>
+              <div className="space-y-5">{nativeSections}</div>
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div
+          className={PROMPT_DOCUMENT_BLOCK_CLASS}
+          data-onboarding-target={
+            isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorFields : undefined
+          }
+        >
+          {nativeSections}
+        </div>
+      );
+    }
+
+    const documentSections = (
+      <>
+        <div className={sectionClassName}>
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="font-mono text-[13px] font-semibold text-gray-100">
+                {formatPromptDocumentHeading("Agent Name")}
+              </span>
+              <span className="text-red-600">*</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPromptDocumentExpanded((prev) => !prev)}
+              className={PROMPT_DOCUMENT_TOGGLE_BUTTON_CLASS}
+              title={togglePromptDocumentLabel}
+              aria-label={togglePromptDocumentLabel}
+              aria-expanded={expanded}
+            >
+              {expanded ? (
+                <Minimize2 className="h-3.5 w-3.5" />
+              ) : (
+                <Maximize2 className="h-3.5 w-3.5" />
+              )}
+            </button>
+          </div>
+          <input
+            aria-label="Agent Name"
+            type="text"
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value)}
+            spellCheck={false}
+            autoCorrect="off"
+            autoCapitalize="off"
+            className={PROMPT_DOCUMENT_INPUT_CLASS}
+            placeholder="Custom agent name"
+          />
+        </div>
+        <div className={promptCoreSectionClassName}>
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-[13px] font-semibold text-gray-100">
+              {formatPromptDocumentHeading(t("jobs.promptEditor.promptCoreLabel"))}
+            </span>
+            <span className="text-red-600">*</span>
+          </div>
+          {expanded ? (
+            <AutoGrowingTextarea
+              ariaLabel={t("jobs.promptEditor.promptCoreLabel")}
+              value={fields.prompt_template}
+              onChange={(value) =>
+                setFields((prev) => ({ ...prev, prompt_template: value }))
+              }
+              rows={8}
+              className={PROMPT_DOCUMENT_EXPANDED_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.promptCorePlaceholder")}
+            />
+          ) : (
+            <textarea
+              aria-label={t("jobs.promptEditor.promptCoreLabel")}
+              value={fields.prompt_template}
+              onChange={(e) =>
+                setFields((prev) => ({ ...prev, prompt_template: e.target.value }))
+              }
+              rows={8}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
+              className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.promptCorePlaceholder")}
+            />
+          )}
+        </div>
+        <div className={alertConditionSectionClassName}>
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-[13px] font-semibold text-gray-100">
+              {formatPromptDocumentHeading(t("jobs.promptEditor.alertConditionLabel"))}
+            </span>
+            <span className="text-red-600">*</span>
+          </div>
+          {expanded ? (
+            <AutoGrowingTextarea
+              ariaLabel={t("jobs.promptEditor.alertConditionLabel")}
+              value={fields.alert_condition}
+              onChange={(value) =>
+                setFields((prev) => ({ ...prev, alert_condition: value }))
+              }
+              rows={5}
+              className={PROMPT_DOCUMENT_EXPANDED_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.alertConditionPlaceholder")}
+            />
+          ) : (
+            <textarea
+              aria-label={t("jobs.promptEditor.alertConditionLabel")}
+              value={fields.alert_condition}
+              onChange={(e) =>
+                setFields((prev) => ({ ...prev, alert_condition: e.target.value }))
+              }
+              rows={5}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
+              className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.alertConditionPlaceholder")}
+            />
+          )}
+        </div>
+        <div className={negativeConditionSectionClassName}>
+          <div className="font-mono text-[13px] font-semibold text-gray-100">
+            {formatPromptDocumentHeading(t("jobs.promptEditor.negativeConditionLabel"), {
+              optional: true,
+              optionalSuffix: localizedOptionalSuffix,
+            })}
+          </div>
+          {expanded ? (
+            <AutoGrowingTextarea
+              ariaLabel={`${t("jobs.promptEditor.negativeConditionLabel")}${localizedOptionalSuffix}`}
+              value={fields.negative_condition}
+              onChange={(value) =>
+                setFields((prev) => ({ ...prev, negative_condition: value }))
+              }
+              rows={4}
+              className={PROMPT_DOCUMENT_EXPANDED_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.negativeConditionPlaceholder")}
+            />
+          ) : (
+            <textarea
+              aria-label={`${t("jobs.promptEditor.negativeConditionLabel")}${localizedOptionalSuffix}`}
+              value={fields.negative_condition}
+              onChange={(e) =>
+                setFields((prev) => ({ ...prev, negative_condition: e.target.value }))
+              }
+              rows={4}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
+              className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.negativeConditionPlaceholder")}
+            />
+          )}
+        </div>
+      </>
+    );
+
+    if (expanded) {
+      return (
+        <div className={PROMPT_DOCUMENT_EXPANDED_SHEET_CLASS}>
+          <div className={PROMPT_DOCUMENT_EXPANDED_CONTENT_CLASS}>
+            <div className="space-y-5">{documentSections}</div>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div
+        className={PROMPT_DOCUMENT_BLOCK_CLASS}
+        data-onboarding-target={
+          isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorFields : undefined
+        }
+      >
+        {documentSections}
+      </div>
+    );
+  };
+
+  if (!open) return null;
+
+  const draftPoints = draftRect ? buildRectPolygonFromPoints(draftRect.start, draftRect.end) : [];
+  const draftViewportPoints =
+    draftPoints.length >= ANALYSIS_REGION_MIN_POINTS ? mapPointsToViewport(draftPoints, frameWindow) : [];
+
+  return (
+    <>
+      <div className="fixed inset-0 z-[90] flex items-center justify-center px-4 py-6">
+        <button
+          type="button"
+          className="absolute inset-0 bg-black/45 backdrop-blur-md"
+          onClick={() => {
+            if (!saving && !enhancingPrompt) onClose();
+          }}
+          aria-label={t("jobs.promptEditor.closePromptEditorAria")}
+        />
+
+        <div
+          className="relative h-[90vh] max-h-[1050px] w-[min(88vw,1320px)] max-w-[88vw] bg-gray-800 text-gray-100 rounded-md shadow-2xl border border-gray-700 overflow-hidden flex flex-col"
+          spellCheck={false}
+        >
+          <div className="flex items-center justify-between gap-4 px-6 py-4 border-b border-gray-700">
+            <div className="min-w-0">
+              <h4 className="text-lg font-semibold leading-tight">
+                {t("jobs.promptEditor.title")}
+              </h4>
+              <p className="text-xs text-gray-400 mt-1">
+                {t("jobs.promptEditor.subtitle")}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <div className="flex items-center gap-2 rounded border border-gray-700 bg-gray-900/80 px-2 py-1.5">
+                <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                  Priority
+                </span>
+                <select
+                  value={normalizeCameraAgentPriority(priorityLevel)}
+                  onChange={(e) => setPriorityLevel(normalizeCameraAgentPriority(e.target.value))}
+                  disabled={saving || enhancingPrompt}
+                  className="w-[118px] rounded border border-gray-700 bg-gray-950 px-2 py-1.5 text-xs text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                  title="Choose the alert priority for this agent"
+                >
+                  {CAMERA_AGENT_PRIORITY_OPTIONS.map((priority) => (
+                    <option key={priority} value={priority}>
+                      {priority}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {canLoadSavedAgentTemplate ? (
+                <div className="flex items-center gap-2 rounded border border-gray-700 bg-gray-900/80 px-2 py-1.5">
+                  <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                    Load
+                  </span>
+                  <select
+                    value={selectedTemplateAgentKey}
+                    onChange={(e) => setSelectedTemplateAgentKey(e.target.value)}
+                    disabled={templateAgentsLoading || saving || enhancingPrompt}
+                    title={
+                      templateAgentsError ||
+                      "Load one of your saved agents. Negative reference images need to be re-uploaded after the first save."
+                    }
+                    className="w-[172px] rounded border border-gray-700 bg-gray-950 px-2 py-1.5 text-xs text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    <option value="">
+                      {templateAgentsLoading
+                        ? "Loading saved agents..."
+                        : templateAgentsError
+                        ? "Failed to load agents"
+                        : templateAgents.length === 0
+                        ? "No saved agents"
+                        : "Saved agents"}
+                    </option>
+                    {templateAgents.map((agent) => (
+                      <option key={agent.library_key} value={agent.library_key}>
+                        {getSavedAgentLibraryOptionLabel(agent)}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => void onLoadTemplateAgent()}
+                    disabled={!selectedTemplateAgent || templateAgentsLoading || saving || enhancingPrompt}
+                    title="Load this saved agent into the current draft"
+                    className={`rounded px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                      !selectedTemplateAgent || templateAgentsLoading || saving || enhancingPrompt
+                        ? "cursor-not-allowed bg-gray-700 text-gray-500"
+                        : "bg-blue-600 text-white hover:bg-blue-500"
+                    }`}
+                  >
+                    {templateAgentsLoading ? "..." : "Use"}
+                  </button>
+                </div>
+              ) : null}
+              <div
+                className="flex items-center gap-2"
+                data-onboarding-target={
+                  isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorModel : undefined
+                }
+              >
+                <select
+                  value={inferenceModel}
+                  onChange={(e) => {
+                    if (isPortalCounterActive) return;
+                    const previousModel = inferenceModel;
+                    const nextModel = normalizeInferenceModel(e.target.value);
+                    if (shouldShowCoreModelNotice(nextModel, previousModel)) {
+                      const notice = getCoreModelNoticeCopy(i18n.resolvedLanguage || i18n.language);
+                      showToast(notice.title, notice.message, "default");
+                    }
+                    const constrained = applyExecutionConstraints(
+                      inputType,
+                      nextModel,
+                      runEvery,
+                      runningResolution,
+                      modelFps
+                    );
+                    const nextVideoPackagingMode = videoPackagingWasManuallySelectedRef.current
+                      ? videoPackagingMode
+                      : getAutoVideoPackagingModeForModel(constrained.inferenceModel);
+                    setInferenceModel(constrained.inferenceModel);
+                    setInputType(constrained.inputType);
+                    setVideoPackagingMode(nextVideoPackagingMode);
+                    setRunEvery(constrained.runEvery);
+                    setRunningResolution(constrained.runningResolution);
+                    setModelFps(constrained.modelFps);
+                  }}
+                  disabled={saving || enhancingPrompt || isPortalCounterActive}
+                  className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                  title={
+                    isPortalCounterActive
+                      ? "Disabled while native portal counter mode is active"
+                      : t("jobs.inferenceModel")
+                  }
+                >
+                  <option value="ultra_plus">{t("jobs.inferenceModelOption.ultraPlus")}</option>
+                  <option value="ultra">{t("jobs.inferenceModelOption.ultra")}</option>
+                  <option value="light">{t("jobs.inferenceModelOption.light")}</option>
+                  <option value="core">{t("jobs.inferenceModelOption.core")}</option>
+                  {inferenceModel === "pro" ? (
+                    <option value="pro">{t("jobs.inferenceModelOption.pro")}</option>
+                  ) : null}
+                  {inferenceModel === "legacy" ? (
+                    <option value="legacy">{t("jobs.inferenceModelOption.legacy")}</option>
+                  ) : null}
+                </select>
+                <ModelHostingBadge modelTier={inferenceModel} />
+              </div>
+              <div
+                data-onboarding-target={
+                  isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorInputType : undefined
+                }
+              >
+                <select
+                  value={inputType}
+                  onChange={(e) => {
+                    if (isPortalCounterActive) return;
+                    const nextInputType = e.target.value === "image" ? "image" : "video";
+                    const constrained = applyExecutionConstraints(
+                      nextInputType,
+                      inferenceModel,
+                      runEvery,
+                      runningResolution,
+                      modelFps
+                    );
+                    setInputType(constrained.inputType);
+                    setRunEvery(constrained.runEvery);
+                    setRunningResolution(constrained.runningResolution);
+                    setModelFps(constrained.modelFps);
+                  }}
+                  disabled={saving || enhancingPrompt || inferenceModel === "core" || isPortalCounterActive}
+                  className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                  title={
+                    isPortalCounterActive
+                      ? "Disabled while native portal counter mode is active"
+                      : t("jobs.inputType")
+                  }
+                >
+                  <option value="video">{t("jobs.video")}</option>
+                  {inferenceModel !== "core" && <option value="image">{t("jobs.image")}</option>}
+                </select>
+              </div>
+              <button
+                type="button"
+                onClick={onClose}
+                disabled={saving || enhancingPrompt}
+                className="p-2 rounded-md text-gray-500 hover:text-gray-100 hover:bg-gray-700 transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          <div className="px-8 py-6 min-h-0 overflow-hidden">
+            <div className="h-full grid grid-cols-1 xl:grid-cols-2 gap-6">
+              <div
+                className={`order-1 xl:order-1 min-h-0 grid gap-4 ${
+                  targetFacesExpanded
+                    ? "grid-rows-[minmax(0,0.5fr)_minmax(0,1.5fr)]"
+                    : "grid-rows-[minmax(0,1.35fr)_minmax(0,0.65fr)]"
+                }`}
+              >
+                <div
+                  className="min-h-0 rounded-xl border border-gray-600/80 bg-gray-900/55 overflow-hidden flex flex-col shadow-lg shadow-black/30"
+                  data-onboarding-target={
+                    isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorPolygons : undefined
+                  }
+                >
+                  <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between gap-2">
+                    <div className="text-xs text-gray-300 truncate">{targetLabel}</div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const next = !polygonDrawEnabled;
+                          setPolygonDrawEnabled(next);
+                          if (!next) {
+                            setShowRegionDialog(false);
+                            setPendingRegionSeed(null);
+                            setDraftRect(null);
+                            setIsSizingRect(false);
+                          }
+                        }}
+                        disabled={!snapshotUrl || polygonCount >= ANALYSIS_REGION_MAX}
+                        className={`text-[11px] px-2 py-1 rounded border ${
+                          polygonDrawEnabled
+                            ? "border-blue-500 text-blue-200 bg-blue-500/20"
+                            : "border-gray-600 text-gray-300 bg-gray-800"
+                        } disabled:opacity-50`}
+                      >
+                        {polygonDrawEnabled ? "Drawing ON" : "Draw Polygon"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void requestSnapshotRefresh()}
+                        disabled={snapshotRefreshBlocked}
+                        className="text-[11px] text-blue-300 hover:underline disabled:text-gray-500"
+                      >
+                        {!previewCameraId
+                          ? "No preview camera"
+                          : snapshotLoading
+                          ? "Loading..."
+                          : snapshotRequesting
+                          ? "Refreshing..."
+                          : snapshotUrl
+                          ? "Refresh preview"
+                          : "Capture preview"}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="px-3 py-2 text-xs border-b border-gray-700 flex flex-wrap items-center justify-between gap-3">
+                    <div className="text-gray-400 min-w-0 flex-1">
+                      {pendingRegionSeed
+                        ? "Drag on image to size the new polygon."
+                        : polygonDrawEnabled
+                        ? "Click once on image to define polygon name and description."
+                        : polygonCount > 0
+                        ? `${polygonCount} polygon(s) configured. Select one below to manage or delete it.`
+                        : "No polygons configured. The current preview window will be used."}
+                    </div>
+                    <div className="flex items-center gap-2 text-[11px] text-gray-300">
+                      <button
+                        type="button"
+                        onClick={() => setConstrainedFrameWindow(DEFAULT_FRAME_WINDOW)}
+                        disabled={!snapshotUrl || !hasViewportAdjustments}
+                        className="rounded border border-gray-600 bg-gray-800 px-2 py-1 text-gray-200 disabled:opacity-40"
+                      >
+                        Reset view
+                      </button>
+                      <span className="w-12 text-right tabular-nums">{currentZoom.toFixed(1)}x</span>
+                      <input
+                        type="range"
+                        min={1}
+                        max={FRAME_WINDOW_MAX_ZOOM}
+                        step={0.05}
+                        value={currentZoom}
+                        onChange={(event) => applyFrameWindowZoom(Number(event.target.value))}
+                        disabled={!snapshotUrl}
+                        className="w-28 accent-blue-400 disabled:opacity-40"
+                        aria-label="Preview zoom"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="relative min-h-0 flex-1 overflow-hidden p-3">
+                    {snapshotUrl ? (
+                      <div
+                        ref={previewRef}
+                        className={`relative h-full w-full bg-black/55 border border-gray-700 overflow-hidden ${
+                          panDrag ? "cursor-grabbing" : polygonDrawEnabled ? "cursor-crosshair" : "cursor-grab"
+                        }`}
+                        onMouseDown={onPreviewMouseDown}
+                        onMouseMove={onPreviewMouseMove}
+                        onMouseUp={onPreviewMouseUp}
+                        onMouseLeave={() => {
+                          if (panDrag) setPanDrag(null);
+                        }}
+                        onWheel={onPreviewWheel}
+                        onContextMenu={(event) => event.preventDefault()}
+                      >
+                        {previewViewportMetrics ? (
+                          <>
+                            <canvas
+                              ref={previewCanvasRef}
+                              className="absolute inset-0 h-full w-full select-none"
+                              style={{ pointerEvents: "none" }}
+                              aria-hidden="true"
+                            />
+                            <svg
+                              className="absolute inset-0 h-full w-full"
+                              viewBox="0 0 100 100"
+                              preserveAspectRatio="none"
+                            >
+                            {polygonRegions.map((region) => {
+                              const points = Array.isArray(region.polygon_norm) ? region.polygon_norm : [];
+                              if (points.length < ANALYSIS_REGION_MIN_POINTS) return null;
+                              const viewportPoints = mapPointsToViewport(points, frameWindow);
+                              const centroid = getPolygonCentroid(viewportPoints);
+                              return (
+                                <g key={region.region_id}>
+                                  <polygon
+                                    points={toSvgPoints(viewportPoints, { clamp: false })}
+                                    fill={region.enabled ? "rgba(96,165,250,0.20)" : "rgba(245,158,11,0.20)"}
+                                    stroke={
+                                      hoveredRegionId === region.region_id || selectedRegionId === region.region_id
+                                        ? "#60a5fa"
+                                        : "#93c5fd"
+                                    }
+                                    strokeWidth={0.35}
+                                    onMouseEnter={() => setHoveredRegionId(region.region_id)}
+                                    onMouseDown={(event) => {
+                                      if (event.button !== 0) return;
+                                      if (!polygonDrawEnabled) return;
+                                      event.preventDefault();
+                                      event.stopPropagation();
+                                      setSelectedRegionId(region.region_id);
+                                      setHoveredRegionId(region.region_id);
+                                    }}
+                                    onDoubleClick={(event) => {
+                                      if (!polygonDrawEnabled) return;
+                                      event.preventDefault();
+                                      event.stopPropagation();
+                                      setPolygonRegions((prev) =>
+                                        prev.map((r) =>
+                                          r.region_id === region.region_id ? { ...r, enabled: !r.enabled } : r
+                                        )
+                                      );
+                                    }}
+                                  />
+                                  <text
+                                    x={centroid.x * 100}
+                                    y={centroid.y * 100}
+                                    textAnchor="middle"
+                                    dominantBaseline="middle"
+                                    fill="#dbeafe"
+                                    fontSize={3}
+                                    fontWeight={700}
+                                    style={{ pointerEvents: "none" }}
+                                  >
+                                    {region.label}
+                                  </text>
+                                  {viewportPoints.map((p, idx) => (
+                                    <circle
+                                      key={`${region.region_id}-${idx}`}
+                                      cx={p.x * 100}
+                                      cy={p.y * 100}
+                                      r={0.7}
+                                      fill="#93c5fd"
+                                      stroke="#111827"
+                                      strokeWidth={0.2}
+                                      onMouseDown={(event) => {
+                                        if (event.button !== 0) return;
+                                        if (!polygonDrawEnabled) return;
+                                        event.preventDefault();
+                                        event.stopPropagation();
+                                        setSelectedRegionId(region.region_id);
+                                        setHoveredRegionId(region.region_id);
+                                        setDragVertex({ regionId: region.region_id, index: idx });
+                                      }}
+                                    />
+                                  ))}
+                                </g>
+                              );
+                            })}
+                            {draftViewportPoints.length >= ANALYSIS_REGION_MIN_POINTS ? (
+                              <polygon
+                                points={toSvgPoints(draftViewportPoints, { clamp: false })}
+                                fill="rgba(59,130,246,0.22)"
+                                stroke="rgba(96,165,250,0.95)"
+                                strokeDasharray="2 1"
+                                strokeWidth={0.35}
+                              />
+                            ) : null}
+                            </svg>
+                          </>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <div className="h-full rounded border border-dashed border-gray-700 bg-gray-900/70 text-[13px] text-gray-500 flex items-center justify-center px-4 text-center">
+                        {!previewCameraId && isStepTarget
+                          ? "No preview camera is linked to this step agent yet."
+                          : snapshotLoading
+                            ? "Loading snapshot..."
+                            : "No snapshot available yet."}
+                      </div>
+                    )}
+                  </div>
+                  {polygonRegions.length > 0 ? (
+                    <div className="border-t border-gray-700/80 bg-gray-950/50 px-4 py-3 space-y-3">
+                      <div className="flex flex-wrap gap-2">
+                        {polygonRegions.map((region, index) => {
+                          const isSelected = selectedRegion?.region_id === region.region_id;
+                          return (
+                            <button
+                              key={region.region_id}
+                              type="button"
+                              onClick={() => {
+                                setSelectedRegionId(region.region_id);
+                                setHoveredRegionId(region.region_id);
+                              }}
+                              className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition-colors ${
+                                isSelected
+                                  ? "border-blue-500 bg-blue-500/20 text-blue-100"
+                                  : "border-gray-700 bg-gray-900 text-gray-300 hover:bg-gray-800"
+                              }`}
+                            >
+                              <span
+                                className={`h-2 w-2 rounded-full ${
+                                  region.enabled === false ? "bg-amber-400" : "bg-emerald-400"
+                                }`}
+                              />
+                              {region.label || `Region ${index + 1}`}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {selectedRegion ? (
+                        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-gray-700 bg-gray-900/80 px-3 py-2 text-xs text-gray-200">
+                          <span className="font-medium text-gray-100">
+                            Selected polygon: {selectedRegion.label || "Region"}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => togglePolygonRegionEnabled(selectedRegion.region_id)}
+                            className={`inline-flex items-center gap-1.5 rounded border px-2.5 py-1 transition-colors ${
+                              selectedRegion.enabled === false
+                                ? "border-emerald-600/70 text-emerald-300 hover:bg-emerald-500/10"
+                                : "border-amber-600/70 text-amber-300 hover:bg-amber-500/10"
+                            }`}
+                          >
+                            {selectedRegion.enabled === false ? "Enable" : "Disable"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => removePolygonRegion(selectedRegion.region_id)}
+                            className="inline-flex items-center gap-1.5 rounded border border-rose-600/70 px-2.5 py-1 text-rose-300 transition-colors hover:bg-rose-500/10"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            Delete polygon
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="min-h-0 rounded-xl border border-gray-600/80 bg-gray-900/55 overflow-hidden flex flex-col shadow-lg shadow-black/30">
+                  <div className="px-4 py-3 border-b border-gray-700">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="space-y-1 min-w-0">
+                        <label className="block text-sm font-semibold text-gray-100">
+                          Target Faces (optional)
+                        </label>
+                        <p className="text-xs text-gray-400">
+                          Select faces from the library to enable hidden FaceID matching in this agent.
+                        </p>
+                        <p className="text-[11px] text-blue-300">
+                          Selected faces are shared across all polygons in this agent.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setTargetFacesExpanded((prev) => !prev)}
+                        className="inline-flex h-7 w-7 items-center justify-center rounded border border-gray-600 bg-gray-800 text-gray-300 hover:border-gray-500 hover:text-gray-100"
+                        title={targetFacesExpanded ? "Collapse target faces panel" : "Expand target faces panel"}
+                      >
+                        {targetFacesExpanded ? (
+                          <Minimize2 className="h-3.5 w-3.5" />
+                        ) : (
+                          <Maximize2 className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="min-h-0 flex-1 overflow-y-auto p-4">
+                    <div className="space-y-3">
+                      <div className="rounded border border-gray-700 bg-gray-800 p-3 space-y-3">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                          <input
+                            type="text"
+                            value={newFaceTargetName}
+                            onChange={(e) => setNewFaceTargetName(e.target.value)}
+                            className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500"
+                            placeholder="Target name (required)"
+                          />
+                          <input
+                            type="text"
+                            value={newFaceTargetDescription}
+                            onChange={(e) => setNewFaceTargetDescription(e.target.value)}
+                            className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500"
+                            placeholder="Description (optional)"
+                          />
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <input
+                            type="file"
+                            accept="image/*"
+                            onChange={(e) => {
+                              const file = e.target.files?.[0] || null;
+                              setNewFaceTargetFile(file);
+                              e.currentTarget.value = "";
+                            }}
+                            className="text-xs text-gray-300"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => void onCreateFaceTarget({ autoSelect: true })}
+                            disabled={creatingFaceTarget}
+                            className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-xs"
+                          >
+                            {creatingFaceTarget ? "Creating..." : "Create Target"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void fetchFaceTargets()}
+                            disabled={faceTargetsLoading}
+                            className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-gray-100 text-xs"
+                          >
+                            Refresh
+                          </button>
+                        </div>
+                        <p className="text-[11px] text-gray-500">
+                          Tip: if name + image are filled here, `Apply & Save` will also create this target automatically.
+                        </p>
+                      </div>
+
+                      <div className="space-y-2">
+                        {faceTargetsLoading ? (
+                          <p className="text-xs text-gray-500">Loading target faces...</p>
+                        ) : faceTargets.length === 0 ? (
+                          <p className="text-xs text-gray-500">No target faces yet.</p>
+                        ) : (
+                          faceTargets.map((target) => {
+                            const selected = selectedFaceTargetIds.includes(target.id);
+                            const isEditingTarget = editingFaceTargetId === target.id;
+                            const isSavingTarget = savingFaceTargetId === target.id;
+                            const isDeletingTarget = deletingFaceTargetId === target.id;
+                            const currentImageCount = getFaceTargetImageCount(target);
+                            const maxImagesReached = currentImageCount >= FACE_TARGET_MAX_IMAGES;
+                            return (
+                              <div
+                                key={target.id}
+                                className={`rounded border p-3 ${
+                                  selected
+                                    ? "border-blue-500 bg-blue-500/10"
+                                    : "border-gray-700 bg-gray-800"
+                                } ${isDeletingTarget ? "opacity-70" : ""}`}
+                              >
+                                <div className="flex items-start justify-between gap-3">
+                                  <label className="flex items-start gap-2 cursor-pointer">
+                                    <input
+                                      type="checkbox"
+                                      checked={selected}
+                                      onChange={() => toggleSelectedFaceTarget(target.id)}
+                                      disabled={isDeletingTarget}
+                                      className="mt-1 h-4 w-4 rounded border-gray-500"
+                                    />
+                                    {isEditingTarget ? (
+                                      <span className="block space-y-1 min-w-[220px]">
+                                        <input
+                                          type="text"
+                                          value={editingFaceTargetName}
+                                          onChange={(e) => setEditingFaceTargetName(e.target.value)}
+                                          onClick={(e) => e.stopPropagation()}
+                                          className="w-full px-2 py-1 rounded border border-gray-700 bg-gray-800 text-gray-100 text-xs focus:outline-none focus:border-blue-500"
+                                          placeholder="Target name"
+                                        />
+                                        <input
+                                          type="text"
+                                          value={editingFaceTargetDescription}
+                                          onChange={(e) =>
+                                            setEditingFaceTargetDescription(e.target.value)
+                                          }
+                                          onClick={(e) => e.stopPropagation()}
+                                          className="w-full px-2 py-1 rounded border border-gray-700 bg-gray-800 text-gray-100 text-xs focus:outline-none focus:border-blue-500"
+                                          placeholder="Target description"
+                                        />
+                                        <span className="block text-[11px] text-gray-500 mt-0.5">
+                                          {currentImageCount} image(s)
+                                        </span>
+                                      </span>
+                                    ) : (
+                                      <span>
+                                        <span className="block text-sm font-semibold text-gray-100">
+                                          {target.name}
+                                        </span>
+                                        {target.description ? (
+                                          <span className="block text-xs text-gray-400">
+                                            {target.description}
+                                          </span>
+                                        ) : null}
+                                        <span className="block text-[11px] text-gray-500 mt-0.5">
+                                          {currentImageCount} image(s)
+                                        </span>
+                                      </span>
+                                    )}
+                                  </label>
+                                  <div className="flex flex-wrap items-center justify-end gap-2">
+                                    <label
+                                      className={`text-[11px] ${
+                                        maxImagesReached || isDeletingTarget
+                                          ? "text-gray-500 cursor-not-allowed"
+                                          : "text-blue-400 cursor-pointer hover:underline"
+                                      }`}
+                                    >
+                                      {faceTargetUploadingId === target.id ? "Uploading" : "Add image"}
+                                      <input
+                                        type="file"
+                                        accept="image/*"
+                                        multiple
+                                        className="hidden"
+                                        disabled={isDeletingTarget || maxImagesReached}
+                                        onChange={(e) => {
+                                          const selectedFiles = Array.from(e.target.files || []);
+                                          void onAddFaceTargetImages(target.id, selectedFiles);
+                                          e.currentTarget.value = "";
+                                        }}
+                                      />
+                                    </label>
+                                    {isEditingTarget ? (
+                                      <>
+                                        <button
+                                          type="button"
+                                          onClick={() => void onSaveFaceTargetMeta(target.id)}
+                                          disabled={isSavingTarget}
+                                          className="text-[11px] text-emerald-400 hover:underline disabled:text-gray-500"
+                                        >
+                                          {isSavingTarget ? "Saving..." : "Save"}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={cancelEditingFaceTarget}
+                                          disabled={isSavingTarget}
+                                          className="text-[11px] text-gray-400 hover:underline disabled:text-gray-500"
+                                        >
+                                          Cancel
+                                        </button>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <button
+                                          type="button"
+                                          onClick={() => startEditingFaceTarget(target)}
+                                          disabled={isDeletingTarget}
+                                          className="text-[11px] text-gray-300 hover:underline disabled:text-gray-500"
+                                        >
+                                          Edit
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => void onDeleteFaceTarget(target)}
+                                          disabled={isDeletingTarget}
+                                          className="text-[11px] text-rose-400 hover:underline disabled:text-gray-500"
+                                        >
+                                          {isDeletingTarget ? "Deleting..." : "Delete"}
+                                        </button>
+                                      </>
+                                    )}
+                                  </div>
+                                </div>
+                                {target.images.length > 0 ? (
+                                  <div className="mt-2 flex flex-wrap gap-2">
+                                    {target.images.map((image) => (
+                                      <div
+                                        key={image.id}
+                                        className="relative h-14 w-14 rounded overflow-hidden border border-gray-700 bg-gray-800"
+                                      >
+                                        <img
+                                          src={image.image_url}
+                                          alt={target.name}
+                                          className="h-full w-full object-cover"
+                                        />
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            void onDeleteFaceTargetImage(target.id, image.id)
+                                          }
+                                          disabled={
+                                            faceTargetDeletingImageId === image.id || isDeletingTarget
+                                          }
+                                          className="absolute top-0 right-0 bg-black/60 text-white text-[10px] px-1 leading-4"
+                                          title="Remove image"
+                                        >
+                                          x
+                                        </button>
+                                      </div>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <p className="mt-2 text-[11px] text-amber-400">
+                                    Add at least one image to improve matching.
+                                  </p>
+                                )}
+                                {maxImagesReached ? (
+                                  <p className="mt-2 text-[11px] text-amber-400">
+                                    Maximum {FACE_TARGET_MAX_IMAGES} images reached for this target.
+                                  </p>
+                                ) : null}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="relative order-2 xl:order-2 min-h-0 overflow-hidden rounded-xl border border-gray-600/80 bg-gray-900/50 shadow-lg shadow-black/30">
+                <div
+                  className={`h-full ${
+                    enhancingPrompt ? "overflow-y-hidden" : "overflow-y-auto"
+                  } pr-2 pl-4 space-y-5 p-5`}
+                >
+                <div
+                  className="space-y-5"
+                  data-onboarding-target={
+                    isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorExecution : undefined
+                  }
+                >
+                  {!isPortalCounterActive ? (
+                    <>
+                      <div className="space-y-2">
+                        <label className="block text-sm font-semibold text-gray-100">{t("jobs.runEvery")}</label>
+                        <select
+                          value={inferenceModel === "core" ? 60 : runEvery}
+                          onChange={(e) => setRunEvery(normalizeRunEverySeconds(e.target.value, 60))}
+                          disabled={inferenceModel === "core"}
+                          className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm disabled:opacity-60 disabled:cursor-not-allowed"
+                        >
+                      {CAMERA_AGENT_RUN_EVERY_OPTIONS.map((seconds) => (
+                        <option key={seconds} value={seconds}>
+                          {getRunEveryOptionLabel(seconds)}
+                        </option>
+                      ))}
+                        </select>
+                      </div>
+                      {inputType === "video" ? (
+                        <div className="space-y-2">
+                          <label className="block text-sm font-semibold text-gray-100">Video Packaging</label>
+                          <select
+                            value={getVideoPackagingSelectValue(videoPackagingMode)}
+                            onChange={(e) => {
+                              videoPackagingWasManuallySelectedRef.current = true;
+                              setVideoPackagingMode(
+                                normalizeVideoPackagingMode(e.target.value, videoPackagingMode)
+                              );
+                            }}
+                            className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
+                          >
+                            {!isSelectableVideoPackagingMode(videoPackagingMode) ? (
+                              <option value="" disabled>
+                                Legacy Packaging Mode
+                              </option>
+                            ) : null}
+                            <option value="frame_sequence">{getVideoPackagingModeLabel("frame_sequence")}</option>
+                            <option value="mosaic_2x2">{getVideoPackagingModeLabel("mosaic_2x2")}</option>
+                          </select>
+                          <p className="text-xs text-gray-400">
+                            Standard Resolution uses a 2x2 mosaic and sends fewer image inputs than High Resolution.
+                          </p>
+                          {!isSelectableVideoPackagingMode(videoPackagingMode) ? (
+                            <p className="text-xs text-amber-400">
+                              This agent is using a legacy packaging mode that is no longer available here.
+                              Choose High Resolution or Standard Resolution to replace it.
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : null}
+                      {supportsAdjustableVideoFps(inferenceModel) && inputType === "video" ? (
+                        <div className="space-y-2">
+                          <label className="block text-sm font-semibold text-gray-100">Video FPS</label>
+                          <select
+                            value={modelFps}
+                            onChange={(e) => setModelFps(normalizeModelFps(e.target.value, modelFps))}
+                            className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
+                          >
+                            {Array.from({ length: MAX_ULTRA_VIDEO_MODEL_FPS }, (_, index) => {
+                              const fps = index + 1;
+                              return (
+                                <option key={fps} value={fps}>
+                                  {`${fps} FPS`}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        </div>
+                      ) : null}
+                      {inferenceModel === "core" ? (
+                        <div className="space-y-2">
+                          <label className="block text-sm font-semibold text-gray-100">
+                            {t("jobs.runningResolution")}
+                          </label>
+                          <select
+                            value={runningResolution}
+                            onChange={(e) =>
+                              setRunningResolution(normalizeRunningResolution(e.target.value))
+                            }
+                            className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
+                          >
+                            <option value={640}>
+                              {t("jobs.runningResolutionOption.640")}
+                            </option>
+                            <option value={1024}>
+                              {t("jobs.runningResolutionOption.1024")}
+                            </option>
+                          </select>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <div className="rounded-lg border border-emerald-500/25 bg-emerald-950/20 px-4 py-3 text-sm text-emerald-100">
+                      This step will capture video continuously for the whole timeout and run the
+                      OpenCV portal counter only after the step ends.
+                    </div>
+                  )}
+                </div>
+                {renderPromptDocument()}
+                {!isPortalCounterActive ? (
+                  <div className="space-y-2">
+                  <label className="block font-mono text-[13px] font-semibold text-gray-100">
+                    {formatPromptDocumentHeading("Negative Reference Images", {
+                      optional: true,
+                      optionalSuffix: localizedOptionalSuffix,
+                    })}
+                  </label>
+                  <div className="rounded border border-gray-700 bg-gray-800 p-3 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <label className={`text-xs ${!algorithmId || negativeImages.length >= NEGATIVE_REFERENCE_MAX_IMAGES ? "text-gray-500 cursor-not-allowed" : "text-blue-400 cursor-pointer"}`}>
+                        {uploadingNegativeImages ? "Uploading..." : "Add image(s)"}
+                        <input type="file" accept="image/*" multiple className="hidden" disabled={!algorithmId || negativeImages.length >= NEGATIVE_REFERENCE_MAX_IMAGES || uploadingNegativeImages} onChange={(e) => {
+                          const files = Array.from(e.target.files || []);
+                          void onUploadNegativeImages(files);
+                          e.currentTarget.value = "";
+                        }} />
+                      </label>
+                      <span className="text-[11px] text-gray-500">{negativeImages.length}/{NEGATIVE_REFERENCE_MAX_IMAGES}</span>
+                    </div>
+                    {!algorithmId ? <p className="text-[11px] text-amber-400">Save agent first to upload images.</p> : null}
+                    <div className="flex flex-wrap gap-2">
+                      {negativeImages.map((img) => (
+                        <div key={img.id} className={`relative h-14 w-14 rounded overflow-hidden border ${selectedNegativeImageIds.includes(img.id) ? "border-amber-400" : "border-gray-700"}`}>
+                          <button type="button" className="absolute inset-0 z-10" onClick={() => {
+                            setSelectedNegativeImageIds((prev) => {
+                              const set = new Set(prev);
+                              if (set.has(img.id)) set.delete(img.id);
+                              else set.add(img.id);
+                              return Array.from(set);
+                            });
+                          }} />
+                          <img src={img.image_url} alt="negative" className="h-full w-full object-cover" />
+                          <button type="button" className="absolute top-0 right-0 z-20 bg-black/70 text-white text-[10px] px-1 leading-4" onClick={() => void onDeleteNegativeImage(img.id)}>x</button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  </div>
+                ) : null}
+                {renderPortalCounterCollapse()}
+                </div>
+                {enhancingPrompt ? (
+                  <div className="absolute -inset-px z-20 rounded-xl bg-gray-950/55 backdrop-blur-[2px] flex items-center justify-center">
+                    <div className="flex flex-col items-center gap-3 text-gray-100">
+                      <div className="h-10 w-10 rounded-full border-2 border-white/25 border-t-white animate-spin" />
+                      <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-white/90">
+                        {t("jobs.promptEditor.enhancing")}
+                      </span>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
+
+          <div className="px-8 py-4 border-t border-gray-700 bg-gray-800/70 flex justify-end gap-2">
+            <button type="button" onClick={onClose} disabled={enhancingPrompt || saving} className="px-3 py-1.5 rounded bg-gray-700 text-gray-100 text-sm">{t("jobs.cancel")}</button>
+            {!isPortalCounterActive ? (
+              <button type="button" onClick={() => void onEnhancePrompt()} disabled={enhancingPrompt || saving} data-onboarding-target={isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorEnhance : undefined} className="px-3 py-1.5 rounded bg-gray-700 border border-white/85 hover:border-white disabled:border-white/35 text-white text-sm inline-flex items-center gap-1.5 shadow-[0_0_0_1px_rgba(255,255,255,0.12)]">
+                <Sparkles className="w-3.5 h-3.5" />
+                {enhancingPrompt
+                  ? t("jobs.promptEditor.enhancing")
+                  : t("jobs.promptEditor.enhanceWithAI")}
+              </button>
+            ) : null}
+            <button type="button" onClick={() => void onApplyAndSave()} disabled={enhancingPrompt || saving} data-onboarding-target={isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorSave : undefined} className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm">
+              {saving ? t("jobs.promptEditor.saving") : t("jobs.promptEditor.applyAndSave")}
+            </button>
+          </div>
+
+          {!isPortalCounterActive && suggestion ? (
+            <div className="absolute inset-0 z-20 bg-gray-950/65 backdrop-blur-sm flex items-center justify-center p-6">
+              <div className="w-full max-w-3xl max-h-[85vh] bg-gray-800 border border-gray-700 rounded-lg shadow-xl overflow-hidden flex flex-col">
+                <div className="px-6 py-4 border-b border-gray-700">
+                  <h5 className="text-base font-semibold text-gray-100">
+                    {t("jobs.promptEditor.aiSuggestionReadyTitle")}
+                  </h5>
+                  <p className="text-xs text-gray-400 mt-1">
+                    {t("jobs.promptEditor.aiSuggestionReadyDescription")}
+                  </p>
+                </div>
+                <div className="px-6 py-4 overflow-y-auto">
+                  <div className={PROMPT_DOCUMENT_BLOCK_CLASS}>
+                    <div className={PROMPT_DOCUMENT_SECTION_CLASS}>
+                      <div className="font-mono text-[13px] font-semibold text-gray-100">
+                        {formatPromptDocumentHeading(t("jobs.promptEditor.promptCoreLabel"))}
+                      </div>
+                      <textarea
+                        aria-label={t("jobs.promptEditor.promptCoreLabel")}
+                        value={suggestion.prompt_template}
+                        readOnly
+                        rows={5}
+                        className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                      />
+                    </div>
+                    <div className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}>
+                      <div className="font-mono text-[13px] font-semibold text-gray-100">
+                        {formatPromptDocumentHeading(t("jobs.promptEditor.alertConditionLabel"))}
+                      </div>
+                      <textarea
+                        aria-label={t("jobs.promptEditor.alertConditionLabel")}
+                        value={suggestion.alert_condition}
+                        readOnly
+                        rows={4}
+                        className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                      />
+                    </div>
+                    <div className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}>
+                      <div className="font-mono text-[13px] font-semibold text-gray-100">
+                        {formatPromptDocumentHeading(t("jobs.promptEditor.negativeConditionLabel"), {
+                          optional: true,
+                          optionalSuffix: localizedOptionalSuffix,
+                        })}
+                      </div>
+                      <textarea
+                        aria-label={`${t("jobs.promptEditor.negativeConditionLabel")}${localizedOptionalSuffix}`}
+                        value={suggestion.negative_condition}
+                        readOnly
+                        rows={4}
+                        className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                      />
+                    </div>
+                  </div>
+                </div>
+                <div className="px-6 py-4 border-t border-gray-700 bg-gray-800/70 flex justify-end gap-2">
+                  <button type="button" onClick={() => setSuggestion(null)} className="px-3 py-1.5 rounded bg-gray-700 text-sm">Keep current</button>
+                  <button type="button" onClick={() => { setFields((prev) => ({ ...prev, ...suggestion })); setSuggestion(null); }} className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm">Use suggested</button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      {promptDocumentExpanded ? (
+        <div className="fixed inset-0 z-[96] flex items-center justify-center px-4 py-6">
+          <button
+            type="button"
+            className="absolute inset-0 bg-black/55 backdrop-blur-md"
+            onClick={() => setPromptDocumentExpanded(false)}
+            aria-label={t("jobs.promptEditor.collapseDocument", {
+              defaultValue: "Collapse prompt document",
+            })}
+          />
+          <div className="relative w-full max-w-5xl">
+            {renderPromptDocument({ expanded: true })}
+          </div>
+        </div>
+      ) : null}
+
+      {showRegionDialog ? (
+        <div className="fixed inset-0 z-[95] flex items-center justify-center px-4 py-6">
+          <button type="button" className="absolute inset-0 bg-black/55" onClick={() => setShowRegionDialog(false)} />
+          <div className="relative w-full max-w-md rounded-xl border border-gray-700 bg-gray-900 p-4 shadow-2xl">
+            <h5 className="text-sm font-semibold text-gray-100 mb-3">New polygon</h5>
+            <div className="space-y-2">
+              <input type="text" value={regionDialogLabel} onChange={(e) => setRegionDialogLabel(e.target.value)} className="w-full rounded border border-gray-700 bg-gray-800 px-3 py-2 text-sm" placeholder="Region name" />
+              <textarea value={regionDialogDescription} onChange={(e) => setRegionDialogDescription(e.target.value)} className="w-full rounded border border-gray-700 bg-gray-800 px-3 py-2 text-sm" rows={3} placeholder="Description (optional)" />
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" onClick={() => setShowRegionDialog(false)} className="px-3 py-1.5 rounded bg-gray-700 text-sm">Cancel</button>
+              <button type="button" onClick={onConfirmRegionDialog} className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm">Continue</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </>
+  );
+}
+const getVideoPackagingModeLabel = (mode: CameraVideoPackagingMode): string => {
+  if (mode === "frame_sequence") return "High Resolution";
+  if (mode === "mosaic_2x2") return "Standard Resolution";
+  return "Legacy Packaging";
+};

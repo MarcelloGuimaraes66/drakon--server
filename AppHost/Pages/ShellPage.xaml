@@ -1,0 +1,427 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Background="{StaticResource DrakonShellBackgroundBrush}"
+    RequestedTheme="Dark">
+
+    <Page.Resources>
+        <Style x:Key="SidebarNavButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="16" />
+            <Setter Property="Padding" Value="18,14" />
+            <Setter Property="Margin" Value="0,0,0,10" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Foreground" Value="{StaticResource DrakonSecondaryTextBrush}" />
+            <Setter Property="MinHeight" Value="58" />
+        </Style>
+
+        <Style x:Key="SidebarUtilityButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="14" />
+            <Setter Property="Padding" Value="14,12" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Foreground" Value="{StaticResource DrakonSecondaryTextBrush}" />
+        </Style>
+
+        <Style x:Key="HeaderChipButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="{StaticResource DrakonShellChipBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource DrakonShellChipBorderBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="14" />
+            <Setter Property="Padding" Value="14,10" />
+            <Setter Property="Foreground" Value="{StaticResource DrakonStrongTextBrush}" />
+        </Style>
+
+        <Style x:Key="HeaderIconButtonStyle" TargetType="Button" BasedOn="{StaticResource HeaderChipButtonStyle}">
+            <Setter Property="Padding" Value="12" />
+            <Setter Property="MinWidth" Value="46" />
+        </Style>
+    </Page.Resources>
+
+    <Grid Background="{StaticResource DrakonShellBackgroundBrush}">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition x:Name="SidebarColumnDefinition" Width="306" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <Border
+            Grid.Column="0"
+            Background="{StaticResource DrakonShellSidebarBrush}"
+            BorderBrush="{StaticResource DrakonPanelBorderBrush}"
+            BorderThickness="0,0,1,0">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="88" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <Grid
+                    Grid.Row="0"
+                    Padding="22,18"
+                    BorderBrush="{StaticResource DrakonPanelBorderBrush}"
+                    BorderThickness="0,0,0,1">
+                    <Image
+                        x:Name="SidebarCollapsedLogoImage"
+                        Width="46"
+                        Height="46"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Source="ms-appx:///Assets/Branding/icon-dark.png"
+                        Stretch="Uniform"
+                        Visibility="Collapsed" />
+
+                    <Image
+                        x:Name="SidebarExpandedLogoImage"
+                        Height="44"
+                        HorizontalAlignment="Left"
+                        VerticalAlignment="Center"
+                        Source="ms-appx:///Assets/Branding/wordmark-dark.png"
+                        Stretch="Uniform" />
+                </Grid>
+
+                <ScrollViewer
+                    Grid.Row="1"
+                    VerticalScrollBarVisibility="Auto"
+                    HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel Padding="18,24,18,18">
+                        <Button
+                            x:Name="NavDashboardButton"
+                            Tag="dashboard"
+                            Style="{StaticResource SidebarNavButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="14">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="18" Glyph="&#xE80F;" />
+                                <TextBlock x:Name="NavDashboardText" FontSize="17" FontWeight="SemiBold" Text="Dashboard" />
+                            </StackPanel>
+                        </Button>
+
+                        <Button
+                            x:Name="NavAIAgentsButton"
+                            Tag="ai-agents"
+                            Style="{StaticResource SidebarNavButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="14">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="18" Glyph="&#xE7BE;" />
+                                <TextBlock x:Name="NavAIAgentsText" FontSize="17" FontWeight="SemiBold" Text="AI Agents" />
+                            </StackPanel>
+                        </Button>
+
+                        <Button
+                            x:Name="NavDrakonFindButton"
+                            Tag="drakon-find"
+                            Style="{StaticResource SidebarNavButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="14">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="18" Glyph="&#xE721;" />
+                                <TextBlock x:Name="NavDrakonFindText" FontSize="17" FontWeight="SemiBold" Text="Drakon Find" />
+                            </StackPanel>
+                        </Button>
+
+                        <Button
+                            x:Name="NavJobsButton"
+                            Tag="jobs"
+                            Style="{StaticResource SidebarNavButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="14">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="18" Glyph="&#xE821;" />
+                                <TextBlock x:Name="NavJobsText" FontSize="17" FontWeight="SemiBold" Text="Jobs" />
+                            </StackPanel>
+                        </Button>
+
+                        <Button
+                            x:Name="NavChatButton"
+                            Tag="chat"
+                            Style="{StaticResource SidebarNavButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="14">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="18" Glyph="&#xE8BD;" />
+                                <TextBlock x:Name="NavChatText" FontSize="17" FontWeight="SemiBold" Text="Drakon Chat" />
+                            </StackPanel>
+                        </Button>
+
+                        <Button
+                            x:Name="NavCamerasButton"
+                            Tag="cameras"
+                            Style="{StaticResource SidebarNavButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="14">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="18" Glyph="&#xE722;" />
+                                <TextBlock x:Name="NavCamerasText" FontSize="17" FontWeight="SemiBold" Text="Cameras" />
+                            </StackPanel>
+                        </Button>
+
+                        <Button
+                            x:Name="NavEventsButton"
+                            Tag="events"
+                            Style="{StaticResource SidebarNavButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="14">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="18" Glyph="&#xE8A5;" />
+                                <TextBlock x:Name="NavEventsText" FontSize="17" FontWeight="SemiBold" Text="Logs &amp; Events" />
+                            </StackPanel>
+                        </Button>
+
+                        <Button
+                            x:Name="NavSettingsButton"
+                            Tag="settings"
+                            Style="{StaticResource SidebarNavButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="14">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="18" Glyph="&#xE713;" />
+                                <TextBlock x:Name="NavSettingsText" FontSize="17" FontWeight="SemiBold" Text="Settings" />
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+                </ScrollViewer>
+
+                <Border
+                    Grid.Row="2"
+                    Padding="18,18,18,20"
+                    BorderBrush="{StaticResource DrakonPanelBorderBrush}"
+                    BorderThickness="0,1,0,0">
+                    <StackPanel Spacing="16">
+                        <StackPanel x:Name="AppearanceExpandedPanel" Spacing="10">
+                            <TextBlock
+                                FontSize="12"
+                                FontWeight="SemiBold"
+                                Foreground="{StaticResource DrakonSecondaryTextBrush}"
+                                Text="APPEARANCE" />
+
+                            <Border
+                                Background="{StaticResource DrakonShellChipBrush}"
+                                BorderBrush="{StaticResource DrakonShellChipBorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="16"
+                                Padding="6">
+                                <Grid ColumnSpacing="6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+
+                                    <Button
+                                        x:Name="AppearanceDarkButton"
+                                        Grid.Column="0"
+                                        Style="{StaticResource SidebarUtilityButtonStyle}"
+                                        Background="{StaticResource DrakonShellActiveBrush}"
+                                        BorderBrush="{StaticResource DrakonShellActiveBorderBrush}"
+                                        Foreground="{StaticResource DrakonStrongTextBrush}">
+                                        <StackPanel HorizontalAlignment="Center" Orientation="Horizontal" Spacing="8">
+                                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE708;" />
+                                            <TextBlock FontSize="16" FontWeight="SemiBold" Text="Dark" />
+                                        </StackPanel>
+                                    </Button>
+
+                                    <Button
+                                        x:Name="AppearanceLightButton"
+                                        Grid.Column="1"
+                                        Style="{StaticResource SidebarUtilityButtonStyle}">
+                                        <StackPanel HorizontalAlignment="Center" Orientation="Horizontal" Spacing="8">
+                                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="15" Glyph="&#xE706;" />
+                                            <TextBlock FontSize="16" FontWeight="SemiBold" Text="Light" />
+                                        </StackPanel>
+                                    </Button>
+                                </Grid>
+                            </Border>
+                        </StackPanel>
+
+                        <StackPanel
+                            x:Name="AppearanceCollapsedPanel"
+                            Orientation="Vertical"
+                            Spacing="8"
+                            Visibility="Collapsed">
+                            <Button
+                                x:Name="AppearanceCollapsedDarkButton"
+                                Style="{StaticResource SidebarUtilityButtonStyle}"
+                                Background="{StaticResource DrakonShellActiveBrush}"
+                                BorderBrush="{StaticResource DrakonShellActiveBorderBrush}"
+                                Foreground="{StaticResource DrakonStrongTextBrush}">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE708;" />
+                            </Button>
+                            <Button
+                                x:Name="AppearanceCollapsedLightButton"
+                                Style="{StaticResource SidebarUtilityButtonStyle}">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE706;" />
+                            </Button>
+                        </StackPanel>
+
+                        <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+
+                            <Border
+                                Width="44"
+                                Height="44"
+                                Background="{StaticResource DrakonAccentBrush}"
+                                CornerRadius="22"
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Center">
+                                <TextBlock
+                                    x:Name="CurrentUserInitialText"
+                                    HorizontalAlignment="Center"
+                                    VerticalAlignment="Center"
+                                    FontSize="19"
+                                    FontWeight="SemiBold"
+                                    Foreground="White"
+                                    Text="M" />
+                            </Border>
+
+                            <StackPanel
+                                x:Name="UserDetailsPanel"
+                                Grid.Column="1"
+                                VerticalAlignment="Center"
+                                Spacing="2">
+                                <TextBlock
+                                    x:Name="CurrentUserNameText"
+                                    FontSize="16"
+                                    FontWeight="SemiBold"
+                                    Foreground="{StaticResource DrakonStrongTextBrush}"
+                                    Text="marcellogmf66@gmail.com" />
+                                <TextBlock
+                                    x:Name="CurrentUserEmailText"
+                                    Style="{StaticResource DrakonCaptionTextStyle}"
+                                    Text="marcellogmf66@gmail.com" />
+                            </StackPanel>
+                        </Grid>
+
+                        <Button
+                            x:Name="LogoutButton"
+                            Style="{StaticResource SidebarUtilityButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="10">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE8AC;" />
+                                <TextBlock
+                                    x:Name="LogoutText"
+                                    FontSize="16"
+                                    FontWeight="SemiBold"
+                                    Text="Logout" />
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Column="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="88" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <Border
+                Grid.Row="0"
+                Background="{StaticResource DrakonShellHeaderBrush}"
+                BorderBrush="{StaticResource DrakonPanelBorderBrush}"
+                BorderThickness="0,0,0,1">
+                <Grid
+                    x:Name="HeaderGrid"
+                    Padding="20,16"
+                    ColumnSpacing="18">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel
+                        VerticalAlignment="Center"
+                        Orientation="Horizontal"
+                        Spacing="16">
+                        <Button
+                            x:Name="SidebarToggleButton"
+                            Style="{StaticResource HeaderIconButtonStyle}">
+                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE76B;" />
+                        </Button>
+
+                        <TextBlock
+                            x:Name="CurrentPageTitleText"
+                            VerticalAlignment="Center"
+                            FontSize="17"
+                            FontWeight="SemiBold"
+                            Foreground="{StaticResource DrakonStrongTextBrush}"
+                            Text="Dashboard" />
+                    </StackPanel>
+
+                    <StackPanel
+                        x:Name="HeaderActionsHorizontal"
+                        Grid.Column="1"
+                        HorizontalAlignment="Right"
+                        VerticalAlignment="Center"
+                        Orientation="Horizontal"
+                        Spacing="12">
+                        <Button
+                            x:Name="TokenBalanceButton"
+                            Tag="billing"
+                            Style="{StaticResource HeaderChipButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="12">
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <Ellipse Width="7" Height="7" VerticalAlignment="Center" Fill="{StaticResource DrakonAccentBrush}" />
+                                    <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="In:" />
+                                    <TextBlock
+                                        x:Name="HeaderInputTokensText"
+                                        FontSize="14"
+                                        FontWeight="SemiBold"
+                                        Text="99.8M" />
+                                </StackPanel>
+
+                                <Border Width="1" Height="14" Background="{StaticResource DrakonPanelBorderBrush}" />
+
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <Ellipse Width="7" Height="7" VerticalAlignment="Center" Fill="#FF7C3AED" />
+                                    <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Out:" />
+                                    <TextBlock
+                                        x:Name="HeaderOutputTokensText"
+                                        FontSize="14"
+                                        FontWeight="SemiBold"
+                                        Text="100.0M" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Button>
+
+                        <Button
+                            x:Name="SystemActivityButton"
+                            Tag="events"
+                            Style="{StaticResource HeaderChipButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE9D2;" />
+                                <TextBlock
+                                    x:Name="SystemActivityText"
+                                    FontSize="14"
+                                    FontWeight="SemiBold"
+                                    Text="System Activity" />
+                            </StackPanel>
+                        </Button>
+
+                        <Button
+                            x:Name="LanguageButton"
+                            Style="{StaticResource HeaderChipButtonStyle}">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <TextBlock FontSize="14" FontWeight="SemiBold" Text="US" />
+                                <TextBlock
+                                    x:Name="LanguageLabelText"
+                                    FontSize="14"
+                                    FontWeight="SemiBold"
+                                    Text="EN" />
+                                <FontIcon FontFamily="Segoe Fluent Icons" FontSize="13" Glyph="&#xE70D;" />
+                            </StackPanel>
+                        </Button>
+
+                        <Button
+                            x:Name="NotificationsButton"
+                            Tag="events"
+                            Style="{StaticResource HeaderIconButtonStyle}">
+                            <FontIcon FontFamily="Segoe Fluent Icons" FontSize="16" Glyph="&#xE7ED;" />
+                        </Button>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Grid Grid.Row="1" Padding="28,24,28,24">
+                <Frame x:Name="ContentFrame" />
+            </Grid>
+        </Grid>
+    </Grid>
+</Page>
