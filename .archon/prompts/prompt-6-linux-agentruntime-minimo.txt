@@ -1,0 +1,300 @@
+PROMPT 6 — IAGENTRUNTIME LINUX REAL MÍNIMO SEM CÂMERA/RTSP/JOBS
+
+Atue como engenheiro sênior de C++23, CMake, Linux/Ubuntu, arquitetura multiplataforma, runtime headless, interfaces portáveis, AgentCore, feature gates, logging seguro, testes CTest e refatoração segura.
+
+Contexto:
+Estou no Ubuntu, no projeto:
+
+/home/marcello-guimaraes/dev/perceptrum_desktop_aspp
+
+As Fases 1 a 5 já foram executadas.
+
+Estado atual após a Fase 5:
+- Existe base Linux CMake reprodutível.
+- Existe perceptrum-agent.
+- Existe perceptrum-desktop stub.
+- APP_RUNTIME_* funciona.
+- XDG fallback funciona.
+- logs e agent_health.json funcionam.
+- pairing/provisioning/config funcionam no agente Linux mínimo.
+- LinuxHeadlessRuntime existe.
+- Interfaces portáveis foram criadas em:
+  Perceptrum/Perceptrum/runtime/interfaces/
+- Adaptadores Linux foram criados em:
+  Perceptrum/linux/LinuxRuntimeAdapters.h
+  Perceptrum/linux/LinuxRuntimeAdapters.cpp
+- HeadlessService.cpp entrou no build Linux com PERCEPTRUM_LINUX_BUILD sem puxar AgentCore real, CameraSession, FrameDiskWriter ou JobRuntime.
+- CTest passou com 27/27 testes.
+- AppHost, .vcxproj e .sln não foram alterados.
+- Nenhum commit foi feito.
+
+Relatório anterior:
+.archon/plans/relatorio-fase5-headless-interfaces-logging-linux.md
+
+Recomendação do relatório:
+Introduzir uma implementação Linux real mínima de IAgentRuntime sem câmera/RTSP/jobs, migrar PairingClient/Logging real para dependências injetadas e então aproximar AgentCore por fatias portáveis, mantendo câmeras e jobs pesados atrás de feature gates.
+
+Objetivo desta Fase 6:
+Criar uma implementação Linux real mínima de IAgentRuntime, substituindo o LinuxNoopAgentRuntime por um runtime Linux controlado que faça inicialização real de subsistemas leves, mas ainda NÃO ative câmera, RTSP, FrameDiskWriter, JobRuntime ou AgentCore completo.
+
+Esta fase deve aproximar o runtime de produção sem quebrar Windows/macOS e sem ativar fluxos pesados.
+
+Esta fase NÃO deve:
+- converter interface desktop completa;
+- implementar telas;
+- ativar câmera real;
+- ativar RTSP;
+- ativar FrameDiskWriter real;
+- ativar JobRuntime real;
+- integrar AgentCore completo se ele ainda arrastar Win32/OpenCV/jobs;
+- alterar AppHost;
+- alterar .vcxproj;
+- alterar .sln;
+- fazer commit;
+- fazer push.
+
+Arquivos a ler antes de alterar:
+- .archon/plans/relatorio-fase5-headless-interfaces-logging-linux.md
+- .archon/plans/relatorio-fase4-headlessservice-linux-safe.md
+- .archon/plans/relatorio-fase3-pairing-headless-linux.md
+- .archon/plans/anchor-riscos-multiplataforma.md
+- Perceptrum/CMakeLists.txt
+- Perceptrum/linux/main.cpp
+- Perceptrum/linux/RuntimePaths.h
+- Perceptrum/linux/RuntimePaths.cpp
+- Perceptrum/linux/LinuxHeadlessRuntime.h
+- Perceptrum/linux/LinuxHeadlessRuntime.cpp
+- Perceptrum/linux/LinuxRuntimeAdapters.h
+- Perceptrum/linux/LinuxRuntimeAdapters.cpp
+- Perceptrum/Perceptrum/runtime/interfaces/IRuntimeLogger.h
+- Perceptrum/Perceptrum/runtime/interfaces/ITokenStore.h
+- Perceptrum/Perceptrum/runtime/interfaces/IAgentRuntime.h
+- Perceptrum/Perceptrum/runtime/interfaces/IHeadlessRuntime.h
+- Perceptrum/Perceptrum/runtime/HeadlessService.cpp
+- Perceptrum/Perceptrum/runtime/HeadlessService.h
+- Perceptrum/Perceptrum/runtime/BrandingRuntime.cpp
+- Perceptrum/Perceptrum/runtime/BrandingRuntime.h
+- Perceptrum/Perceptrum/logging/Logging.cpp
+- Perceptrum/Perceptrum/logging/Logging.h
+- Perceptrum/Perceptrum/core/AgentCore.cpp
+- Perceptrum/Perceptrum/core/AgentCore.h
+- Perceptrum/Perceptrum/orchestrator/ChatModelConfig.cpp
+- Perceptrum/Perceptrum/orchestrator/ChatModelConfig.h
+- Perceptrum/Perceptrum/orchestrator/ConfigUtils.cpp
+- Perceptrum/Perceptrum/orchestrator/ConfigUtils.h
+- Perceptrum/Perceptrum/orchestrator/SkillRegistry.cpp
+- Perceptrum/Perceptrum/orchestrator/SkillRegistry.h
+- Perceptrum/Perceptrum/orchestrator/SkillTypes.h
+- Perceptrum/Perceptrum/platform/platform_common.cpp
+- Perceptrum/Perceptrum/platform/platform_common.h
+- Perceptrum/Perceptrum/platform/platform_process.cpp
+- Perceptrum/Perceptrum/platform/platform_process.h
+- Perceptrum/Perceptrum/platform/platform_secure_store.cpp
+- Perceptrum/Perceptrum/platform/platform_secure_store.h
+- brand.config.json
+
+Regras absolutas:
+1. Não fazer commit.
+2. Não fazer push.
+3. Não executar git reset --hard.
+4. Não apagar código.
+5. Não alterar AppHost.
+6. Não alterar .vcxproj.
+7. Não alterar .sln.
+8. Não quebrar Windows.
+9. Não quebrar macOS.
+10. Não copiar código de Perceptrum/out como fonte.
+11. Perceptrum/out é artefato histórico, não fonte canônica.
+12. Não transformar Linux em site externo.
+13. Não implementar interface completa.
+14. Não ativar câmera/RTSP.
+15. Não ativar FrameDiskWriter real.
+16. Não ativar JobRuntime real.
+17. Não expor tokens/secrets em log, terminal, status ou health JSON.
+18. Usar somente Codex/gpt-5.5.
+19. Não usar Claude, opus, sonnet ou haiku.
+20. Se precisar de apt install, parar e informar exatamente o comando.
+
+Implementar nesta fase:
+
+A. LinuxRealAgentRuntime mínimo
+Criar ou evoluir uma implementação concreta de IAgentRuntime para Linux, por exemplo:
+
+- LinuxMinimalAgentRuntime
+- LinuxRealAgentRuntime
+- ou nome equivalente justificado no relatório.
+
+Responsabilidades permitidas nesta fase:
+1. start()
+2. stop()
+3. status()
+4. carregar configuração não sensível;
+5. validar runtime roots;
+6. validar branding básico;
+7. validar disponibilidade de dependências leves já checadas por check-deps;
+8. inicializar subsistemas leves que não arrastem câmera/RTSP/jobs;
+9. reportar estado real no health JSON;
+10. declarar explicitamente:
+   - agent_runtime=linux_minimal_agent_runtime
+   - agent_core_enabled=false ou agent_core_partial=true, conforme real
+   - camera_capture_enabled=false
+   - rtsp_capture_enabled=false
+   - job_runtime_enabled=false
+   - frame_writer_enabled=false
+
+Não deve:
+- abrir câmera;
+- iniciar RTSP;
+- processar vídeo;
+- iniciar JobRuntime;
+- puxar AgentCore.cpp se ainda quebrar Linux.
+
+B. Feature gates explícitos
+Adicionar feature gates claros no runtime Linux:
+
+1. PERCEPTRUM_ENABLE_AGENT_CORE
+2. PERCEPTRUM_ENABLE_CAMERA_CAPTURE
+3. PERCEPTRUM_ENABLE_RTSP_CAPTURE
+4. PERCEPTRUM_ENABLE_JOB_RUNTIME
+5. PERCEPTRUM_ENABLE_FRAME_WRITER
+
+Ou nomes equivalentes.
+
+Comportamento:
+- Por padrão, todos os recursos pesados ficam OFF.
+- Se o usuário tentar ativar um recurso ainda não suportado, retornar erro funcional claro, não crash.
+- Registrar no health JSON quais gates estão ligados/desligados.
+- Não expor secrets.
+
+C. Aproximação segura do AgentCore
+Auditar AgentCore.cpp/AgentCore.h e identificar uma fatia leve que possa ser extraída sem Win32/camera/jobs.
+
+Se viável com baixo risco:
+1. extrair interface leve ou snapshot de status;
+2. criar stub de AgentCore para Linux;
+3. compilar apenas headers ou componente leve sem puxar Win32.
+
+Se não for viável:
+1. não forçar;
+2. documentar exatamente quais includes/funções bloqueiam;
+3. manter AgentCore completo fora do CMake Linux.
+
+D. PairingClient e config
+Auditar PairingClient e config real.
+
+Nesta fase, fazer apenas uma destas duas opções:
+1. se for baixo risco, alinhar PairingClient a RuntimePaths/ITokenStore sem puxar backend pesado;
+2. se não for baixo risco, documentar bloqueios e manter pairing/provisioning atual do agente Linux mínimo.
+
+Não quebrar o fluxo já validado na Fase 3.
+
+E. Logging
+Aprimorar integração com IRuntimeLogger sem quebrar Logger legado:
+1. LinuxMinimalAgentRuntime deve usar IRuntimeLogger.
+2. Logs devem continuar em APP_RUNTIME_LOG_ROOT.
+3. Não escrever logs relativos ao CWD.
+4. Não exportar logs ao backend nesta fase.
+5. Não expor tokens.
+
+F. HeadlessService
+Atualizar a ponte do HeadlessService:
+1. HeadlessService deve poder usar IAgentRuntime injetado em Linux.
+2. O build Linux deve continuar compilando HeadlessService.cpp.
+3. No Linux, o caminho sem AgentCore real deve ser funcional e reportar estado claro.
+4. No Windows, preservar comportamento antigo.
+5. Não remover AgentCore real.
+
+G. CMake
+Atualizar Perceptrum/CMakeLists.txt se necessário:
+1. adicionar fontes novas;
+2. manter lista explícita;
+3. não globar;
+4. não incluir AppHost;
+5. não incluir .vcxproj/.sln;
+6. não incluir *_old.cpp;
+7. não incluir CameraSession/FrameDiskWriter/JobRuntime se isso ativar câmera/jobs;
+8. não incluir AgentCore.cpp completo se ele ainda arrastar Win32.
+
+H. CTest
+Adicionar ou atualizar testes para:
+1. runtime reporta linux_minimal_agent_runtime.
+2. feature gates pesados OFF por padrão.
+3. tentar ativar recurso não suportado gera erro funcional claro.
+4. run com provisionamento reflete runtime mínimo.
+5. status/health não expõem secrets.
+6. logs permanecem em APP_RUNTIME_LOG_ROOT.
+7. HeadlessService.cpp continua compilando no Linux.
+8. AgentCore completo continua fora do alvo Linux, se ainda bloqueado.
+9. AppHost/.vcxproj/.sln continuam intocados.
+10. testes anteriores continuam passando.
+
+Validação obrigatória:
+Executar:
+
+cd Perceptrum
+cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build out/build/linux-debug -j$(nproc)
+ctest --test-dir out/build/linux-debug --output-on-failure
+
+Executar também manualmente com runtime isolado:
+
+export APP_RUNTIME_DATA_ROOT=/tmp/perceptrum-runtime-test/data
+export APP_RUNTIME_CONFIG_ROOT=/tmp/perceptrum-runtime-test/config
+export APP_RUNTIME_CACHE_ROOT=/tmp/perceptrum-runtime-test/cache
+export APP_RUNTIME_STATE_ROOT=/tmp/perceptrum-runtime-test/state
+export APP_RUNTIME_LOG_ROOT=/tmp/perceptrum-runtime-test/state/logs
+
+rm -rf /tmp/perceptrum-runtime-test
+mkdir -p "$APP_RUNTIME_DATA_ROOT" "$APP_RUNTIME_CONFIG_ROOT" "$APP_RUNTIME_CACHE_ROOT" "$APP_RUNTIME_STATE_ROOT" "$APP_RUNTIME_LOG_ROOT"
+
+./out/build/linux-debug/perceptrum-agent --help
+./out/build/linux-debug/perceptrum-agent version
+./out/build/linux-debug/perceptrum-agent validate-config
+./out/build/linux-debug/perceptrum-agent check-deps
+
+APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 ./out/build/linux-debug/perceptrum-agent provision --base-url http://localhost:4000 --exe-token TEST_TOKEN --client-id test-client --timezone America/Manaus || true
+
+timeout 10s ./out/build/linux-debug/perceptrum-agent run || true
+./out/build/linux-debug/perceptrum-agent status || true
+./out/build/linux-debug/perceptrum-agent healthcheck || true
+
+find /tmp/perceptrum-runtime-test -maxdepth 5 -type f -print
+grep -R "TEST_TOKEN" /tmp/perceptrum-runtime-test/data /tmp/perceptrum-runtime-test/state 2>/dev/null || true
+
+Saída obrigatória:
+Gerar relatório em:
+
+.archon/plans/relatorio-fase6-linux-agentruntime-minimo.md
+
+O relatório deve conter:
+1. Arquivos lidos.
+2. Arquivos criados.
+3. Arquivos alterados.
+4. Implementação concreta de IAgentRuntime criada ou evoluída.
+5. Feature gates adicionados.
+6. Estado de AgentCore.
+7. Se AgentCore entrou ou não no build Linux.
+8. Se não entrou, por quê.
+9. Como HeadlessService usa IAgentRuntime.
+10. Como logs e tokens ficaram protegidos.
+11. Quais testes foram adicionados.
+12. Resultado do CMake.
+13. Resultado do build.
+14. Resultado do ctest.
+15. Resultado dos comandos manuais.
+16. Confirmação de que AppHost não foi alterado.
+17. Confirmação de que .vcxproj e .sln não foram alterados.
+18. Confirmação de que nenhum commit foi feito.
+19. Riscos pendentes.
+20. Próxima fase recomendada.
+
+Critério de sucesso:
+A Fase 6 só é considerada concluída se:
+- build Linux continuar reprodutível;
+- ctest passar;
+- existir IAgentRuntime Linux mínimo real, não apenas Noop;
+- feature gates pesados estiverem OFF por padrão;
+- status/health refletirem o runtime mínimo;
+- AgentCore/câmera/RTSP/jobs pesados não forem ativados indevidamente;
+- AppHost/.vcxproj/.sln não forem alterados;
+- nenhum commit for feito.

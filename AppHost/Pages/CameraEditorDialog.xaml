@@ -1,0 +1,283 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    RequestedTheme="Dark">
+
+    <ScrollViewer
+        MaxHeight="720"
+        VerticalScrollBarVisibility="Auto">
+        <StackPanel Spacing="16">
+            <InfoBar
+                x:Name="DialogErrorBar"
+                IsOpen="False"
+                Severity="Error" />
+
+            <InfoBar
+                x:Name="PublicAccessInfoBar"
+                IsOpen="False"
+                Severity="Warning"
+                Message="Public access exposes this camera to broader discovery scope. Enable only when this is intentional." />
+
+            <TextBlock
+                Style="{StaticResource DrakonCaptionTextStyle}"
+                Text="Dialog fiel ao CameraEditorModal do DrakonSite, com tabs de conexão, endereço, retenção e regras por fabricante."
+                TextWrapping="WrapWholeWords" />
+
+            <TabView
+                x:Name="ModeTabs"
+                IsAddTabButtonVisible="False"
+                TabWidthMode="Equal">
+                <TabViewItem
+                    x:Name="RtspTab"
+                    Header="IP / RTSP Camera"
+                    IsClosable="False">
+                    <StackPanel
+                        Margin="12"
+                        Spacing="14">
+                        <TextBox
+                            x:Name="NameTextBox"
+                            Header="Camera Name *"
+                            PlaceholderText="Front Entrance" />
+
+                        <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+
+                            <TextBox
+                                x:Name="IpAddressTextBox"
+                                Header="IP Address *"
+                                PlaceholderText="192.168.1.100" />
+                            <TextBox
+                                x:Name="RtspPortTextBox"
+                                Grid.Column="1"
+                                Header="RTSP Port *"
+                                PlaceholderText="554" />
+                        </Grid>
+
+                        <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+
+                            <ComboBox
+                                x:Name="ManufacturerComboBox"
+                                Header="Manufacturer *">
+                                <ComboBoxItem Content="Hikvision" />
+                                <ComboBoxItem Content="Intelbras" />
+                                <ComboBoxItem Content="Axis" />
+                                <ComboBoxItem Content="Dahua" />
+                                <ComboBoxItem Content="ONVIF" />
+                                <ComboBoxItem Content="Other" />
+                            </ComboBox>
+
+                            <ComboBox
+                                x:Name="ConnectionMethodComboBox"
+                                Grid.Column="1"
+                                Header="Connection Method *">
+                                <ComboBoxItem Content="RTSP" />
+                                <ComboBoxItem Content="HTTP" />
+                                <ComboBoxItem Content="ONVIF" />
+                            </ComboBox>
+                        </Grid>
+
+                        <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+
+                            <TextBox
+                                x:Name="ChannelTextBox"
+                                Header="Channel"
+                                PlaceholderText="1 or 201" />
+                            <TextBox
+                                x:Name="SubtypeTextBox"
+                                Grid.Column="1"
+                                Header="Subtype"
+                                PlaceholderText="0, 1, 2..." />
+                        </Grid>
+
+                        <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+
+                            <TextBox
+                                x:Name="UsernameTextBox"
+                                Header="Username *"
+                                PlaceholderText="admin" />
+                            <PasswordBox
+                                x:Name="PasswordBox"
+                                Grid.Column="1"
+                                Header="Password *"
+                                PasswordRevealMode="Visible" />
+                        </Grid>
+                    </StackPanel>
+                </TabViewItem>
+
+                <TabViewItem
+                    x:Name="WebcamTab"
+                    Header="Webcam"
+                    IsClosable="False">
+                    <StackPanel
+                        Margin="12"
+                        Spacing="14">
+                        <TextBox
+                            x:Name="WebcamNameTextBox"
+                            Header="Camera Name *"
+                            PlaceholderText="Webcam Lab" />
+
+                        <NumberBox
+                            x:Name="WebcamIndexNumberBox"
+                            Header="Webcam Index *"
+                            Minimum="-1"
+                            SmallChange="1"
+                            SpinButtonPlacementMode="Inline" />
+                    </StackPanel>
+                </TabViewItem>
+            </TabView>
+
+            <Expander
+                x:Name="AddressExpander"
+                Header="Address and physical location">
+                <Grid
+                    Margin="0,12,0,0"
+                    ColumnSpacing="12"
+                    RowSpacing="12">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+
+                    <TextBox
+                        x:Name="StreetTextBox"
+                        Header="Street *"
+                        PlaceholderText="Main St" />
+                    <TextBox
+                        x:Name="NumberTextBox"
+                        Grid.Column="1"
+                        Header="Number *"
+                        PlaceholderText="120" />
+                    <TextBox
+                        x:Name="CityTextBox"
+                        Grid.Row="1"
+                        Header="City *"
+                        PlaceholderText="New York" />
+                    <TextBox
+                        x:Name="StateTextBox"
+                        Grid.Row="1"
+                        Grid.Column="1"
+                        Header="State *"
+                        PlaceholderText="NY" />
+                    <TextBox
+                        x:Name="ZipCodeTextBox"
+                        Grid.Row="2"
+                        Header="ZIP Code *"
+                        PlaceholderText="10001" />
+                    <TextBox
+                        x:Name="CountryTextBox"
+                        Grid.Row="2"
+                        Grid.Column="1"
+                        Header="Country *"
+                        PlaceholderText="United States" />
+                </Grid>
+            </Expander>
+
+            <StackPanel
+                x:Name="DescriptionSectionRoot"
+                Spacing="12"
+                Visibility="Collapsed">
+                <TextBlock
+                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                    Text="Camera Description" />
+
+                <ComboBox
+                    x:Name="DescriptionLabelComboBox"
+                    Header="Label">
+                    <ComboBoxItem Content="Kitchen" Tag="kitchen" />
+                    <ComboBoxItem Content="Living Room" Tag="living_room" />
+                    <ComboBoxItem Content="Bedroom" Tag="bedroom" />
+                    <ComboBoxItem Content="Children's Room" Tag="childrens_room" />
+                    <ComboBoxItem Content="Office Room" Tag="office_room" />
+                    <ComboBoxItem Content="Corridor" Tag="corridor" />
+                    <ComboBoxItem Content="Elevator" Tag="elevator" />
+                    <ComboBoxItem Content="Classroom" Tag="classroom" />
+                    <ComboBoxItem Content="Parking Lot" Tag="parking_lot" />
+                    <ComboBoxItem Content="Garage" Tag="garage" />
+                    <ComboBoxItem Content="Street" Tag="street" />
+                    <ComboBoxItem Content="Intersection" Tag="intersection" />
+                    <ComboBoxItem Content="Park" Tag="park" />
+                    <ComboBoxItem Content="Yard" Tag="yard" />
+                    <ComboBoxItem Content="Frontyard" Tag="frontyard" />
+                    <ComboBoxItem Content="Backyard" Tag="backyard" />
+                    <ComboBoxItem Content="Store" Tag="store" />
+                    <ComboBoxItem Content="Supermarket" Tag="supermarket" />
+                    <ComboBoxItem Content="Warehouse" Tag="warehouse" />
+                    <ComboBoxItem Content="Staircase" Tag="staircase" />
+                    <ComboBoxItem Content="Lobby" Tag="lobby" />
+                    <ComboBoxItem Content="Reception" Tag="reception" />
+                    <ComboBoxItem Content="Restaurant" Tag="restaurant" />
+                    <ComboBoxItem Content="Bar" Tag="bar" />
+                    <ComboBoxItem Content="Cafe" Tag="cafe" />
+                    <ComboBoxItem Content="Gym" Tag="gym" />
+                    <ComboBoxItem Content="Front Door" Tag="front_door" />
+                    <ComboBoxItem Content="Back Door" Tag="back_door" />
+                    <ComboBoxItem Content="Other Indoor" Tag="other_indoor" />
+                    <ComboBoxItem Content="Other Outdoor" Tag="other_outdoor" />
+                </ComboBox>
+
+                <TextBox
+                    x:Name="DescriptionTextBox"
+                    AcceptsReturn="True"
+                    Header="Description"
+                    MaxLength="1900"
+                    MinHeight="96"
+                    PlaceholderText="Describe what this camera sees and the context around it."
+                    TextWrapping="Wrap" />
+
+                <TextBlock
+                    x:Name="DescriptionCountText"
+                    Style="{StaticResource DrakonCaptionTextStyle}"
+                    Text="0/1900 characters" />
+            </StackPanel>
+
+            <Grid ColumnSpacing="12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <ComboBox
+                    x:Name="RetentionComboBox"
+                    Header="Retention days">
+                    <ComboBoxItem Content="1" />
+                    <ComboBoxItem Content="3" />
+                    <ComboBoxItem Content="7" />
+                    <ComboBoxItem Content="15" />
+                    <ComboBoxItem Content="30" />
+                    <ComboBoxItem Content="90" />
+                    <ComboBoxItem Content="180" />
+                </ComboBox>
+
+                <CheckBox
+                    x:Name="AllowPublicAccessCheckBox"
+                    Grid.Column="1"
+                    Content="Allow Public Access"
+                    VerticalAlignment="Bottom" />
+            </Grid>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

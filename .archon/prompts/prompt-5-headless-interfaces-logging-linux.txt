@@ -1,0 +1,270 @@
+PROMPT 5 — INTERFACES PORTÁVEIS DO HEADLESSSERVICE E LOGGING LINUX
+
+Atue como engenheiro sênior de C++23, CMake, Linux/Ubuntu, arquitetura multiplataforma, runtime headless, logging, interfaces portáveis, injeção de dependências, segurança de secrets e refatoração segura.
+
+Contexto:
+Estou no Ubuntu, no projeto:
+
+/home/marcello-guimaraes/dev/perceptrum_desktop_aspp
+
+As Fases 1, 2, 3 e 4 já foram executadas.
+
+Estado atual:
+- Existe base Linux CMake reprodutível.
+- Existe perceptrum-agent.
+- Existe perceptrum-desktop stub.
+- APP_RUNTIME_* funciona.
+- XDG fallback funciona.
+- logs e agent_health.json funcionam.
+- pairing/provisioning/config foram implementados no agente Linux mínimo.
+- LinuxHeadlessRuntime foi criado.
+- CTest passou com 23/23 testes.
+- HeadlessService.cpp real ainda não entrou no build Linux porque instancia AgentCore e arrasta Logging, câmeras, FrameDiskWriter, JobRuntime, OpenCV, Win32 APIs e jobs pesados.
+- AppHost, .vcxproj e .sln não foram alterados.
+- Nenhum commit foi feito.
+
+Relatório anterior:
+.archon/plans/relatorio-fase4-headlessservice-linux-safe.md
+
+Recomendação do relatório:
+Criar interfaces portáveis mínimas para HeadlessService, por exemplo:
+- IHeadlessRuntime
+- ITokenStore
+- IRuntimeLogger
+- IAgentCoreFactory
+
+Migrar Logging para roots explícitos e permitir que HeadlessService.cpp compile no Linux sem instanciar AgentCore real. Somente depois ativar AgentCore Linux sem câmera/RTSP/jobs pesados.
+
+Objetivo desta Fase 5:
+Criar fronteiras portáveis para o HeadlessService e Logging, de modo que o HeadlessService possa ser preparado/compilado no Linux sem ativar AgentCore real, câmeras, jobs ou RTSP.
+
+Esta fase NÃO deve:
+- converter interface desktop completa;
+- implementar telas;
+- ativar câmera real;
+- ativar RTSP;
+- ativar jobs reais;
+- integrar AgentCore completo;
+- mexer no AppHost;
+- mexer em .vcxproj;
+- mexer em .sln;
+- fazer commit;
+- fazer push.
+
+Arquivos a ler antes de alterar:
+- .archon/plans/relatorio-fase4-headlessservice-linux-safe.md
+- .archon/plans/relatorio-fase3-pairing-headless-linux.md
+- .archon/plans/relatorio-fase2-runtime-xdg-secrets-linux.md
+- .archon/plans/anchor-riscos-multiplataforma.md
+- Perceptrum/CMakeLists.txt
+- Perceptrum/linux/main.cpp
+- Perceptrum/linux/RuntimePaths.h
+- Perceptrum/linux/RuntimePaths.cpp
+- Perceptrum/linux/LinuxHeadlessRuntime.h
+- Perceptrum/linux/LinuxHeadlessRuntime.cpp
+- Perceptrum/Perceptrum/runtime/HeadlessService.cpp
+- Perceptrum/Perceptrum/runtime/HeadlessService.h
+- Perceptrum/Perceptrum/runtime/BrandingRuntime.cpp
+- Perceptrum/Perceptrum/runtime/BrandingRuntime.h
+- Perceptrum/Perceptrum/logging/Logging.cpp
+- Perceptrum/Perceptrum/logging/Logging.h
+- Perceptrum/Perceptrum/core/AgentCore.cpp
+- Perceptrum/Perceptrum/core/AgentCore.h
+- Perceptrum/Perceptrum/platform/platform_common.cpp
+- Perceptrum/Perceptrum/platform/platform_common.h
+- Perceptrum/Perceptrum/platform/platform_secure_store.cpp
+- Perceptrum/Perceptrum/platform/platform_secure_store.h
+
+Regras absolutas:
+1. Não fazer commit.
+2. Não fazer push.
+3. Não executar git reset --hard.
+4. Não apagar código.
+5. Não alterar AppHost.
+6. Não alterar .vcxproj.
+7. Não alterar .sln.
+8. Não quebrar Windows.
+9. Não quebrar macOS.
+10. Não copiar código de Perceptrum/out como fonte.
+11. Perceptrum/out é artefato histórico, não fonte canônica.
+12. Não transformar Linux em site externo.
+13. Não implementar interface completa.
+14. Não ativar AgentCore real.
+15. Não ativar câmera/RTSP.
+16. Não ativar jobs reais.
+17. Não expor tokens/secrets em log, terminal ou health JSON.
+18. Usar somente Codex/gpt-5.5.
+19. Não usar Claude, opus, sonnet ou haiku.
+20. Se precisar de apt install, parar e informar exatamente o comando.
+
+Implementar nesta fase:
+
+A. Interfaces portáveis mínimas
+Criar uma pasta canônica para contratos portáveis, por exemplo:
+
+Perceptrum/Perceptrum/runtime/interfaces/
+
+ou outro local justificado no relatório.
+
+Criar interfaces mínimas, se fizer sentido:
+1. IRuntimeLogger
+   - info()
+   - warn()
+   - error()
+   - debug(), se útil
+   - sem depender de Logger singleton global
+   - sem paths hardcoded
+
+2. ITokenStore
+   - readToken()
+   - writeToken()
+   - hasToken()
+   - clearToken(), se útil
+   - nunca expor token em string de log
+   - deve permitir implementação Linux usando platform_secure_store
+
+3. IAgentCoreFactory ou IAgentRuntime
+   - create/start/stop/status de AgentCore
+   - nesta fase pode ter implementação stub/no-op
+   - deve declarar claramente camera/jobs desativados
+   - não deve puxar AgentCore.cpp para o build Linux ainda se isso quebrar o escopo
+
+4. IHeadlessRuntime ou HeadlessRuntimeContext
+   - runtime roots
+   - config
+   - health writer
+   - logger
+   - token store
+   - shutdown flag
+   - status callback
+
+Objetivo das interfaces:
+Permitir que HeadlessService.cpp seja gradualmente desacoplado de Logger::instance(), AgentCore direto e paths hardcoded.
+
+B. Logging com roots explícitos
+Refatorar Logging somente no menor escopo possível:
+1. Não quebrar Windows.
+2. Preservar Logger::instance() para Windows/fluxo legado.
+3. Adicionar uma implementação ou adaptador Linux de logger com root explícito.
+4. O logger Linux deve escrever em APP_RUNTIME_LOG_ROOT.
+5. Não usar `logs/agent.log` relativo ao CWD no caminho Linux novo.
+6. Não ler client_id.txt, exe_token.txt ou exe_id.txt relativos ao CWD no caminho Linux novo.
+7. Não exportar logs ao backend usando bearer token em caminhos de teste/stub.
+8. Não imprimir secrets.
+
+C. HeadlessService preparado para dependências injetáveis
+Modificar HeadlessService.h/.cpp somente se possível com baixo risco:
+1. Adicionar overload, options ou construtor que aceite interfaces/stubs.
+2. Preservar construtor/uso antigo para Windows.
+3. Proteger mudanças com compatibilidade.
+4. Não remover AgentCore real.
+5. Não alterar comportamento Windows.
+6. Permitir que o Linux compile uma variante que não instancia AgentCore real.
+7. Se HeadlessService.cpp ainda não puder entrar no build Linux, criar relatório preciso e preparar headers/interfaces para próxima fase.
+
+D. LinuxHeadlessRuntime
+Atualizar LinuxHeadlessRuntime para usar as novas interfaces onde fizer sentido:
+1. usar IRuntimeLogger ou adaptador equivalente;
+2. usar ITokenStore ou adaptador equivalente;
+3. manter run/status/healthcheck funcionando;
+4. manter runtime_stub/headless_blocked_by_platform_coupling enquanto AgentCore real não estiver ativo;
+5. não regredir testes.
+
+E. CMake
+Atualizar Perceptrum/CMakeLists.txt:
+1. adicionar novos headers/sources de interface/adaptadores;
+2. manter lista explícita de fontes;
+3. não globar árvore;
+4. não incluir AppHost;
+5. não incluir .vcxproj/.sln;
+6. não incluir arquivos *_old.cpp;
+7. não incluir AgentCore.cpp se ele ainda arrastar Win32;
+8. não incluir CameraSession/FrameDiskWriter/JobRuntime se isso ativar câmera/jobs.
+
+F. Testes CTest
+Adicionar ou atualizar testes para:
+1. logger Linux escreve em APP_RUNTIME_LOG_ROOT.
+2. logger não escreve em logs relativo ao CWD.
+3. token store falha fechado sem secret-tool/fallback explícito.
+4. token store com fallback explícito usa arquivo 0600.
+5. status não expõe secrets.
+6. health JSON não expõe secrets.
+7. LinuxHeadlessRuntime usa logger/token store por interface/adaptador.
+8. HeadlessService headers/interfaces compilam no Linux.
+9. AppHost/.vcxproj/.sln não são alterados.
+10. testes anteriores continuam passando.
+
+Validação obrigatória:
+Executar exatamente:
+
+cd Perceptrum
+cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build out/build/linux-debug -j$(nproc)
+ctest --test-dir out/build/linux-debug --output-on-failure
+
+Executar também manualmente com runtime isolado:
+
+export APP_RUNTIME_DATA_ROOT=/tmp/perceptrum-runtime-test/data
+export APP_RUNTIME_CONFIG_ROOT=/tmp/perceptrum-runtime-test/config
+export APP_RUNTIME_CACHE_ROOT=/tmp/perceptrum-runtime-test/cache
+export APP_RUNTIME_STATE_ROOT=/tmp/perceptrum-runtime-test/state
+export APP_RUNTIME_LOG_ROOT=/tmp/perceptrum-runtime-test/state/logs
+
+rm -rf /tmp/perceptrum-runtime-test
+mkdir -p "$APP_RUNTIME_DATA_ROOT" "$APP_RUNTIME_CONFIG_ROOT" "$APP_RUNTIME_CACHE_ROOT" "$APP_RUNTIME_STATE_ROOT" "$APP_RUNTIME_LOG_ROOT"
+
+./out/build/linux-debug/perceptrum-agent --help
+./out/build/linux-debug/perceptrum-agent version
+./out/build/linux-debug/perceptrum-agent validate-config
+./out/build/linux-debug/perceptrum-agent check-deps
+./out/build/linux-debug/perceptrum-agent status || true
+./out/build/linux-debug/perceptrum-agent healthcheck || true
+
+APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 ./out/build/linux-debug/perceptrum-agent provision --base-url http://localhost:4000 --exe-token TEST_TOKEN --client-id test-client --timezone America/Manaus || true
+
+timeout 10s ./out/build/linux-debug/perceptrum-agent run || true
+./out/build/linux-debug/perceptrum-agent status || true
+./out/build/linux-debug/perceptrum-agent healthcheck || true
+
+find /tmp/perceptrum-runtime-test -maxdepth 5 -type f -print
+grep -R "TEST_TOKEN" /tmp/perceptrum-runtime-test/data /tmp/perceptrum-runtime-test/state /tmp/perceptrum-runtime-test/config 2>/dev/null || true
+
+Saída obrigatória:
+Gerar relatório em:
+
+.archon/plans/relatorio-fase5-headless-interfaces-logging-linux.md
+
+O relatório deve conter:
+1. Arquivos lidos.
+2. Arquivos criados.
+3. Arquivos alterados.
+4. Interfaces criadas.
+5. O que mudou em Logging.
+6. Se HeadlessService.cpp entrou ou não no build Linux.
+7. Se não entrou, por quê.
+8. Como LinuxHeadlessRuntime passou a usar as interfaces/adaptadores.
+9. Como tokens ficaram protegidos.
+10. Como logs ficaram roteados.
+11. Quais testes foram adicionados.
+12. Resultado do CMake.
+13. Resultado do build.
+14. Resultado do ctest.
+15. Resultado dos comandos manuais.
+16. Confirmação de que AppHost não foi alterado.
+17. Confirmação de que .vcxproj e .sln não foram alterados.
+18. Confirmação de que nenhum commit foi feito.
+19. Riscos pendentes.
+20. Próxima fase recomendada.
+
+Critério de sucesso:
+A Fase 5 só é considerada concluída se:
+- build Linux continuar reprodutível;
+- ctest passar;
+- interfaces portáveis existirem;
+- LinuxHeadlessRuntime usar pelo menos parte das interfaces/adaptadores;
+- logs respeitarem APP_RUNTIME_LOG_ROOT;
+- tokens não vazarem em logs/status/health;
+- HeadlessService estiver mais próximo de compilar no Linux sem AgentCore real;
+- AgentCore/câmera/jobs pesados não forem ativados;
+- AppHost/.vcxproj/.sln não forem alterados;
+- nenhum commit for feito.

@@ -1,0 +1,3634 @@
+#include "FrameDiskWriter.h"
+#include <iomanip>
+#include <sstream>
+#include <vector>
+#include <algorithm>
+#include <fstream>
+#include <ctime>
+#include <cstdlib>
+#include <cctype>
+#include "../logging/Logging.h"
+#include "../generated/Branding.h"
+#include <mutex>
+#include <cmath>
+
+
+using Clock = std::chrono::steady_clock;
+namespace fs = std::filesystem;
+
+static bool parseClipNameParts(
+    const std::string& filename,
+    std::string& outCameraId,
+    std::string& outStartDate,
+    std::string& outStartTime,
+    std::string& outEndDate,
+    std::string& outEndTime);
+
+static bool parseClipLocalTimestamp_(
+    const std::string& yyyymmdd,
+    const std::string& hhmmss,
+    std::chrono::system_clock::time_point& outTp);
+
+static std::chrono::system_clock::time_point fileTimeToSystemClock_(
+    const fs::file_time_type& ft);
+
+static std::string formatUtcIso_(
+    const std::chrono::system_clock::time_point& tp)
+{
+    if (tp.time_since_epoch().count() == 0) {
+        return std::string();
+    }
+
+    using namespace std::chrono;
+    const auto ms = duration_cast<milliseconds>(tp.time_since_epoch());
+    const std::time_t tt = static_cast<std::time_t>(ms.count() / 1000);
+
+    std::tm tmUtc{};
+#ifdef _WIN32
+    gmtime_s(&tmUtc, &tt);
+#else
+    gmtime_r(&tt, &tmUtc);
+#endif
+
+    std::ostringstream oss;
+    oss << std::put_time(&tmUtc, "%Y-%m-%dT%H:%M:%SZ");
+    return oss.str();
+}
+
+static bool readFrameDiskWriterAsyncModeEnabled_()
+{
+    char* rawMode = nullptr;
+    std::size_t rawModeLength = 0;
+    if (_dupenv_s(&rawMode, &rawModeLength, "FRAME_DISK_WRITER_MODE") != 0 || !rawMode) {
+        return true;
+    }
+
+    std::string mode = rawMode;
+    std::free(rawMode);
+    std::transform(
+        mode.begin(),
+        mode.end(),
+        mode.begin(),
+        [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+
+    return mode != "sync" && mode != "disabled" && mode != "off";
+}
+
+#ifdef _WIN32
+
+// Media Foundation / COM
+#include <windows.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <wrl/client.h>
+
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mfreadwrite.lib")
+#pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "wmcodecdspuuid.lib")
+
+#include <opencv2/imgproc.hpp>
+
+
+
+
+
+
+
+// Helper: where we drop 10s clips for real-time inference
+static std::filesystem::path getInferenceTempDirForCamera(const std::string& cameraId)
+{
+    // On Windows this is typically: C:\Users\<user>\AppData\Local\Temp
+    std::filesystem::path base = AppBrand::inferenceLoopTempRoot();
+    base /= "cam_" + cameraId;
+    return base;
+}
+
+// Helper: copy a finished 10s clip to the inference temp folder
+static bool copyTenSecondClipToInferenceTemp(
+    const std::string& cameraId,
+    const std::string& srcPath
+)
+{
+    try {
+        auto dir = getInferenceTempDirForCamera(cameraId);
+
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec) {
+            Logger::instance().logDebug(
+                cameraId,
+                "FrameDiskWriter: create_directories inference temp failed: " +
+                ec.message()
+            );
+            return false;
+        }
+
+        std::filesystem::path dst = dir / std::filesystem::path(srcPath).filename();
+        std::filesystem::path dstTmp = dst;
+        dstTmp += ".tmp";
+
+        std::filesystem::copy_file(
+            srcPath,
+            dstTmp,
+            std::filesystem::copy_options::overwrite_existing,
+            ec
+        );
+        if (ec) {
+            Logger::instance().logDebug(
+                cameraId,
+                "FrameDiskWriter: copy 10s clip to inference temp failed: " +
+                ec.message() + " | src=" + srcPath + " | dst=" + dstTmp.string()
+            );
+            return false;
+        }
+
+        std::filesystem::rename(dstTmp, dst, ec);
+        if (ec) {
+            std::filesystem::remove(dstTmp, ec);
+            Logger::instance().logDebug(
+                cameraId,
+                "FrameDiskWriter: rename inference temp tmp->final failed: " +
+                ec.message() + " | tmp=" + dstTmp.string() + " | dst=" + dst.string()
+            );
+            return false;
+        }
+
+        Logger::instance().logDebug(
+            cameraId,
+            "FrameDiskWriter: copied 10s clip to inference temp: " + dst.string()
+        );
+        return true;
+    }
+    catch (const std::exception& ex) {
+        Logger::instance().logDebug(
+            cameraId,
+            std::string("FrameDiskWriter: exception while copying 10s clip to inference temp: ") +
+            ex.what()
+        );
+    }
+    return false;
+}
+
+
+
+
+
+static std::filesystem::path getInferenceImagesTempDirForCamera(const std::string& cameraId)
+{
+    return getInferenceTempDirForCamera(cameraId) / "images";
+}
+
+static bool writeImageBytesAtomicToDir(
+    const std::string& cameraId,
+    const std::filesystem::path& dir,
+    const std::string& fileName,
+    const std::vector<uchar>& imageBytes,
+    const std::string& context
+)
+{
+    try {
+        if (imageBytes.empty()) return false;
+
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec) {
+            Logger::instance().logDebug(
+                cameraId,
+                context + ": create_directories failed: " + ec.message() + " dir=" + dir.string()
+            );
+            return false;
+        }
+
+        std::filesystem::path finalPath = dir / fileName;
+        std::filesystem::path tmpPath = finalPath;
+        tmpPath += ".tmp";
+
+        {
+            std::ofstream ofs(tmpPath, std::ios::binary | std::ios::trunc);
+            if (!ofs) {
+                Logger::instance().logDebug(
+                    cameraId,
+                    context + ": failed opening temp image path: " + tmpPath.string()
+                );
+                return false;
+            }
+            ofs.write(reinterpret_cast<const char*>(imageBytes.data()), static_cast<std::streamsize>(imageBytes.size()));
+            if (!ofs) {
+                Logger::instance().logDebug(
+                    cameraId,
+                    context + ": failed writing temp image path: " + tmpPath.string()
+                );
+                ofs.close();
+                std::filesystem::remove(tmpPath, ec);
+                return false;
+            }
+        }
+
+        std::filesystem::rename(tmpPath, finalPath, ec);
+        if (ec) {
+            std::filesystem::remove(tmpPath, ec);
+            Logger::instance().logDebug(
+                cameraId,
+                context + ": rename temp image failed: " + ec.message() +
+                " tmp=" + tmpPath.string() + " final=" + finalPath.string()
+            );
+            return false;
+        }
+
+        Logger::instance().logDebug(
+            cameraId,
+            context + ": wrote image snapshot " + finalPath.string()
+        );
+        return true;
+    }
+    catch (const std::exception& ex) {
+        Logger::instance().logDebug(
+            cameraId,
+            context + ": exception writing image snapshot: " + ex.what()
+        );
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            cameraId,
+            context + ": unknown exception writing image snapshot"
+        );
+    }
+    return false;
+}
+
+// JOBS
+
+static std::filesystem::path getJobsTempDirForJobStepCamera(int jobId, int stepId, const std::string& cameraId)
+{
+    std::filesystem::path base = AppBrand::jobsInferenceTempRoot();
+    base /= ("Job_" + std::to_string(jobId));
+    base /= ("step_" + std::to_string(stepId));
+    base /= ("cam_" + cameraId);
+    return base;
+}
+
+static std::filesystem::path getJobsImagesTempDirForJobStepCamera(int jobId, int stepId, const std::string& cameraId)
+{
+    return getJobsTempDirForJobStepCamera(jobId, stepId, cameraId) / "images";
+}
+
+/*
+static std::filesystem::path getJobsTempDirForJobCamera(int jobId, const std::string& cameraId)
+{
+    std::filesystem::path base = AppBrand::jobsInferenceTempRoot();
+    base /= ("Job_" + std::to_string(jobId));
+    base /= ("cam_" + cameraId);
+    return base;
+}
+*/
+
+static bool copyTenSecondClipToJobsTemp(
+    int jobId,
+    int stepId,
+    const std::string& cameraId,
+    const std::string& srcPath
+)
+{
+    try {
+        auto dir = getJobsTempDirForJobStepCamera(jobId, stepId, cameraId);
+
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec) {
+            Logger::instance().logDebug(cameraId, "create_directories jobs temp failed: " + ec.message());
+            return false;
+        }
+
+        std::filesystem::path dstFinal = dir / std::filesystem::path(srcPath).filename();
+        std::filesystem::path dstTmp = dstFinal;
+        dstTmp += ".tmp";
+
+        std::filesystem::copy_file(srcPath, dstTmp,
+            std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            Logger::instance().logDebug(cameraId, "copy 10s clip to jobs temp failed: " + ec.message());
+            return false;
+        }
+
+        std::filesystem::rename(dstTmp, dstFinal, ec);
+        if (ec) {
+            std::filesystem::remove(dstTmp, ec);
+            Logger::instance().logDebug(cameraId, "rename jobs temp tmp->final failed: " + ec.message());
+            return false;
+        }
+
+        Logger::instance().logDebug(cameraId,
+            "copied 10s clip to jobs temp: " + dstFinal.string());
+        return true;
+    }
+    catch (const std::exception& ex) {
+        Logger::instance().logDebug(cameraId,
+            std::string("exception while copying 10s clip to jobs temp: ") + ex.what());
+    }
+    return false;
+}
+
+
+//void FrameDiskWriter::setJobsCopyJobIdsProvider(std::function<std::vector<int>()> provider) {
+    //jobsJobIdsProvider_ = std::move(provider);
+//}
+
+void FrameDiskWriter::setJobsCopyTargetsProvider(std::function<std::vector<JobsCopyTarget>()> provider) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
+    jobsTargetsProvider_ = std::move(provider);
+}
+
+void FrameDiskWriter::setInferenceCopyEnabledProvider(std::function<bool()> provider) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
+    inferenceCopyEnabledProvider_ = std::move(provider);
+}
+
+void FrameDiskWriter::setInferenceImageCopyEnabledProvider(std::function<bool()> provider) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
+    inferenceImageCopyEnabledProvider_ = std::move(provider);
+}
+
+void FrameDiskWriter::setForceVideoCaptureProvider(std::function<bool()> provider) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
+    forceVideoCaptureProvider_ = std::move(provider);
+}
+
+FrameDiskWriter::IoTelemetrySnapshot FrameDiskWriter::getIoTelemetrySnapshot() const
+{
+    IoTelemetrySnapshot snapshot;
+    snapshot.bytesWrittenTotal = telemetryBytesWrittenTotal_.load(std::memory_order_relaxed);
+    snapshot.writeLatencyTotalUs = telemetryWriteLatencyTotalUs_.load(std::memory_order_relaxed);
+    snapshot.writeOperations = telemetryWriteOperations_.load(std::memory_order_relaxed);
+    return snapshot;
+}
+
+void FrameDiskWriter::recordWriteTelemetry_(std::uint64_t bytesWritten, std::uint64_t latencyUs)
+{
+    if (bytesWritten > 0) {
+        telemetryBytesWrittenTotal_.fetch_add(bytesWritten, std::memory_order_relaxed);
+    }
+    if (latencyUs > 0) {
+        telemetryWriteLatencyTotalUs_.fetch_add(latencyUs, std::memory_order_relaxed);
+    }
+    telemetryWriteOperations_.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool FrameDiskWriter::shouldEmitImageSnapshotOnlyNow() const
+{
+    std::lock_guard<std::mutex> lk(writerMutex_);
+    if (!enabled_) return false;
+
+    const auto now = Clock::now();
+    if (!canSaveNow_(now)) return false;
+
+    bool shouldCopyInferenceVideo = true;
+    if (inferenceCopyEnabledProvider_) {
+        try {
+            shouldCopyInferenceVideo = inferenceCopyEnabledProvider_();
+        }
+        catch (...) {
+            shouldCopyInferenceVideo = true;
+        }
+    }
+
+    bool shouldCopyInferenceImage = false;
+    if (inferenceImageCopyEnabledProvider_) {
+        try {
+            shouldCopyInferenceImage = inferenceImageCopyEnabledProvider_();
+        }
+        catch (...) {
+            shouldCopyInferenceImage = false;
+        }
+    }
+
+    bool forceVideoCapture = false;
+    if (forceVideoCaptureProvider_) {
+        try {
+            forceVideoCapture = forceVideoCaptureProvider_();
+        }
+        catch (...) {
+            forceVideoCapture = false;
+        }
+    }
+
+    std::vector<JobsCopyTarget> jobsTargets;
+    if (jobsTargetsProvider_) {
+        try {
+            jobsTargets = jobsTargetsProvider_();
+        }
+        catch (...) {
+            jobsTargets.clear();
+        }
+    }
+
+    bool hasJobsVideoDemand = false;
+    bool hasJobsImageDemand = false;
+    for (const auto& t : jobsTargets) {
+        if (t.jobId <= 0 || t.stepId <= 0) continue;
+        hasJobsVideoDemand = hasJobsVideoDemand || t.copyVideo;
+        hasJobsImageDemand = hasJobsImageDemand || t.copyImage;
+    }
+
+    const bool hasImageDemand = shouldCopyInferenceImage || hasJobsImageDemand;
+    const bool hasProfileVideoDemand = capture10Enabled_ || capture60Enabled_;
+    const bool hasVideoDemand =
+        hasProfileVideoDemand || forceVideoCapture || shouldCopyInferenceVideo || hasJobsVideoDemand;
+    const bool runImageOnly = hasImageDemand && !hasVideoDemand;
+    if (!runImageOnly) return false;
+
+    if (lastImageSnapshotSaved_.time_since_epoch().count() != 0 &&
+        (now - lastImageSnapshotSaved_) < imageSnapshotInterval_) {
+        return false;
+    }
+
+    return true;
+}
+
+
+
+/*
+static std::filesystem::path getJobsTempDirForCamera(const std::string& cameraId)
+{
+    std::filesystem::path base = AppBrand::jobsInferenceTempRoot();
+    base /= "cam_" + cameraId;
+    return base;
+}
+*/
+
+/*
+static void copyTenSecondClipToJobsTemp(
+    const std::string& cameraId,
+    const std::string& srcPath
+)
+{
+    try {
+        auto dir = getJobsTempDirForCamera(cameraId);
+
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec) {
+            Logger::instance().logDebug(cameraId, "create_directories jobs temp failed: " + ec.message());
+            return;
+        }
+
+        std::filesystem::path dstFinal = dir / std::filesystem::path(srcPath).filename();
+        std::filesystem::path dstTmp = dstFinal;
+        dstTmp += ".tmp";
+
+        // copy -> tmp
+        std::filesystem::copy_file(srcPath, dstTmp,
+            std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            Logger::instance().logDebug(cameraId, "copy 10s clip to jobs temp failed: " + ec.message());
+            return;
+        }
+
+        // rename tmp -> final (atomic-ish)
+        std::filesystem::rename(dstTmp, dstFinal, ec);
+        if (ec) {
+            // cleanup tmp if rename failed
+            std::filesystem::remove(dstTmp, ec);
+            Logger::instance().logDebug(cameraId, "rename jobs temp tmp->final failed: " + ec.message());
+            return;
+        }
+
+        Logger::instance().logDebug(cameraId, "copied 10s clip to jobs temp: " + dstFinal.string());
+    }
+    catch (const std::exception& ex) {
+        Logger::instance().logDebug(cameraId,
+            std::string("exception while copying 10s clip to jobs temp: ") + ex.what());
+    }
+}
+*/
+
+
+
+
+
+
+
+#ifdef _WIN32
+
+static std::wstring getExecutableDirW()
+{
+    wchar_t buffer[MAX_PATH];
+    DWORD len = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+    if (len == 0) {
+        return L"";
+    }
+    std::filesystem::path exePath(buffer);
+    return exePath.parent_path().wstring();
+}
+
+#endif
+
+
+
+
+#ifdef _WIN32
+#include <fstream>
+
+// Run: ffmpeg -y -safe 0 -f concat -i list.txt -c copy out.mp4
+// inputFiles must be in the desired order.
+static bool runFfmpegConcat(const std::vector<std::string>& inputFiles,
+    const std::string& outputFile,
+    const std::string& cameraIdForLog)
+{
+    if (inputFiles.empty()) return false;
+
+    try {
+        // Make output path absolute and ensure directory exists
+        fs::path outPath = fs::absolute(outputFile);
+        fs::path dir = outPath.parent_path();
+        fs::create_directories(dir);
+
+        // Build a small, almost-unique temp list file name
+        auto now = std::chrono::system_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+
+        fs::path listPath = dir / ("ffconcat_" + std::to_string(ms) + ".txt");
+
+        // Write concat list
+        std::ofstream ofs(listPath);
+        if (!ofs.is_open()) {
+            Logger::instance().logDebug(
+                cameraIdForLog,
+                "runFfmpegConcat: failed to open list file " + listPath.string()
+            );
+            return false;
+        }
+
+        // concat demuxer format: one line per file
+        // We MUST use absolute, normalized paths so ffmpeg can find them
+        for (const auto& f : inputFiles) {
+            fs::path absPath = fs::absolute(f);          // avoid name clash with ::abs
+            // convert backslashes to forward slashes for ffmpeg
+            std::string normalized = absPath.string();   // or absPath.u8string() if you prefer
+            for (char& c : normalized) {
+                if (c == '\\') c = '/';
+            }
+
+            ofs << "file '" << normalized << "'\n";
+        }
+        ofs.close();
+
+
+        /*
+        // Build command line; ffmpeg must be in PATH
+        
+        std::wstring listW = listPath.wstring();
+        std::wstring outW = outPath.wstring();
+
+        std::wstring cmdLine =
+            L"\"ffmpeg\" -y -safe 0 -f concat -i \"" + listW +
+            L"\" -c copy \"" + outW + L"\"";
+        */
+
+
+        std::wstring listW = listPath.wstring();
+        std::wstring outW = outPath.wstring();
+
+        // Build ffmpeg path: prefer bundled ffmpeg.exe next to Perceptrum.exe
+        std::wstring exeDirW = getExecutableDirW();
+        std::wstring ffmpegCmdW;
+
+        if (!exeDirW.empty()) {
+            // "C:\...\Perceptrum\ffmpeg.exe"
+            ffmpegCmdW = L"\"" + exeDirW + L"\\ffmpeg.exe\"";
+        }
+        else {
+            // Fallback: use PATH
+            ffmpegCmdW = L"\"ffmpeg\"";
+        }
+
+        // Build command line
+        /*
+        std::wstring cmdLine =
+            ffmpegCmdW +
+            L" -y -safe 0 -f concat -i \"" + listW +
+            L"\" -c copy \"" + outW + L"\"";
+        */
+        
+        std::wstring cmdLine =
+            ffmpegCmdW +
+            L" -y -safe 0 -f concat -i \"" + listW + L"\""
+            L" -map 0:v:0 -c:v copy -an -sn -dn"
+            L" \"" + outW + L"\"";
+
+
+
+        STARTUPINFOEXW si;
+        ZeroMemory(&si, sizeof(si));
+        si.StartupInfo.cb = sizeof(si);
+        si.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
+        si.StartupInfo.wShowWindow = SW_HIDE;
+
+        PROCESS_INFORMATION pi;
+        ZeroMemory(&pi, sizeof(pi));
+
+        std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+        cmdBuf.push_back(L'\0');
+
+        BOOL ok = CreateProcessW(
+            nullptr,            // application name (use command line)
+            cmdBuf.data(),      // command line
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_NO_WINDOW,   // no console window pops up
+            nullptr,
+            nullptr,
+            &si.StartupInfo,
+            &pi
+        );
+
+        if (!ok) {
+            Logger::instance().logDebug(
+                cameraIdForLog,
+                "runFfmpegConcat: CreateProcessW failed"
+            );
+            std::error_code ec;
+            fs::remove(listPath, ec);
+            return false;
+        }
+        /*
+        WaitForSingleObject(pi.hProcess, INFINITE);
+
+        DWORD exitCode = 1;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+
+        std::error_code ec;
+        fs::remove(listPath, ec);
+
+        if (exitCode != 0) {
+            Logger::instance().logDebug(
+                cameraIdForLog,
+                "runFfmpegConcat: ffmpeg exited with code " +
+                std::to_string(exitCode)
+            );
+            return false;
+        }
+
+        return true;
+        */
+
+
+        // Wait for ffmpeg to finish (max 5 seconds)
+        constexpr DWORD kFfmpegTimeoutMs = 5000;
+        DWORD waitRes = WaitForSingleObject(pi.hProcess, kFfmpegTimeoutMs);
+
+        if (waitRes == WAIT_TIMEOUT) {
+            Logger::instance().logDebug(
+                cameraIdForLog,
+                "runFfmpegConcat: ffmpeg TIMEOUT after 5s -> terminating process"
+            );
+
+            if (!TerminateProcess(pi.hProcess, 124)) {
+                DWORD terr = GetLastError();
+                Logger::instance().logDebug(
+                    cameraIdForLog,
+                    "runFfmpegConcat: TerminateProcess failed, GetLastError=" + std::to_string(terr)
+                );
+            }
+
+            // Give it a moment to actually exit
+            WaitForSingleObject(pi.hProcess, 2000);
+
+            // Cleanup handles
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+
+            // Remove concat list file
+            std::error_code ec;
+            fs::remove(listPath, ec);
+
+            return false;
+        }
+        else if (waitRes != WAIT_OBJECT_0) {
+            DWORD werr = GetLastError();
+            Logger::instance().logDebug(
+                cameraIdForLog,
+                "runFfmpegConcat: WaitForSingleObject failed, GetLastError=" + std::to_string(werr)
+            );
+
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+
+            std::error_code ec;
+            fs::remove(listPath, ec);
+
+            return false;
+        }
+
+        // Process exited normally -> read exit code
+        DWORD exitCode = 1;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+
+        // Remove concat list file
+        std::error_code ec;
+        fs::remove(listPath, ec);
+
+        if (exitCode != 0) {
+            Logger::instance().logDebug(
+                cameraIdForLog,
+                "runFfmpegConcat: ffmpeg exited with code " + std::to_string(exitCode)
+            );
+            return false;
+        }
+
+        return true;
+
+
+
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            cameraIdForLog,
+            "runFfmpegConcat: exception thrown"
+        );
+        return false;
+    }
+}
+#endif
+
+
+
+
+using Microsoft::WRL::ComPtr;
+
+/*
+static void ensureMediaFoundationInitialized()
+{
+    static std::once_flag g_initFlag;
+
+    std::call_once(g_initFlag, []() {
+        // COM for this process (multi-threaded)
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+            // If COM already initialized in different mode, just continue.
+        }
+
+        hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+        if (FAILED(hr)) {
+            // If MF fails, log error
+            Logger::instance().logDebug("FrameDiskWriter",
+                "MFStartup failed: " + std::to_string(hr));
+        }
+        });
+}
+*/
+
+
+
+#ifdef _WIN32
+static void ensureMediaFoundationInitialized()
+{
+    // 1) COM is per-thread
+    thread_local bool tl_comInited = false;
+    if (!tl_comInited) {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        // RPC_E_CHANGED_MODE is "already initialized in a different apartment" (still usable)
+        if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+            // If COM init fails, MF calls can be unsafe; at least log once.
+            try {
+                Logger::instance().logDebug("FrameDiskWriter", "CoInitializeEx failed hr=" + std::to_string(hr));
+            }
+            catch (...) {}
+        }
+        tl_comInited = true;
+    }
+
+    // 2) MFStartup is process-wide (call once)
+    static std::once_flag mfFlag;
+    std::call_once(mfFlag, []() {
+        HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+        if (FAILED(hr)) {
+            try {
+                Logger::instance().logDebug("FrameDiskWriter", "MFStartup failed hr=" + std::to_string(hr));
+            }
+            catch (...) {}
+        }
+        });
+}
+#endif
+
+
+
+
+// Utility: UTF-8 std::string -> std::wstring
+static std::wstring utf8ToWide(const std::string& s)
+{
+    if (s.empty()) return std::wstring();
+
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    if (len <= 0) return std::wstring();
+
+    std::wstring w;
+    w.resize(static_cast<size_t>(len - 1));
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], len);
+    return w;
+}
+
+// Nested encoder implementation
+struct FrameDiskWriter::SegmentWriter::MfEncoder {
+    ComPtr<IMFSinkWriter> sinkWriter;
+    DWORD streamIndex{ 0 };
+    cv::Mat bgraScratch;
+    ComPtr<IMFMediaBuffer> mediaBuffer;
+    ComPtr<IMFSample> sample;
+    DWORD mediaBufferSize{ 0 };
+};
+
+#endif // _WIN32
+
+FrameDiskWriter::FrameDiskWriter(
+    const std::string& cameraId,
+    const std::string& baseDir,
+    bool enabled,
+    std::chrono::milliseconds minInterval,
+    std::chrono::seconds timeOffset,
+    double outputFps,
+    int retentionDays,
+    bool hydrateExistingSegments
+)
+    : cameraId_(cameraId),
+    baseDir_(baseDir),
+    enabled_(enabled),
+    minInterval_(minInterval),
+    timeOffset_(timeOffset),
+    fps_(outputFps),
+    retentionDays_(retentionDays > 0 ? retentionDays : 0),
+    hydrateExistingSegments_(hydrateExistingSegments),
+    asyncWorkerEnabled_(readFrameDiskWriterAsyncModeEnabled_())
+{
+    lastSaved_ = Clock::now() - minInterval_;
+    lastSaved10_ = lastSaved_;
+    lastSaved60_ = lastSaved_;
+
+    if (hydrateExistingSegments_) {
+        initializeFromDisk_();
+    }
+    else {
+        Logger::instance().logDebug(
+            cameraId_,
+            "FrameDiskWriter: starting with a clean in-memory clip queue"
+        );
+    }
+    if (asyncWorkerEnabled_) {
+        workerThread_ = std::thread(&FrameDiskWriter::workerLoop_, this);
+        Logger::instance().logDebug(cameraId_, "FrameDiskWriter: async worker enabled");
+    }
+    else {
+        Logger::instance().logDebug(cameraId_, "FrameDiskWriter: async worker disabled by FRAME_DISK_WRITER_MODE");
+    }
+}
+
+FrameDiskWriter::~FrameDiskWriter()
+{
+    try {
+        if (asyncWorkerEnabled_) {
+            beginSynchronousWorkerBarrier_(true);
+            {
+                std::lock_guard<std::mutex> lk(writerMutex_);
+                forceFinalizeAllOpenClipsLocked_("writer_shutdown");
+            }
+            endSynchronousWorkerBarrier_();
+        }
+        else {
+            std::lock_guard<std::mutex> lk(writerMutex_);
+            forceFinalizeAllOpenClipsLocked_("writer_shutdown");
+        }
+    }
+    catch (...) {
+        Logger::instance().logDebug(cameraId_, "FrameDiskWriter: destructor finalize failed");
+    }
+
+    if (asyncWorkerEnabled_) {
+        {
+            std::lock_guard<std::mutex> lk(workerStateMutex_);
+            workerStopRequested_ = true;
+            workerPauseRequested_ = false;
+            dropAsyncSavesWhilePaused_ = false;
+            pendingFrameReady_ = false;
+            pendingFlushRequested_ = false;
+        }
+        workerCv_.notify_all();
+        workerIdleCv_.notify_all();
+        if (workerThread_.joinable()) {
+            workerThread_.join();
+        }
+    }
+}
+
+void FrameDiskWriter::setEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
+    enabled_ = enabled;
+}
+
+void FrameDiskWriter::setMinInterval(std::chrono::milliseconds interval) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
+    minInterval_ = interval;
+}
+
+void FrameDiskWriter::setOutputFps(double fps) {
+    setCaptureProfiles({ VideoCaptureProfile{ 10, normalizeClipFps_(fps) } });
+}
+
+void FrameDiskWriter::setCaptureProfiles(const std::vector<VideoCaptureProfile>& profiles) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
+    int new10Fps = 0;
+    int new60Fps = 0;
+
+    for (const auto& profile : profiles) {
+        const int normalizedSeconds = (profile.clipSeconds > 10) ? 60 : 10;
+        const int normalizedFps = normalizeClipFps_(profile.fps);
+        if (normalizedSeconds == 60) {
+            new60Fps = (std::max)(new60Fps, normalizedFps);
+        }
+        else {
+            new10Fps = (std::max)(new10Fps, normalizedFps);
+        }
+    }
+
+    if ((capture10Enabled_ && new10Fps != capture10Fps_) || (!capture10Enabled_ && new10Fps > 0) ||
+        (capture10Enabled_ && new10Fps == 0))
+    {
+        discardOpenClip_(
+            writer10_,
+            framesIn10_,
+            tenSecondPaths_,
+            lastVideoFrameWriteAt10_,
+            lastVideoFrameWriteTp10_,
+            hasLastVideoFrameWriteTp10_
+        );
+        lastVideoFrameWallTime10_ = std::chrono::system_clock::time_point{};
+        hasLastVideoFrameWallTime10_ = false;
+    }
+
+    if ((capture60Enabled_ && new60Fps != capture60Fps_) || (!capture60Enabled_ && new60Fps > 0) ||
+        (capture60Enabled_ && new60Fps == 0))
+    {
+        discardOpenClip_(
+            writer60_,
+            framesIn60_,
+            sixtySecondPaths_,
+            lastVideoFrameWriteAt60_,
+            lastVideoFrameWriteTp60_,
+            hasLastVideoFrameWriteTp60_
+        );
+        lastVideoFrameWallTime60_ = std::chrono::system_clock::time_point{};
+        hasLastVideoFrameWallTime60_ = false;
+    }
+
+    capture10Enabled_ = new10Fps > 0;
+    capture60Enabled_ = new60Fps > 0;
+    capture10Fps_ = capture10Enabled_ ? new10Fps : 0;
+    capture60Fps_ = capture60Enabled_ ? new60Fps : 0;
+
+    if (capture10Enabled_) {
+        minInterval10_ = intervalForFps_(capture10Fps_);
+        fps_ = static_cast<double>(capture10Fps_);
+        minInterval_ = minInterval10_;
+    }
+    else {
+        minInterval10_ = std::chrono::milliseconds(0);
+    }
+
+    if (capture60Enabled_) {
+        minInterval60_ = intervalForFps_(capture60Fps_);
+    }
+    else {
+        minInterval60_ = std::chrono::milliseconds(0);
+    }
+}
+
+void FrameDiskWriter::workerLoop_()
+{
+    while (true) {
+        bool shouldSave = false;
+        bool shouldFlush = false;
+        std::chrono::milliseconds flushThreshold{ 0 };
+
+        {
+            std::unique_lock<std::mutex> lk(workerStateMutex_);
+            workerCv_.wait(lk, [this]() {
+                return workerStopRequested_ ||
+                    pendingFrameReady_ ||
+                    pendingFlushRequested_ ||
+                    workerPauseRequested_;
+            });
+
+            if (workerStopRequested_) {
+                break;
+            }
+
+            if (workerPauseRequested_ && !pendingFrameReady_ && !pendingFlushRequested_) {
+                workerIdleCv_.notify_all();
+                workerCv_.wait(lk, [this]() {
+                    return workerStopRequested_ || !workerPauseRequested_;
+                });
+                if (workerStopRequested_) {
+                    break;
+                }
+            }
+
+            if (workerPauseRequested_ && !pendingFrameReady_ && !pendingFlushRequested_) {
+                continue;
+            }
+
+            shouldSave = pendingFrameReady_;
+            if (shouldSave) {
+                std::swap(pendingFrameBuffer_, workerFrameBuffer_);
+                pendingFrameReady_ = false;
+            }
+
+            shouldFlush = pendingFlushRequested_;
+            flushThreshold = pendingFlushIdleThreshold_;
+            pendingFlushRequested_ = false;
+            pendingFlushIdleThreshold_ = std::chrono::milliseconds(0);
+            workerActive_ = shouldSave || shouldFlush;
+        }
+
+        try {
+            if (shouldSave) {
+                std::lock_guard<std::mutex> lk(writerMutex_);
+                saveLocked_(workerFrameBuffer_);
+            }
+            if (shouldFlush) {
+                std::lock_guard<std::mutex> lk(writerMutex_);
+                flushVideoClipIfIdleLocked_(flushThreshold);
+            }
+        }
+        catch (const std::exception& ex) {
+            Logger::instance().logDebug(
+                cameraId_,
+                std::string("FrameDiskWriter worker exception: ") + ex.what()
+            );
+        }
+        catch (...) {
+            Logger::instance().logDebug(cameraId_, "FrameDiskWriter worker unknown exception");
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(workerStateMutex_);
+            workerActive_ = false;
+            if (!pendingFrameReady_ && !pendingFlushRequested_) {
+                workerIdleCv_.notify_all();
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(workerStateMutex_);
+        workerActive_ = false;
+    }
+    workerIdleCv_.notify_all();
+}
+
+void FrameDiskWriter::beginSynchronousWorkerBarrier_(bool dropAsyncSaves)
+{
+    if (!asyncWorkerEnabled_) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> lk(workerStateMutex_);
+    workerPauseRequested_ = true;
+    if (dropAsyncSaves) {
+        dropAsyncSavesWhilePaused_ = true;
+    }
+    workerCv_.notify_one();
+    workerIdleCv_.wait(lk, [this]() {
+        return !workerActive_ && !pendingFrameReady_ && !pendingFlushRequested_;
+    });
+}
+
+void FrameDiskWriter::endSynchronousWorkerBarrier_()
+{
+    if (!asyncWorkerEnabled_) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(workerStateMutex_);
+        dropAsyncSavesWhilePaused_ = false;
+        workerPauseRequested_ = false;
+    }
+    workerCv_.notify_one();
+}
+
+FrameDiskWriter::RetentionSweepStats FrameDiskWriter::runRetentionCleanupNow(
+    const std::string& cameraId,
+    const std::string& baseDir,
+    int retentionDays)
+{
+    RetentionSweepStats stats;
+    if (retentionDays <= 0) {
+        return stats;
+    }
+
+    const auto nowSys = std::chrono::system_clock::now();
+    const auto cutoff =
+        nowSys - std::chrono::hours(24LL * static_cast<long long>(retentionDays));
+    const fs::path root = fs::path(baseDir) / ("cam_" + cameraId);
+
+    std::error_code ec;
+    if (!fs::exists(root, ec) || ec) {
+        return stats;
+    }
+
+    std::vector<fs::path> directories;
+    fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+    fs::recursive_directory_iterator end;
+    if (ec) {
+        return stats;
+    }
+
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+
+        const auto& entry = *it;
+        if (entry.is_directory(ec) && !ec) {
+            directories.push_back(entry.path());
+            continue;
+        }
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        if (!entry.is_regular_file(ec) || ec) {
+            ec.clear();
+            continue;
+        }
+
+        const fs::path path = entry.path();
+        std::string ext = path.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (ext != ".mp4") continue;
+
+        ++stats.scannedFiles;
+
+        std::chrono::system_clock::time_point clipEndTs;
+        bool hasTs = false;
+
+        std::string parsedCameraId;
+        std::string startDate;
+        std::string startTime;
+        std::string endDate;
+        std::string endTime;
+        if (parseClipNameParts(
+            path.filename().string(),
+            parsedCameraId,
+            startDate,
+            startTime,
+            endDate,
+            endTime))
+        {
+            if (parseClipLocalTimestamp_(endDate, endTime, clipEndTs)) {
+                hasTs = true;
+                ++stats.parsedByNameTimestamp;
+            }
+        }
+
+        if (!hasTs) {
+            auto ft = entry.last_write_time(ec);
+            if (!ec) {
+                clipEndTs = fileTimeToSystemClock_(ft);
+                hasTs = true;
+                ++stats.parsedByFileTime;
+            }
+            else {
+                ec.clear();
+            }
+        }
+
+        if (!hasTs) {
+            ++stats.failed;
+            continue;
+        }
+
+        if (clipEndTs < cutoff) {
+            fs::remove(path, ec);
+            if (ec) {
+                ++stats.failed;
+                ec.clear();
+            }
+            else {
+                ++stats.deletedFiles;
+            }
+        }
+    }
+
+    std::sort(directories.begin(), directories.end(), [](const fs::path& a, const fs::path& b) {
+        return a.native().size() > b.native().size();
+    });
+
+    for (const auto& dir : directories) {
+        if (dir == root) continue;
+
+        std::error_code dirEc;
+        if (!fs::exists(dir, dirEc) || dirEc) {
+            dirEc.clear();
+            continue;
+        }
+        if (!fs::is_directory(dir, dirEc) || dirEc) {
+            dirEc.clear();
+            continue;
+        }
+        if (!fs::is_empty(dir, dirEc) || dirEc) {
+            dirEc.clear();
+            continue;
+        }
+
+        fs::remove(dir, dirEc);
+        if (dirEc) {
+            ++stats.failed;
+            dirEc.clear();
+        }
+        else {
+            ++stats.prunedDirectories;
+        }
+    }
+
+    return stats;
+}
+
+void FrameDiskWriter::runRetentionCleanupIfDue() {
+    if (retentionDays_ <= 0) return;
+
+    constexpr auto kSweepInterval = std::chrono::hours(1);
+    auto nowSteady = Clock::now();
+    if (lastRetentionSweep_.time_since_epoch().count() != 0 &&
+        (nowSteady - lastRetentionSweep_) < kSweepInterval) {
+        return;
+    }
+    lastRetentionSweep_ = nowSteady;
+
+    const RetentionSweepStats stats =
+        FrameDiskWriter::runRetentionCleanupNow(cameraId_, baseDir_, retentionDays_);
+
+    Logger::instance().logDebug(
+        cameraId_,
+        "FrameDiskWriter: retention sweep days=" + std::to_string(retentionDays_) +
+        " scanned=" + std::to_string(stats.scannedFiles) +
+        " deleted=" + std::to_string(stats.deletedFiles) +
+        " byNameTs=" + std::to_string(stats.parsedByNameTimestamp) +
+        " byFileTime=" + std::to_string(stats.parsedByFileTime) +
+        " prunedDirs=" + std::to_string(stats.prunedDirectories) +
+        " failed=" + std::to_string(stats.failed)
+    );
+}
+
+bool FrameDiskWriter::canSaveNow_(Clock::time_point now) const {
+    if (!enabled_) return false;
+    const bool due10 =
+        capture10Enabled_ &&
+        (minInterval10_.count() <= 0 || (now - lastSaved10_) >= minInterval10_);
+    const bool due60 =
+        capture60Enabled_ &&
+        (minInterval60_.count() <= 0 || (now - lastSaved60_) >= minInterval60_);
+    if (!capture10Enabled_ && !capture60Enabled_) {
+        const auto activeInterval = activeMinInterval_();
+        if (activeInterval.count() <= 0) return true;
+        return (now - lastSaved_) >= activeInterval;
+    }
+    return due10 || due60;
+}
+
+std::chrono::milliseconds FrameDiskWriter::activeMinInterval_() const {
+    std::chrono::milliseconds best = (std::chrono::milliseconds::max)();
+    if (capture10Enabled_ && minInterval10_.count() > 0) {
+        best = (std::min)(best, minInterval10_);
+    }
+    if (capture60Enabled_ && minInterval60_.count() > 0) {
+        best = (std::min)(best, minInterval60_);
+    }
+    if (best == (std::chrono::milliseconds::max)()) {
+        return minInterval_;
+    }
+    return best;
+}
+
+double FrameDiskWriter::activeClipFps_() const {
+    if (capture10Enabled_ && capture10Fps_ > 0) {
+        return static_cast<double>(capture10Fps_);
+    }
+    if (capture60Enabled_ && capture60Fps_ > 0) {
+        return static_cast<double>(capture60Fps_);
+    }
+    return fps_;
+}
+
+std::chrono::milliseconds FrameDiskWriter::intervalForFps_(double fps) {
+    const int normalizedFps = normalizeClipFps_(fps);
+    const int intervalMs = (std::max)(1, static_cast<int>(std::llround(1000.0 / static_cast<double>(normalizedFps))));
+    return std::chrono::milliseconds(intervalMs);
+}
+
+int FrameDiskWriter::normalizeClipFps_(double fps) {
+    int rounded = 1;
+    if (std::isfinite(fps)) {
+        rounded = static_cast<int>(std::llround(fps));
+    }
+    if (rounded < 1) rounded = 1;
+    if (rounded > 10) rounded = 10;
+    return rounded;
+}
+
+int FrameDiskWriter::probeClipFps_(const std::string& path) {
+    try {
+        cv::VideoCapture cap(path);
+        if (!cap.isOpened()) return 0;
+        const double fps = cap.get(cv::CAP_PROP_FPS);
+        return normalizeClipFps_(fps);
+    }
+    catch (...) {
+        return 0;
+    }
+}
+
+FrameDiskWriter::TimeParts FrameDiskWriter::getTimeParts_() const {
+    return getTimePartsForSystemTime_(std::chrono::system_clock::now());
+}
+
+FrameDiskWriter::TimeParts FrameDiskWriter::getTimePartsForSystemTime_(
+    const std::chrono::system_clock::time_point& tp) const {
+    using namespace std::chrono;
+    auto ms = duration_cast<milliseconds>(tp.time_since_epoch());
+    std::time_t tt = static_cast<std::time_t>(ms.count() / 1000);
+    int msPart = static_cast<int>(ms.count() % 1000);
+
+    std::tm tmLocal{};
+#ifdef _WIN32
+    localtime_s(&tmLocal, &tt);
+#else
+    localtime_r(&tt, &tmLocal);
+#endif
+    return { tmLocal, msPart };
+}
+
+void FrameDiskWriter::clearSegmentTimeline_(SegmentWriter& writer) {
+    writer.clipStartAt = Clock::time_point{};
+    writer.nextSampleAt = Clock::time_point{};
+    writer.clipStartWallTime = std::chrono::system_clock::time_point{};
+    writer.timelineInitialized = false;
+    writer.heldFrame.release();
+    writer.hasHeldFrame = false;
+}
+
+
+
+
+std::string FrameDiskWriter::ensureBaseDirAndMakePrefix_(const TimeParts& tp) const {
+    // baseDir/cam_<id>/YYYY/MM/DD/
+    std::ostringstream ossDir;
+    ossDir << baseDir_ << "/cam_" << cameraId_ << "/"
+        << std::put_time(&tp.tmLocal, "%Y/%m/%d");
+
+    fs::create_directories(ossDir.str());
+
+    std::ostringstream prefix;
+    prefix << ossDir.str() << "/"
+        << cameraId_ << "_"
+        << std::put_time(&tp.tmLocal, "%Y%m%d_%H%M%S");
+    return prefix.str(); // WITHOUT extension/suffix
+}
+
+
+
+
+
+static std::string hrToHex(HRESULT hr) {
+    std::ostringstream oss;
+    oss << "0x" << std::hex << std::uppercase
+        << static_cast<unsigned long>(hr);
+    return oss.str();
+}
+
+// Logging must never crash your thread (logger can throw if file open fails).
+static void safeLogDebug(const std::string& cameraId, const std::string& msg) noexcept {
+    try {
+        Logger::instance().logDebug(cameraId, msg);
+    }
+    catch (...) {
+        // last-ditch fallback: do nothing (or OutputDebugStringA if you want)
+        // OutputDebugStringA((msg + "\n").c_str());
+    }
+}
+
+
+
+
+
+void FrameDiskWriter::openWriterIfNeeded_(
+    SegmentWriter& w,
+    const std::string& path,
+    const cv::Size& size,
+    double fps,
+    std::chrono::steady_clock::time_point clipStartAt,
+    std::chrono::system_clock::time_point clipStartWallTime)
+{
+    if (w.isOpened()) return;
+
+#ifdef _WIN32
+    try {
+        ensureMediaFoundationInitialized();
+
+        w.path = path;
+        w.width = size.width;
+        w.height = size.height;
+        w.fps = static_cast<double>(normalizeClipFps_(fps));
+        w.frameCount = 0;
+        w.clipStartAt = clipStartAt;
+        w.nextSampleAt = clipStartAt;
+        w.clipStartWallTime = clipStartWallTime;
+        w.timelineInitialized = true;
+
+        safeLogDebug(cameraId_, "FrameDiskWriter: opening MF writer at " + path);
+
+        auto widePath = utf8ToWide(path);
+
+        auto fail = [&](const char* step, HRESULT hr) {
+            safeLogDebug(
+                cameraId_,
+                std::string("FrameDiskWriter: ") + step + " failed hr=" + hrToHex(hr) + " path=" + path
+            );
+            };
+
+        ComPtr<IMFSinkWriter> sink;
+        HRESULT hr = MFCreateSinkWriterFromURL(
+            widePath.c_str(),
+            nullptr,
+            nullptr,
+            &sink
+        );
+        if (FAILED(hr)) { fail("MFCreateSinkWriterFromURL", hr); return; }
+
+        // Output type: H.264
+        ComPtr<IMFMediaType> outType;
+        hr = MFCreateMediaType(&outType);
+        if (FAILED(hr)) { fail("MFCreateMediaType(outType)", hr); return; }
+
+        hr = outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        if (FAILED(hr)) { fail("outType->SetGUID(MF_MT_MAJOR_TYPE)", hr); return; }
+
+        hr = outType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        if (FAILED(hr)) { fail("outType->SetGUID(MF_MT_SUBTYPE H264)", hr); return; }
+
+        hr = outType->SetUINT32(MF_MT_AVG_BITRATE, 2000000);
+        if (FAILED(hr)) { fail("outType->SetUINT32(MF_MT_AVG_BITRATE)", hr); return; }
+
+        hr = outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        if (FAILED(hr)) { fail("outType->SetUINT32(MF_MT_INTERLACE_MODE)", hr); return; }
+
+        hr = MFSetAttributeSize(
+            outType.Get(), MF_MT_FRAME_SIZE,
+            static_cast<UINT32>(w.width),
+            static_cast<UINT32>(w.height)
+        );
+        if (FAILED(hr)) { fail("MFSetAttributeSize(outType frame size)", hr); return; }
+
+        // Frame rate as rational
+        UINT32 frNum = static_cast<UINT32>(w.fps * 1000.0 + 0.5);
+        UINT32 frDen = 1000;
+        if (frNum == 0) { frNum = 1; frDen = 1; }
+
+        hr = MFSetAttributeRatio(outType.Get(), MF_MT_FRAME_RATE, frNum, frDen);
+        if (FAILED(hr)) { fail("MFSetAttributeRatio(outType frame rate)", hr); return; }
+
+        hr = MFSetAttributeRatio(outType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        if (FAILED(hr)) { fail("MFSetAttributeRatio(outType pixel aspect)", hr); return; }
+
+        DWORD streamIndex = 0;
+        hr = sink->AddStream(outType.Get(), &streamIndex);
+        if (FAILED(hr)) { fail("sink->AddStream(outType)", hr); return; }
+
+        // Input type: RGB32
+        ComPtr<IMFMediaType> inType;
+        hr = MFCreateMediaType(&inType);
+        if (FAILED(hr)) { fail("MFCreateMediaType(inType)", hr); return; }
+
+        hr = inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        if (FAILED(hr)) { fail("inType->SetGUID(MF_MT_MAJOR_TYPE)", hr); return; }
+
+        hr = inType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        if (FAILED(hr)) { fail("inType->SetGUID(MF_MT_SUBTYPE RGB32)", hr); return; }
+
+        hr = MFSetAttributeSize(
+            inType.Get(), MF_MT_FRAME_SIZE,
+            static_cast<UINT32>(w.width),
+            static_cast<UINT32>(w.height)
+        );
+        if (FAILED(hr)) { fail("MFSetAttributeSize(inType frame size)", hr); return; }
+
+        hr = MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, frNum, frDen);
+        if (FAILED(hr)) { fail("MFSetAttributeRatio(inType frame rate)", hr); return; }
+
+        hr = MFSetAttributeRatio(inType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        if (FAILED(hr)) { fail("MFSetAttributeRatio(inType pixel aspect)", hr); return; }
+
+        hr = sink->SetInputMediaType(streamIndex, inType.Get(), nullptr);
+        if (FAILED(hr)) { fail("sink->SetInputMediaType", hr); return; }
+
+        hr = sink->BeginWriting();
+        if (FAILED(hr)) { fail("sink->BeginWriting", hr); return; }
+
+        // Store encoder
+        try {
+            w.encoder = new SegmentWriter::MfEncoder();
+        }
+        catch (const std::exception& e) {
+            safeLogDebug(cameraId_, std::string("FrameDiskWriter: new MfEncoder threw: ") + e.what());
+            return;
+        }
+        catch (...) {
+            safeLogDebug(cameraId_, "FrameDiskWriter: new MfEncoder threw unknown exception");
+            return;
+        }
+
+        w.encoder->sinkWriter = sink;
+        w.encoder->streamIndex = streamIndex;
+        w.opened = true;
+
+        safeLogDebug(cameraId_, "FrameDiskWriter: MF writer opened at " + path);
+    }
+    catch (const std::exception& e) {
+        safeLogDebug(cameraId_, std::string("FrameDiskWriter: openWriterIfNeeded_ exception: ") + e.what());
+        // Make sure we don't leave it half-open
+        w.opened = false;
+        w.frameCount = 0;
+    }
+    catch (...) {
+        safeLogDebug(cameraId_, "FrameDiskWriter: openWriterIfNeeded_ unknown exception");
+        w.opened = false;
+        w.frameCount = 0;
+    }
+#else
+    (void)w;
+    (void)path;
+    (void)size;
+    (void)clipStartAt;
+    (void)clipStartWallTime;
+    safeLogDebug(cameraId_, "FrameDiskWriter: Media Foundation writer not available on this platform");
+#endif
+}
+
+
+
+
+
+void FrameDiskWriter::closeWriter_(SegmentWriter& w) {
+    if (!w.isOpened()) return;
+
+#ifdef _WIN32
+    try {
+        if (w.encoder && w.encoder->sinkWriter) {
+            safeLogDebug(cameraId_, "FrameDiskWriter: closing MF writer at " + w.path);
+
+            HRESULT hr = w.encoder->sinkWriter->Finalize();
+            if (FAILED(hr)) {
+                safeLogDebug(
+                    cameraId_,
+                    "FrameDiskWriter: sinkWriter->Finalize failed hr=" + hrToHex(hr) + " path=" + w.path
+                );
+            }
+
+            w.encoder->sinkWriter.Reset();
+        }
+    }
+    catch (const std::exception& e) {
+        safeLogDebug(cameraId_, std::string("FrameDiskWriter: closeWriter_ exception: ") + e.what());
+    }
+    catch (...) {
+        safeLogDebug(cameraId_, "FrameDiskWriter: closeWriter_ unknown exception");
+    }
+
+    // Always clean up pointer even if Finalize/logging misbehaves
+    try {
+        delete w.encoder;
+    }
+    catch (...) {
+        // don't allow destructor issues to kill the thread
+    }
+    w.encoder = nullptr;
+#endif
+
+    w.opened = false;
+    w.frameCount = 0;
+}
+
+
+
+
+
+/*
+void FrameDiskWriter::openWriterIfNeeded_(
+    SegmentWriter& w,
+    const std::string& path,
+    const cv::Size& size)
+{
+    if (w.isOpened()) return;
+
+#ifdef _WIN32
+    ensureMediaFoundationInitialized();
+
+    w.path = path;
+    w.width = size.width;
+    w.height = size.height;
+    w.fps = fps_;
+    w.frameCount = 0;
+
+    Logger::instance().logDebug(
+        cameraId_,
+        "FrameDiskWriter: opening MF writer at " + path
+    );
+
+    auto widePath = utf8ToWide(path);
+
+    ComPtr<IMFSinkWriter> sink;
+    HRESULT hr = MFCreateSinkWriterFromURL(
+        widePath.c_str(),
+        nullptr,
+        nullptr,
+        &sink
+    );
+
+    if (FAILED(hr)) {
+        Logger::instance().logDebug(
+            cameraId_,
+            "FrameDiskWriter: MFCreateSinkWriterFromURL failed"
+        );
+        return;
+    }
+
+    // Output type: H.264
+    ComPtr<IMFMediaType> outType;
+    hr = MFCreateMediaType(&outType);
+    if (FAILED(hr)) return;
+
+    hr = outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    if (FAILED(hr)) return;
+
+    hr = outType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    if (FAILED(hr)) return;
+
+    // Simple bitrate: ~2 Mbps (tune as you like)
+    hr = outType->SetUINT32(MF_MT_AVG_BITRATE, 2000000);
+    if (FAILED(hr)) return;
+
+    hr = outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    if (FAILED(hr)) return;
+
+    hr = MFSetAttributeSize(outType.Get(), MF_MT_FRAME_SIZE,
+        static_cast<UINT32>(w.width),
+        static_cast<UINT32>(w.height));
+    if (FAILED(hr)) return;
+
+    // Frame rate as rational
+    UINT32 frNum = static_cast<UINT32>(w.fps * 1000.0 + 0.5);
+    UINT32 frDen = 1000;
+    if (frNum == 0) { frNum = 1; frDen = 1; }
+
+    hr = MFSetAttributeRatio(outType.Get(), MF_MT_FRAME_RATE, frNum, frDen);
+    if (FAILED(hr)) return;
+
+    hr = MFSetAttributeRatio(outType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    if (FAILED(hr)) return;
+
+    DWORD streamIndex = 0;
+    hr = sink->AddStream(outType.Get(), &streamIndex);
+    if (FAILED(hr)) return;
+
+    // Input type: RGB32 (we'll convert BGR->BGRA with OpenCV)
+    ComPtr<IMFMediaType> inType;
+    hr = MFCreateMediaType(&inType);
+    if (FAILED(hr)) return;
+
+    hr = inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    if (FAILED(hr)) return;
+
+    hr = inType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+    if (FAILED(hr)) return;
+
+    hr = MFSetAttributeSize(inType.Get(), MF_MT_FRAME_SIZE,
+        static_cast<UINT32>(w.width),
+        static_cast<UINT32>(w.height));
+    if (FAILED(hr)) return;
+
+    hr = MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, frNum, frDen);
+    if (FAILED(hr)) return;
+
+    hr = MFSetAttributeRatio(inType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    if (FAILED(hr)) return;
+
+    hr = sink->SetInputMediaType(streamIndex, inType.Get(), nullptr);
+    if (FAILED(hr)) return;
+
+    hr = sink->BeginWriting();
+    if (FAILED(hr)) return;
+
+    // Store encoder
+    w.encoder = new SegmentWriter::MfEncoder();
+    w.encoder->sinkWriter = sink;
+    w.encoder->streamIndex = streamIndex;
+    w.opened = true;
+
+    Logger::instance().logDebug(
+        cameraId_,
+        "FrameDiskWriter: MF writer opened at " + path
+    );
+#else
+    (void)w;
+    (void)path;
+    (void)size;
+    Logger::instance().logDebug(
+        cameraId_,
+        "FrameDiskWriter: Media Foundation writer not available on this platform"
+    );
+#endif
+}
+
+void FrameDiskWriter::closeWriter_(SegmentWriter& w) {
+    if (!w.isOpened()) return;
+
+#ifdef _WIN32
+    if (w.encoder && w.encoder->sinkWriter) {
+        Logger::instance().logDebug(
+            cameraId_,
+            "FrameDiskWriter: closing MF writer at " + w.path
+        );
+
+        w.encoder->sinkWriter->Finalize();
+        w.encoder->sinkWriter.Reset();
+    }
+    if (w.encoder) {
+        w.encoder->sample.Reset();
+        w.encoder->mediaBuffer.Reset();
+        w.encoder->bgraScratch.release();
+        w.encoder->mediaBufferSize = 0;
+    }
+    delete w.encoder;
+    w.encoder = nullptr;
+#endif
+
+    w.opened = false;
+    w.frameCount = 0;
+}
+*/
+
+/*
+void FrameDiskWriter::writeFrame_(SegmentWriter& w, const cv::Mat& frame) {
+    if (!w.isOpened()) return;
+    if (frame.empty()) return;
+
+#ifdef _WIN32
+    if (!w.encoder || !w.encoder->sinkWriter) return;
+
+    // Convert BGR -> BGRA (RGB32)
+    cv::Mat bgra;
+    cv::cvtColor(frame, bgra, cv::COLOR_BGR2BGRA);
+
+    cv::flip(bgra, bgra, 0);
+
+    const DWORD bufferSize = static_cast<DWORD>(bgra.total() * bgra.elemSize());
+
+    ComPtr<IMFMediaBuffer> mediaBuffer;
+    HRESULT hr = MFCreateMemoryBuffer(bufferSize, &mediaBuffer);
+    if (FAILED(hr)) return;
+
+    BYTE* pData = nullptr;
+    DWORD maxLen = 0, curLen = 0;
+
+    hr = mediaBuffer->Lock(&pData, &maxLen, &curLen);
+    if (FAILED(hr)) return;
+
+    memcpy(pData, bgra.data, bufferSize);
+
+    hr = mediaBuffer->Unlock();
+    if (FAILED(hr)) return;
+
+    hr = mediaBuffer->SetCurrentLength(bufferSize);
+    if (FAILED(hr)) return;
+
+    ComPtr<IMFSample> sample;
+    hr = MFCreateSample(&sample);
+    if (FAILED(hr)) return;
+
+    hr = sample->AddBuffer(mediaBuffer.Get());
+    if (FAILED(hr)) return;
+
+    const LONGLONG ticksPerSecond = 10000000; // 1s = 10^7 * 100ns
+    double fps = (w.fps > 0.0) ? w.fps : 1.0;
+    LONGLONG duration = static_cast<LONGLONG>(ticksPerSecond / fps);
+    LONGLONG sampleTime = static_cast<LONGLONG>(w.frameCount * duration);
+
+    hr = sample->SetSampleTime(sampleTime);
+    if (FAILED(hr)) return;
+
+    hr = sample->SetSampleDuration(duration);
+    if (FAILED(hr)) return;
+
+    hr = w.encoder->sinkWriter->WriteSample(w.encoder->streamIndex, sample.Get());
+    if (FAILED(hr)) return;
+
+    ++w.frameCount;
+#else
+    (void)w;
+    (void)frame;
+#endif
+}
+*/
+
+
+
+
+
+
+
+
+void FrameDiskWriter::writeFrame_(SegmentWriter& w, const cv::Mat& frame) {
+    if (!w.isOpened()) {
+        Logger::instance().logDebug(cameraId_, "writeFrame_: writer not opened, skipping");
+        return;
+    }
+    if (frame.empty()) {
+        Logger::instance().logDebug(cameraId_, "writeFrame_: frame is empty, skipping");
+        return;
+    }
+
+#ifdef _WIN32
+    const auto writeStartedAt = Clock::now();
+    if (!w.encoder || !w.encoder->sinkWriter) {
+        Logger::instance().logDebug(cameraId_, "writeFrame_: encoder or sinkWriter is null");
+        return;
+    }
+
+    // Convert BGR -> BGRA (RGB32)
+    cv::Mat& bgra = w.encoder->bgraScratch;
+    try {
+        cv::cvtColor(frame, bgra, cv::COLOR_BGR2BGRA);
+        cv::flip(bgra, bgra, 0);
+    }
+    catch (const cv::Exception& e) {
+        Logger::instance().logDebug(cameraId_,
+            std::string("writeFrame_: OpenCV exception: ") + e.what());
+        return;
+    }
+
+    const DWORD bufferSize = static_cast<DWORD>(bgra.total() * bgra.elemSize());
+
+    if (!w.encoder->mediaBuffer || !w.encoder->sample || w.encoder->mediaBufferSize != bufferSize) {
+        w.encoder->mediaBuffer.Reset();
+        w.encoder->sample.Reset();
+
+        HRESULT createBufferHr = MFCreateMemoryBuffer(bufferSize, &w.encoder->mediaBuffer);
+        if (FAILED(createBufferHr)) {
+            Logger::instance().logDebug(cameraId_,
+                "writeFrame_: MFCreateMemoryBuffer FAILED hr=0x" +
+                std::to_string(static_cast<unsigned long>(createBufferHr)));
+            return;
+        }
+
+        HRESULT createSampleHr = MFCreateSample(&w.encoder->sample);
+        if (FAILED(createSampleHr)) {
+            Logger::instance().logDebug(cameraId_,
+                "writeFrame_: MFCreateSample FAILED hr=0x" +
+                std::to_string(static_cast<unsigned long>(createSampleHr)));
+            w.encoder->mediaBuffer.Reset();
+            return;
+        }
+
+        HRESULT addBufferHr = w.encoder->sample->AddBuffer(w.encoder->mediaBuffer.Get());
+        if (FAILED(addBufferHr)) {
+            Logger::instance().logDebug(cameraId_,
+                "writeFrame_: AddBuffer FAILED hr=0x" +
+                std::to_string(static_cast<unsigned long>(addBufferHr)));
+            w.encoder->sample.Reset();
+            w.encoder->mediaBuffer.Reset();
+            return;
+        }
+
+        w.encoder->mediaBufferSize = bufferSize;
+    }
+
+    BYTE* pData = nullptr;
+    DWORD maxLen = 0, curLen = 0;
+    HRESULT hr = w.encoder->mediaBuffer->Lock(&pData, &maxLen, &curLen);
+    if (FAILED(hr)) {
+        Logger::instance().logDebug(cameraId_,
+            "writeFrame_: mediaBuffer->Lock FAILED hr=0x" +
+            std::to_string(static_cast<unsigned long>(hr)));
+        return;
+    }
+
+    memcpy(pData, bgra.data, bufferSize);
+
+    hr = w.encoder->mediaBuffer->Unlock();
+    if (FAILED(hr)) {
+        Logger::instance().logDebug(cameraId_,
+            "writeFrame_: mediaBuffer->Unlock FAILED hr=0x" +
+            std::to_string(static_cast<unsigned long>(hr)));
+        return;
+    }
+
+    hr = w.encoder->mediaBuffer->SetCurrentLength(bufferSize);
+    if (FAILED(hr)) {
+        Logger::instance().logDebug(cameraId_,
+            "writeFrame_: SetCurrentLength FAILED hr=0x" +
+            std::to_string(static_cast<unsigned long>(hr)));
+        return;
+    }
+
+    const LONGLONG ticksPerSecond = 10000000;
+    double fps = (w.fps > 0.0) ? w.fps : 1.0;
+    LONGLONG duration = static_cast<LONGLONG>(ticksPerSecond / fps);
+    LONGLONG sampleTime = static_cast<LONGLONG>(w.frameCount * duration);
+
+    hr = w.encoder->sample->SetSampleTime(sampleTime);
+    if (FAILED(hr)) {
+        Logger::instance().logDebug(cameraId_,
+            "writeFrame_: SetSampleTime FAILED hr=0x" +
+            std::to_string(static_cast<unsigned long>(hr)));
+        return;
+    }
+
+    hr = w.encoder->sample->SetSampleDuration(duration);
+    if (FAILED(hr)) {
+        Logger::instance().logDebug(cameraId_,
+            "writeFrame_: SetSampleDuration FAILED hr=0x" +
+            std::to_string(static_cast<unsigned long>(hr)));
+        return;
+    }
+
+    hr = w.encoder->sinkWriter->WriteSample(w.encoder->streamIndex, w.encoder->sample.Get());
+    if (FAILED(hr)) {
+        Logger::instance().logDebug(cameraId_,
+            "writeFrame_: WriteSample FAILED hr=0x" +
+            std::to_string(static_cast<unsigned long>(hr)) +
+            " frameCount=" + std::to_string(w.frameCount));
+
+        // RECUPERAÇÃO: fechar e reabrir o writer no próximo save()
+        closeWriter_(w);
+        return;
+    }
+
+    ++w.frameCount;
+    const auto writeLatencyUs = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - writeStartedAt).count()
+    );
+    recordWriteTelemetry_(static_cast<std::uint64_t>(bufferSize), writeLatencyUs);
+#else
+    (void)w;
+    (void)frame;
+#endif
+}
+
+
+
+
+
+
+
+
+
+// --- short-clip rotation (10s) ---
+
+void FrameDiskWriter::rotate10s_(
+    const cv::Size& size,
+    const TimeParts& tp,
+    std::chrono::steady_clock::time_point clipStartAt,
+    std::chrono::system_clock::time_point clipStartWallTime) {
+    if (!capture10Enabled_) return;
+    if (!writer10_.isOpened()) {
+        std::string prefix = ensureBaseDirAndMakePrefix_(tp);
+        std::string path = prefix + "_10s.mp4";
+        openWriterIfNeeded_(
+            writer10_,
+            path,
+            size,
+            static_cast<double>(capture10Fps_),
+            clipStartAt,
+            clipStartWallTime
+        );
+        if (writer10_.isOpened()) {
+            tenSecondPaths_.push_back(path);
+        }
+    }
+}
+
+void FrameDiskWriter::rotate60s_(
+    const cv::Size& size,
+    const TimeParts& tp,
+    std::chrono::steady_clock::time_point clipStartAt,
+    std::chrono::system_clock::time_point clipStartWallTime) {
+    if (!capture60Enabled_) return;
+    if (!writer60_.isOpened()) {
+        std::string prefix = ensureBaseDirAndMakePrefix_(tp);
+        std::string path = prefix + "_60s.mp4";
+        openWriterIfNeeded_(
+            writer60_,
+            path,
+            size,
+            static_cast<double>(capture60Fps_),
+            clipStartAt,
+            clipStartWallTime
+        );
+        if (writer60_.isOpened()) {
+            sixtySecondPaths_.push_back(path);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+// Parse clip filename into cameraId + start/end timestamps.
+// New pattern: "<cameraId>_YYYYMMDD_HHMMSS_YYYYMMDD_HHMMSS_10s.mp4"
+// Legacy pattern (fallback): "<cameraId>_YYYYMMDD_HHMMSS_10s.mp4"
+static bool parseClipNameParts(
+    const std::string& filename,
+    std::string& outCameraId,
+    std::string& outStartDate,
+    std::string& outStartTime,
+    std::string& outEndDate,
+    std::string& outEndTime)
+{
+    std::vector<std::string> tokens;
+    {
+        std::stringstream ss(filename);
+        std::string token;
+        while (std::getline(ss, token, '_')) {
+            tokens.push_back(token);
+        }
+    }
+
+    // New pattern: cam_YYYYMMDD_HHMMSS_YYYYMMDD_HHMMSS_XXxs.mp4
+    if (tokens.size() >= 6) {
+        outCameraId = tokens[0];
+        outStartDate = tokens[1];
+        outStartTime = tokens[2];
+        outEndDate = tokens[3];
+        outEndTime = tokens[4];
+        return true;
+    }
+
+    // Legacy pattern: cam_YYYYMMDD_HHMMSS_XXxs.mp4
+    if (tokens.size() >= 3) {
+        outCameraId = tokens[0];
+        outStartDate = tokens[1];
+        outStartTime = tokens[2];
+        // For legacy, treat end == start so we still build something valid.
+        outEndDate = outStartDate;
+        outEndTime = outStartTime;
+        return true;
+    }
+
+    return false;
+}
+
+static bool parseClipLocalTimestamp_(
+    const std::string& yyyymmdd,
+    const std::string& hhmmss,
+    std::chrono::system_clock::time_point& outTp)
+{
+    if (yyyymmdd.size() != 8 || hhmmss.size() != 6) return false;
+
+    try {
+        const int year = std::stoi(yyyymmdd.substr(0, 4));
+        const int month = std::stoi(yyyymmdd.substr(4, 2));
+        const int day = std::stoi(yyyymmdd.substr(6, 2));
+        const int hour = std::stoi(hhmmss.substr(0, 2));
+        const int minute = std::stoi(hhmmss.substr(2, 2));
+        const int second = std::stoi(hhmmss.substr(4, 2));
+
+        std::tm tmLocal{};
+        tmLocal.tm_year = year - 1900;
+        tmLocal.tm_mon = month - 1;
+        tmLocal.tm_mday = day;
+        tmLocal.tm_hour = hour;
+        tmLocal.tm_min = minute;
+        tmLocal.tm_sec = second;
+        tmLocal.tm_isdst = -1;
+
+        const std::time_t tt = std::mktime(&tmLocal);
+        if (tt == static_cast<std::time_t>(-1)) return false;
+
+        outTp = std::chrono::system_clock::from_time_t(tt);
+        return true;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+struct ClipRangeInfo_ {
+    std::chrono::system_clock::time_point start{};
+    std::chrono::system_clock::time_point end{};
+    int nominalSeconds = 0;
+};
+
+static int parseNominalSecondsFromFilename_(const std::string& filename)
+{
+    std::vector<std::string> tokens;
+    std::stringstream ss(filename);
+    std::string token;
+    while (std::getline(ss, token, '_')) {
+        tokens.push_back(token);
+    }
+    if (tokens.empty()) return 0;
+
+    std::string tail = tokens.back(); // e.g. "10s.mp4"
+    const std::string ext = ".mp4";
+    if (tail.size() > ext.size() &&
+        tail.rfind(ext) == tail.size() - ext.size())
+    {
+        tail.resize(tail.size() - ext.size());
+    }
+
+    if (!tail.empty() && (tail.back() == 's' || tail.back() == 'S')) {
+        tail.pop_back();
+    }
+    if (tail.empty()) return 0;
+
+    for (char ch : tail) {
+        if (ch < '0' || ch > '9') return 0;
+    }
+
+    try {
+        return std::stoi(tail);
+    }
+    catch (...) {
+        return 0;
+    }
+}
+
+static bool parseClipRangeFromPath_(
+    const std::string& clipPath,
+    ClipRangeInfo_& out,
+    std::string* outErr = nullptr)
+{
+    const fs::path p(clipPath);
+    const std::string filename = p.filename().string();
+
+    std::string camId, startDate, startTime, endDate, endTime;
+    if (!parseClipNameParts(filename, camId, startDate, startTime, endDate, endTime)) {
+        if (outErr) *outErr = "cannot parse clip name: " + filename;
+        return false;
+    }
+
+    std::chrono::system_clock::time_point startTp;
+    std::chrono::system_clock::time_point endTp;
+    if (!parseClipLocalTimestamp_(startDate, startTime, startTp)) {
+        if (outErr) *outErr = "cannot parse start timestamp: " + filename;
+        return false;
+    }
+    if (!parseClipLocalTimestamp_(endDate, endTime, endTp)) {
+        if (outErr) *outErr = "cannot parse end timestamp: " + filename;
+        return false;
+    }
+
+    int nominalSeconds = parseNominalSecondsFromFilename_(filename);
+    if (nominalSeconds <= 0) nominalSeconds = 10;
+    if (endTp <= startTp) {
+        endTp = startTp + std::chrono::seconds(nominalSeconds);
+    }
+
+    out.start = startTp;
+    out.end = endTp;
+    out.nominalSeconds = nominalSeconds;
+    return true;
+}
+
+static bool isMergeBatchTemporallyContinuous_(
+    const std::vector<std::string>& batch,
+    int expectedNominalSeconds,
+    std::string* outErr = nullptr)
+{
+    if (batch.empty()) {
+        if (outErr) *outErr = "empty batch";
+        return false;
+    }
+
+    const auto absll = [](long long v) -> long long { return v < 0 ? -v : v; };
+    const long long maxGapSeconds = expectedNominalSeconds <= 10 ? 5 : 15;
+    const long long maxBacktrackSeconds = 5;
+    const long long minDurationSeconds = expectedNominalSeconds <= 10 ? 5 : expectedNominalSeconds / 2;
+    const long long maxDurationSeconds = expectedNominalSeconds * 2;
+
+    ClipRangeInfo_ first{};
+    ClipRangeInfo_ prev{};
+    for (size_t i = 0; i < batch.size(); ++i) {
+        ClipRangeInfo_ cur{};
+        std::string parseErr;
+        if (!parseClipRangeFromPath_(batch[i], cur, &parseErr)) {
+            if (outErr) *outErr = parseErr;
+            return false;
+        }
+
+        const long long durationSeconds =
+            std::chrono::duration_cast<std::chrono::seconds>(cur.end - cur.start).count();
+        if (durationSeconds < minDurationSeconds || durationSeconds > maxDurationSeconds) {
+            if (outErr) {
+                *outErr = "clip duration out of range (" + std::to_string(durationSeconds) +
+                    "s) for " + fs::path(batch[i]).filename().string();
+            }
+            return false;
+        }
+
+        if (i == 0) {
+            first = cur;
+            prev = cur;
+            continue;
+        }
+
+        const long long gapSeconds =
+            std::chrono::duration_cast<std::chrono::seconds>(cur.start - prev.end).count();
+        if (gapSeconds > maxGapSeconds || gapSeconds < -maxBacktrackSeconds) {
+            if (outErr) {
+                *outErr = "timeline gap between clips is " + std::to_string(gapSeconds) +
+                    "s (" + fs::path(batch[i - 1]).filename().string() + " -> " +
+                    fs::path(batch[i]).filename().string() + ")";
+            }
+            return false;
+        }
+
+        prev = cur;
+    }
+
+    const long long expectedTotalSeconds = static_cast<long long>(expectedNominalSeconds) * static_cast<long long>(batch.size());
+    const long long actualTotalSeconds =
+        std::chrono::duration_cast<std::chrono::seconds>(prev.end - first.start).count();
+    const long long totalToleranceSeconds = maxGapSeconds * static_cast<long long>(batch.size() + 1);
+    if (absll(actualTotalSeconds - expectedTotalSeconds) > totalToleranceSeconds) {
+        if (outErr) {
+            *outErr = "batch total span mismatch: actual=" + std::to_string(actualTotalSeconds) +
+                "s expected~" + std::to_string(expectedTotalSeconds) + "s";
+        }
+        return false;
+    }
+
+    return true;
+}
+
+static std::chrono::system_clock::time_point fileTimeToSystemClock_(
+    const fs::file_time_type& ft)
+{
+    const auto nowFile = fs::file_time_type::clock::now();
+    const auto nowSys = std::chrono::system_clock::now();
+    return std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        ft - nowFile + nowSys
+    );
+}
+
+static bool hasExplicitStartAndEndTimestampsInName(const std::string& filename)
+{
+    std::vector<std::string> tokens;
+    std::stringstream ss(filename);
+    std::string token;
+    while (std::getline(ss, token, '_')) {
+        tokens.push_back(token);
+    }
+
+    // <cam>_YYYYMMDD_HHMMSS_YYYYMMDD_HHMMSS_<suffix>.mp4
+    return tokens.size() >= 6;
+}
+
+static void quarantineFailedMergeClip(
+    const std::string& cameraIdForLog,
+    const std::string& clipPath,
+    const std::string& reasonTag)
+{
+    try {
+        fs::path src(clipPath);
+        if (!fs::exists(src)) return;
+
+        fs::path quarantineDir = src.parent_path() / "_merge_failed";
+        std::error_code ec;
+        fs::create_directories(quarantineDir, ec);
+
+        fs::path dst = quarantineDir / (reasonTag + "_" + src.filename().string());
+
+        ec.clear();
+        fs::rename(src, dst, ec);
+        if (ec) {
+            ec.clear();
+            fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+            if (!ec) {
+                std::error_code rmEc;
+                fs::remove(src, rmEc);
+            }
+        }
+
+        if (ec) {
+            Logger::instance().logDebug(
+                cameraIdForLog,
+                "FrameDiskWriter: failed to quarantine clip " + clipPath +
+                " reason=" + reasonTag + " error=" + ec.message()
+            );
+        }
+        else {
+            Logger::instance().logWarning(
+                cameraIdForLog,
+                "FrameDiskWriter: quarantined merge-failed clip " + clipPath +
+                " -> " + dst.string()
+            );
+        }
+    }
+    catch (const std::exception& ex) {
+        Logger::instance().logDebug(
+            cameraIdForLog,
+            std::string("FrameDiskWriter: exception quarantining clip: ") + ex.what()
+        );
+    }
+}
+// Helper: build merged output path using first clip's start and last clip's end.
+// Output pattern: "<cameraId>_startDate_startTime_endDate_endTime_SUFFIX"
+static std::string buildMergedPathFromBatch(
+    const std::vector<std::string>& inputFiles,
+    const std::string& cameraId,
+    const std::string& suffix)
+{
+    if (inputFiles.empty()) return std::string();
+
+    fs::path firstPath(inputFiles.front());
+    fs::path lastPath(inputFiles.back());
+    fs::path dir = firstPath.parent_path();
+
+    std::string camFirst, startDate, startTime, unusedEndDate, unusedEndTime;
+    if (!parseClipNameParts(firstPath.filename().string(),
+        camFirst, startDate, startTime, unusedEndDate, unusedEndTime))
+    {
+        // Fallback: recreate something simple instead of crashing.
+        std::vector<std::string> tokens;
+        std::stringstream ss(firstPath.filename().string());
+        std::string token;
+        while (std::getline(ss, token, '_')) {
+            tokens.push_back(token);
+        }
+        std::string datePart = (tokens.size() >= 2 ? tokens[1] : "00000000");
+        std::string timePart = (tokens.size() >= 3 ? tokens[2] : "000000");
+
+        std::ostringstream out;
+        out << (cameraId.empty() ? camFirst : cameraId)
+            << "_" << datePart << "_" << timePart << suffix;
+        return (dir / out.str()).string();
+    }
+
+    std::string camLast, lastStartDate, lastStartTime, endDate, endTime;
+    if (!parseClipNameParts(lastPath.filename().string(),
+        camLast, lastStartDate, lastStartTime, endDate, endTime))
+    {
+        // If parsing last fails, fall back to first's "end"
+        endDate = unusedEndDate;
+        endTime = unusedEndTime;
+    }
+
+    const std::string& cam = cameraId.empty() ? camFirst : cameraId;
+
+    std::ostringstream outName;
+    outName << cam << "_" << startDate << "_" << startTime
+        << "_" << endDate << "_" << endTime << suffix;
+
+    fs::path outPath = dir / outName.str();
+    return outPath.string();
+}
+
+
+
+
+
+
+
+
+
+void FrameDiskWriter::finalizeLastClipName_(
+    std::deque<std::string>& clipPaths,
+    const TimeParts& endTp,
+    const std::string& durationSuffix)
+{
+    if (clipPaths.empty()) return;
+
+    std::string oldPath = clipPaths.back();
+    fs::path p(oldPath);
+    fs::path dir = p.parent_path();
+    std::string filename = p.filename().string();
+
+    // Parse existing name to get cameraId + start timestamp.
+    std::string camId, startDate, startTime, dummyEndDate, dummyEndTime;
+    if (!parseClipNameParts(filename, camId, startDate, startTime, dummyEndDate, dummyEndTime)) {
+        return; // don't break anything if filename is unexpected
+    }
+
+    // Format end timestamp from endTp
+    std::ostringstream endDateSS;
+    endDateSS << std::put_time(&endTp.tmLocal, "%Y%m%d");
+
+    std::ostringstream endTimeSS;
+    endTimeSS << std::put_time(&endTp.tmLocal, "%H%M%S");
+
+    std::string endDate = endDateSS.str();
+    std::string endTime = endTimeSS.str();
+
+    std::ostringstream newName;
+    newName << camId << "_"
+        << startDate << "_" << startTime << "_"
+        << endDate << "_" << endTime
+        << durationSuffix;
+
+    fs::path newPath = dir / newName.str();
+
+    if (newPath == p) {
+        // Already in the new format, nothing to do
+        return;
+    }
+
+    std::error_code ec;
+    fs::rename(p, newPath, ec);
+    if (ec) {
+        Logger::instance().logDebug(
+            cameraId_,
+            "FrameDiskWriter: failed to rename clip from " +
+            oldPath + " to " + newPath.string() + " error=" + ec.message()
+        );
+        return;
+    }
+
+    clipPaths.back() = newPath.string();
+
+    Logger::instance().logDebug(
+        cameraId_,
+        "FrameDiskWriter: finalized clip name to " + newPath.string()
+    );
+}
+
+void FrameDiskWriter::discardOpenClip_(
+    SegmentWriter& writer,
+    int& framesInClip,
+    std::deque<std::string>& clipPaths,
+    std::chrono::steady_clock::time_point& lastWriteAt,
+    TimeParts& lastWriteTp,
+    bool& hasLastWriteTp)
+{
+    const std::string danglingPath = writer.path;
+    if (writer.isOpened()) {
+        closeWriter_(writer);
+    } else {
+        writer.frameCount = 0;
+    }
+    framesInClip = 0;
+    lastWriteAt = Clock::time_point{};
+    lastWriteTp = TimeParts{};
+    hasLastWriteTp = false;
+    clearSegmentTimeline_(writer);
+    writer.path.clear();
+
+    if (!danglingPath.empty()) {
+        auto it = std::find(clipPaths.begin(), clipPaths.end(), danglingPath);
+        if (it != clipPaths.end()) {
+            clipPaths.erase(it);
+        }
+
+        std::error_code rmEc;
+        fs::remove(danglingPath, rmEc);
+        if (rmEc) {
+            Logger::instance().logDebug(
+                cameraId_,
+                "FrameDiskWriter: failed removing discarded partial clip " +
+                danglingPath + " err=" + rmEc.message()
+            );
+        }
+    }
+}
+
+bool FrameDiskWriter::finalizeOpenClip_(
+    SegmentWriter& writer,
+    int clipSeconds,
+    int& framesInClip,
+    std::deque<std::string>& clipPaths,
+    std::chrono::steady_clock::time_point& lastWriteAt,
+    TimeParts& lastWriteTp,
+    bool& hasLastWriteTp,
+    const std::vector<JobsCopyTarget>& jobsTargets,
+    bool shouldCopyInferenceVideo,
+    const TimeParts* forcedEndTp)
+{
+    if (!writer.isOpened()) {
+        return false;
+    }
+
+    if (framesInClip <= 0) {
+        discardOpenClip_(writer, framesInClip, clipPaths, lastWriteAt, lastWriteTp, hasLastWriteTp);
+        return false;
+    }
+
+    const TimeParts endTp =
+        forcedEndTp
+            ? *forcedEndTp
+            : (hasLastWriteTp ? lastWriteTp : getTimeParts_());
+    closeWriter_(writer);
+    framesInClip = 0;
+    lastWriteAt = Clock::time_point{};
+    lastWriteTp = TimeParts{};
+    hasLastWriteTp = false;
+
+    const std::string durationSuffix =
+        (clipSeconds >= 60) ? "_60s.mp4" : "_10s.mp4";
+    finalizeLastClipName_(clipPaths, endTp, durationSuffix);
+    if (!clipPaths.empty()) {
+        std::error_code fileSizeEc;
+        const auto clipSize = fs::file_size(clipPaths.back(), fileSizeEc);
+        if (!fileSizeEc) {
+            recordWriteTelemetry_(static_cast<std::uint64_t>(clipSize), 0);
+        }
+    }
+
+    if (clipSeconds < 60 && !clipPaths.empty()) {
+        const std::string& last10sPath = clipPaths.back();
+        std::error_code clipSizeEc;
+        const auto last10sClipSize = fs::file_size(last10sPath, clipSizeEc);
+        const std::uint64_t last10sBytes = clipSizeEc ? 0 : static_cast<std::uint64_t>(last10sClipSize);
+        if (shouldCopyInferenceVideo) {
+            const auto copyStartedAt = Clock::now();
+            const bool copied = copyTenSecondClipToInferenceTemp(cameraId_, last10sPath);
+            if (copied && last10sBytes > 0) {
+                const auto latencyUs = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - copyStartedAt).count()
+                );
+                recordWriteTelemetry_(last10sBytes, latencyUs);
+            }
+        }
+        for (const auto& t : jobsTargets) {
+            if (t.jobId > 0 && t.stepId > 0 && t.copyVideo) {
+                const auto copyStartedAt = Clock::now();
+                const bool copied =
+                    copyTenSecondClipToJobsTemp(t.jobId, t.stepId, cameraId_, last10sPath);
+                if (copied && last10sBytes > 0) {
+                    const auto latencyUs = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - copyStartedAt).count()
+                    );
+                    recordWriteTelemetry_(last10sBytes, latencyUs);
+                }
+            }
+        }
+    }
+
+    return !clipPaths.empty();
+}
+
+// --- main entry point ---
+
+void FrameDiskWriter::save(const cv::Mat& frame)
+{
+    if (!asyncWorkerEnabled_) {
+        std::lock_guard<std::mutex> lk(writerMutex_);
+        saveLocked_(frame);
+        return;
+    }
+
+    if (frame.empty()) {
+        Logger::instance().logDebug(cameraId_, "save: skipping empty frame before async enqueue");
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(workerStateMutex_);
+        if (workerStopRequested_ || dropAsyncSavesWhilePaused_) {
+            return;
+        }
+        frame.copyTo(pendingFrameBuffer_);
+        pendingFrameReady_ = true;
+    }
+    workerCv_.notify_one();
+}
+
+void FrameDiskWriter::flushVideoClipIfIdle(std::chrono::milliseconds idleThreshold)
+{
+    if (!asyncWorkerEnabled_) {
+        std::lock_guard<std::mutex> lk(writerMutex_);
+        flushVideoClipIfIdleLocked_(idleThreshold);
+        return;
+    }
+
+    if (idleThreshold.count() <= 0) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(workerStateMutex_);
+        if (workerStopRequested_) {
+            return;
+        }
+        pendingFlushRequested_ = true;
+        pendingFlushIdleThreshold_ =
+            pendingFlushIdleThreshold_.count() > 0
+                ? (std::max)(pendingFlushIdleThreshold_, idleThreshold)
+                : idleThreshold;
+    }
+    workerCv_.notify_one();
+}
+
+void FrameDiskWriter::saveLocked_(const cv::Mat& frame) {
+    if (!enabled_ || frame.empty()) {
+        Logger::instance().logDebug(cameraId_,
+            "save: skipping - enabled=" + std::to_string(enabled_) +
+            " frame.empty=" + std::to_string(frame.empty()));
+        return;
+    }
+
+    auto now = Clock::now();
+
+    bool shouldCopyInferenceVideo = true;
+    if (inferenceCopyEnabledProvider_) {
+        try {
+            shouldCopyInferenceVideo = inferenceCopyEnabledProvider_();
+        }
+        catch (...) {
+            shouldCopyInferenceVideo = true;
+        }
+    }
+
+    bool shouldCopyInferenceImage = false;
+    if (inferenceImageCopyEnabledProvider_) {
+        try {
+            shouldCopyInferenceImage = inferenceImageCopyEnabledProvider_();
+        }
+        catch (...) {
+            shouldCopyInferenceImage = false;
+        }
+    }
+
+    bool forceVideoCapture = false;
+    if (forceVideoCaptureProvider_) {
+        try {
+            forceVideoCapture = forceVideoCaptureProvider_();
+        }
+        catch (...) {
+            forceVideoCapture = false;
+        }
+    }
+
+    std::vector<JobsCopyTarget> jobsTargets;
+    if (jobsTargetsProvider_) {
+        try {
+            jobsTargets = jobsTargetsProvider_();
+        }
+        catch (...) {
+            jobsTargets.clear();
+        }
+    }
+
+    bool hasJobsVideoDemand = false;
+    bool hasJobsImageDemand = false;
+    for (const auto& t : jobsTargets) {
+        if (t.jobId <= 0 || t.stepId <= 0) continue;
+        hasJobsVideoDemand = hasJobsVideoDemand || t.needsVideo;
+        hasJobsImageDemand = hasJobsImageDemand || t.copyImage;
+    }
+
+    const bool hasImageDemand = shouldCopyInferenceImage || hasJobsImageDemand;
+    const bool hasProfileVideoDemand = capture10Enabled_ || capture60Enabled_;
+    const bool hasVideoDemand =
+        hasProfileVideoDemand || forceVideoCapture || shouldCopyInferenceVideo || hasJobsVideoDemand;
+
+    cv::Size sz(frame.cols, frame.rows);
+    auto tp = getTimeParts_();
+
+    auto emitImageSnapshotIfDue = [&]() {
+        if (!hasImageDemand) return;
+        if (lastImageSnapshotSaved_.time_since_epoch().count() != 0 &&
+            (now - lastImageSnapshotSaved_) < imageSnapshotInterval_) {
+            return;
+        }
+
+        std::vector<uchar> imageBytes;
+        if (!cv::imencode(".png", frame, imageBytes) || imageBytes.empty()) {
+            Logger::instance().logDebug(cameraId_, "save: image-only mode failed to encode PNG snapshot");
+            return;
+        }
+
+        std::ostringstream imageName;
+        imageName << cameraId_ << "_"
+            << std::put_time(&tp.tmLocal, "%Y%m%d_%H%M%S")
+            << "_" << std::setw(3) << std::setfill('0') << tp.ms
+            << "_img.png";
+        const std::string fileName = imageName.str();
+
+        bool wroteAny = false;
+        if (shouldCopyInferenceImage) {
+            const auto writeStartedAt = Clock::now();
+            const bool wrote = writeImageBytesAtomicToDir(
+                cameraId_,
+                getInferenceImagesTempDirForCamera(cameraId_),
+                fileName,
+                imageBytes,
+                "FrameDiskWriter: direct image inference snapshot"
+            );
+            if (wrote) {
+                const auto latencyUs = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - writeStartedAt).count()
+                );
+                recordWriteTelemetry_(static_cast<std::uint64_t>(imageBytes.size()), latencyUs);
+            }
+            wroteAny = wrote || wroteAny;
+        }
+
+        for (const auto& t : jobsTargets) {
+            if (t.jobId <= 0 || t.stepId <= 0 || !t.copyImage) continue;
+            const auto writeStartedAt = Clock::now();
+            const bool wrote = writeImageBytesAtomicToDir(
+                cameraId_,
+                getJobsImagesTempDirForJobStepCamera(t.jobId, t.stepId, cameraId_),
+                fileName,
+                imageBytes,
+                "FrameDiskWriter: jobs image inference snapshot"
+            );
+            if (wrote) {
+                const auto latencyUs = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - writeStartedAt).count()
+                );
+                recordWriteTelemetry_(static_cast<std::uint64_t>(imageBytes.size()), latencyUs);
+            }
+            wroteAny = wrote || wroteAny;
+        }
+
+        if (wroteAny) {
+            lastImageSnapshotSaved_ = now;
+        }
+    };
+
+    if (!hasVideoDemand) {
+        discardOpenClip_(
+            writer10_,
+            framesIn10_,
+            tenSecondPaths_,
+            lastVideoFrameWriteAt10_,
+            lastVideoFrameWriteTp10_,
+            hasLastVideoFrameWriteTp10_
+        );
+        lastVideoFrameWallTime10_ = std::chrono::system_clock::time_point{};
+        hasLastVideoFrameWallTime10_ = false;
+        discardOpenClip_(
+            writer60_,
+            framesIn60_,
+            sixtySecondPaths_,
+            lastVideoFrameWriteAt60_,
+            lastVideoFrameWriteTp60_,
+            hasLastVideoFrameWriteTp60_
+        );
+        lastVideoFrameWallTime60_ = std::chrono::system_clock::time_point{};
+        hasLastVideoFrameWallTime60_ = false;
+        emitImageSnapshotIfDue();
+        return;
+    }
+
+    auto writeProfileIfDue = [&](int clipSeconds,
+                                 bool enabled,
+                                 int clipFps,
+                                 std::chrono::milliseconds interval,
+                                 std::chrono::steady_clock::time_point& lastSavedAt,
+                                 SegmentWriter& writer,
+                                 int& framesInClip,
+                                 std::deque<std::string>& clipPaths,
+                                 std::chrono::steady_clock::time_point& lastWriteAt,
+                                 TimeParts& lastWriteTp,
+                                 bool& hasLastWriteTp,
+                                 std::chrono::system_clock::time_point& lastFrameWallTime,
+                                 bool& hasLastFrameWallTime) {
+        if (!enabled || clipFps <= 0) return;
+        if (interval.count() > 0 && (now - lastSavedAt) < interval) return;
+
+        lastSavedAt = now;
+        lastSaved_ = now;
+        const auto nowWall = std::chrono::system_clock::now();
+        const auto sampleIntervalNs =
+            (std::max)(1LL, 1000000000LL / static_cast<long long>(clipFps));
+        const auto sampleInterval = std::chrono::nanoseconds(sampleIntervalNs);
+        const std::int64_t targetSamples =
+            (std::max)(1LL, static_cast<long long>(clipFps) * static_cast<long long>(clipSeconds));
+
+        if (!writer.timelineInitialized) {
+            writer.clipStartAt = now;
+            writer.nextSampleAt = now;
+            writer.clipStartWallTime = nowWall;
+            writer.timelineInitialized = true;
+        }
+
+        auto ensureWriterForCurrentTimeline = [&]() -> bool {
+            if (!writer.timelineInitialized) {
+                return false;
+            }
+            if (writer.isOpened()) {
+                return true;
+            }
+
+            const TimeParts clipStartTp =
+                getTimePartsForSystemTime_(writer.clipStartWallTime);
+            if (clipSeconds >= 60) {
+                rotate60s_(sz, clipStartTp, writer.clipStartAt, writer.clipStartWallTime);
+            }
+            else {
+                rotate10s_(sz, clipStartTp, writer.clipStartAt, writer.clipStartWallTime);
+            }
+
+            if (!writer.isOpened()) {
+                Logger::instance().logDebug(
+                    cameraId_,
+                    "save: failed to open writer for " + std::to_string(clipSeconds) + "s profile"
+                );
+                return false;
+            }
+            return true;
+        };
+
+        auto finalizeCompletedTimelineClip = [&]() {
+            const auto clipEndWallTime =
+                writer.clipStartWallTime + std::chrono::seconds(clipSeconds);
+            const TimeParts forcedEndTp =
+                getTimePartsForSystemTime_(clipEndWallTime);
+            finalizeOpenClip_(
+                writer,
+                clipSeconds,
+                framesInClip,
+                clipPaths,
+                lastWriteAt,
+                lastWriteTp,
+                hasLastWriteTp,
+                jobsTargets,
+                shouldCopyInferenceVideo,
+                &forcedEndTp
+            );
+            writer.clipStartAt += std::chrono::seconds(clipSeconds);
+            writer.nextSampleAt = writer.clipStartAt;
+            writer.clipStartWallTime = clipEndWallTime;
+            writer.timelineInitialized = true;
+        };
+
+        auto writeDueSamplesUntil = [&](const cv::Mat& sampleFrame, bool includeCurrentBoundary) {
+            if (!writer.timelineInitialized || sampleFrame.empty()) {
+                return;
+            }
+
+            while (writer.timelineInitialized) {
+                const auto clipEndAt = writer.clipStartAt + std::chrono::seconds(clipSeconds);
+                bool wroteAnySampleThisPass = false;
+
+                while (writer.frameCount < targetSamples &&
+                       writer.nextSampleAt < clipEndAt &&
+                       (writer.nextSampleAt < now ||
+                        (includeCurrentBoundary && writer.nextSampleAt <= now)))
+                {
+                    if (!ensureWriterForCurrentTimeline()) {
+                        return;
+                    }
+
+                    const auto frameCountBeforeWrite = writer.frameCount;
+                    writeFrame_(writer, sampleFrame);
+                    if (writer.frameCount == frameCountBeforeWrite) {
+                        discardOpenClip_(
+                            writer,
+                            framesInClip,
+                            clipPaths,
+                            lastWriteAt,
+                            lastWriteTp,
+                            hasLastWriteTp
+                        );
+                        return;
+                    }
+
+                    wroteAnySampleThisPass = true;
+                    framesInClip = static_cast<int>(writer.frameCount);
+                    const auto sampleOffset = writer.nextSampleAt - writer.clipStartAt;
+                    const auto sampleWallTime =
+                        writer.clipStartWallTime +
+                        std::chrono::duration_cast<std::chrono::system_clock::duration>(sampleOffset);
+                    lastWriteTp = getTimePartsForSystemTime_(sampleWallTime);
+                    hasLastWriteTp = true;
+                    writer.nextSampleAt += sampleInterval;
+                }
+
+                if (writer.frameCount >= targetSamples) {
+                    finalizeCompletedTimelineClip();
+                    continue;
+                }
+
+                if (!wroteAnySampleThisPass) {
+                    break;
+                }
+            }
+        };
+
+        if (writer.hasHeldFrame) {
+            writeDueSamplesUntil(writer.heldFrame, false);
+        }
+
+        writer.heldFrame = frame.clone();
+        writer.hasHeldFrame = !writer.heldFrame.empty();
+        writeDueSamplesUntil(writer.heldFrame, true);
+
+        if (writer.hasHeldFrame) {
+            lastWriteAt = now;
+            lastWriteTp = tp;
+            hasLastWriteTp = true;
+            lastFrameWallTime = nowWall;
+            hasLastFrameWallTime = true;
+        }
+    };
+
+    writeProfileIfDue(
+        10,
+        capture10Enabled_,
+        capture10Fps_,
+        minInterval10_,
+        lastSaved10_,
+        writer10_,
+        framesIn10_,
+        tenSecondPaths_,
+        lastVideoFrameWriteAt10_,
+        lastVideoFrameWriteTp10_,
+        hasLastVideoFrameWriteTp10_,
+        lastVideoFrameWallTime10_,
+        hasLastVideoFrameWallTime10_
+    );
+
+    writeProfileIfDue(
+        60,
+        capture60Enabled_,
+        capture60Fps_,
+        minInterval60_,
+        lastSaved60_,
+        writer60_,
+        framesIn60_,
+        sixtySecondPaths_,
+        lastVideoFrameWriteAt60_,
+        lastVideoFrameWriteTp60_,
+        hasLastVideoFrameWriteTp60_,
+        lastVideoFrameWallTime60_,
+        hasLastVideoFrameWallTime60_
+    );
+
+    // In mixed mode (video + image demand), keep video pipeline and also emit periodic snapshots.
+    emitImageSnapshotIfDue();
+}
+
+void FrameDiskWriter::flushVideoClipIfIdleLocked_(std::chrono::milliseconds idleThreshold)
+{
+    if (idleThreshold.count() <= 0) {
+        return;
+    }
+
+    bool shouldCopyInferenceVideo = true;
+    if (inferenceCopyEnabledProvider_) {
+        try {
+            shouldCopyInferenceVideo = inferenceCopyEnabledProvider_();
+        }
+        catch (...) {
+            shouldCopyInferenceVideo = true;
+        }
+    }
+
+    std::vector<JobsCopyTarget> jobsTargets;
+    if (jobsTargetsProvider_) {
+        try {
+            jobsTargets = jobsTargetsProvider_();
+        }
+        catch (...) {
+            jobsTargets.clear();
+        }
+    }
+
+    const auto now = Clock::now();
+    auto flushProfileIfIdle = [&](int clipSeconds,
+                                  SegmentWriter& writer,
+                                  int& framesInClip,
+                                  std::deque<std::string>& clipPaths,
+                                  std::chrono::steady_clock::time_point& lastWriteAt,
+                                  TimeParts& lastWriteTp,
+                                  bool& hasLastWriteTp) {
+        if (!writer.timelineInitialized && !writer.isOpened()) return;
+
+        if (!hasLastWriteTp || lastWriteAt.time_since_epoch().count() == 0) {
+            discardOpenClip_(writer, framesInClip, clipPaths, lastWriteAt, lastWriteTp, hasLastWriteTp);
+            return;
+        }
+
+        const auto idleFor = now - lastWriteAt;
+        if (idleFor < idleThreshold) {
+            return;
+        }
+
+        Logger::instance().logDebug(
+            cameraId_,
+            "FrameDiskWriter: flushing idle open clip profile=" + std::to_string(clipSeconds) +
+            "s frames=" + std::to_string(framesInClip) +
+            " idle_ms=" + std::to_string(
+                std::chrono::duration_cast<std::chrono::milliseconds>(idleFor).count()
+            )
+        );
+
+        if (writer.isOpened()) {
+            finalizeOpenClip_(
+                writer,
+                clipSeconds,
+                framesInClip,
+                clipPaths,
+                lastWriteAt,
+                lastWriteTp,
+                hasLastWriteTp,
+                jobsTargets,
+                shouldCopyInferenceVideo
+            );
+        } else {
+            framesInClip = 0;
+            lastWriteAt = Clock::time_point{};
+            lastWriteTp = TimeParts{};
+            hasLastWriteTp = false;
+        }
+        clearSegmentTimeline_(writer);
+    };
+
+    flushProfileIfIdle(
+        10,
+        writer10_,
+        framesIn10_,
+        tenSecondPaths_,
+        lastVideoFrameWriteAt10_,
+        lastVideoFrameWriteTp10_,
+        hasLastVideoFrameWriteTp10_
+    );
+
+    flushProfileIfIdle(
+        60,
+        writer60_,
+        framesIn60_,
+        sixtySecondPaths_,
+        lastVideoFrameWriteAt60_,
+        lastVideoFrameWriteTp60_,
+        hasLastVideoFrameWriteTp60_
+    );
+}
+
+FrameDiskWriter::MaterializeOpenClipResult FrameDiskWriter::materializeProfileThroughUtc_(
+    SegmentWriter& writer,
+    int clipSeconds,
+    int& framesInClip,
+    std::deque<std::string>& clipPaths,
+    std::chrono::steady_clock::time_point& lastWriteAt,
+    TimeParts& lastWriteTp,
+    bool& hasLastWriteTp,
+    std::chrono::system_clock::time_point& lastFrameWallTime,
+    bool& hasLastFrameWallTime,
+    const std::vector<JobsCopyTarget>& jobsTargets,
+    bool shouldCopyInferenceVideo,
+    const std::chrono::system_clock::time_point& targetUtc)
+{
+    MaterializeOpenClipResult result;
+    result.attempted = true;
+    result.clipSeconds = clipSeconds;
+
+    if (!writer.timelineInitialized && !writer.isOpened()) {
+        result.noOpenClip = true;
+        result.reason = "no_open_clip";
+        return result;
+    }
+
+    result.openClipPath = writer.path;
+    result.clipStartUtcIso = formatUtcIso_(writer.clipStartWallTime);
+    const auto clipScheduledEndUtc = writer.clipStartWallTime + std::chrono::seconds(clipSeconds);
+    result.clipScheduledEndUtcIso = formatUtcIso_(clipScheduledEndUtc);
+    if (hasLastFrameWallTime) {
+        result.lastFrameUtcIso = formatUtcIso_(lastFrameWallTime);
+    }
+
+    if (writer.clipStartWallTime.time_since_epoch().count() == 0) {
+        result.noOpenClip = true;
+        result.reason = "no_clip_start";
+        return result;
+    }
+
+    if (targetUtc < writer.clipStartWallTime || targetUtc > clipScheduledEndUtc) {
+        result.targetOutsideOpenClip = true;
+        result.reason = "target_outside_open_clip";
+        return result;
+    }
+
+    if (!hasLastFrameWallTime || lastFrameWallTime.time_since_epoch().count() == 0) {
+        result.waitingForTarget = true;
+        result.reason = "waiting_for_first_frame";
+        return result;
+    }
+
+    if (lastFrameWallTime < targetUtc) {
+        result.waitingForTarget = true;
+        result.reason = "waiting_for_target";
+        return result;
+    }
+
+    if (!writer.hasHeldFrame || writer.heldFrame.empty()) {
+        result.waitingForTarget = true;
+        result.reason = "waiting_for_held_frame";
+        return result;
+    }
+
+    const int clipFps = clipSeconds >= 60 ? capture60Fps_ : capture10Fps_;
+    if (clipFps <= 0) {
+        result.reason = "profile_disabled";
+        return result;
+    }
+
+    const auto sampleIntervalNs =
+        (std::max)(1LL, 1000000000LL / static_cast<long long>(clipFps));
+    const auto sampleInterval = std::chrono::nanoseconds(sampleIntervalNs);
+    const std::int64_t targetSamples =
+        (std::max)(1LL, static_cast<long long>(clipFps) * static_cast<long long>(clipSeconds));
+
+    auto ensureWriterForCurrentTimeline = [&]() -> bool {
+        if (!writer.timelineInitialized || writer.heldFrame.empty()) {
+            return false;
+        }
+        if (writer.isOpened()) {
+            return true;
+        }
+
+        const cv::Size size(writer.heldFrame.cols, writer.heldFrame.rows);
+        const TimeParts clipStartTp = getTimePartsForSystemTime_(writer.clipStartWallTime);
+        if (clipSeconds >= 60) {
+            rotate60s_(size, clipStartTp, writer.clipStartAt, writer.clipStartWallTime);
+        }
+        else {
+            rotate10s_(size, clipStartTp, writer.clipStartAt, writer.clipStartWallTime);
+        }
+
+        return writer.isOpened();
+    };
+
+    auto targetAt =
+        writer.clipStartAt +
+        std::chrono::duration_cast<Clock::duration>(targetUtc - writer.clipStartWallTime);
+    const auto clipEndAt = writer.clipStartAt + std::chrono::seconds(clipSeconds);
+    if (targetAt < writer.clipStartAt) {
+        result.targetOutsideOpenClip = true;
+        result.reason = "target_before_open_clip";
+        return result;
+    }
+    if (targetAt > clipEndAt) {
+        targetAt = clipEndAt;
+    }
+
+    while (writer.timelineInitialized) {
+        if (!ensureWriterForCurrentTimeline()) {
+            result.reason = "open_writer_failed";
+            return result;
+        }
+
+        bool wroteAnySampleThisPass = false;
+        while (writer.frameCount < targetSamples &&
+               writer.nextSampleAt < clipEndAt &&
+               writer.nextSampleAt <= targetAt)
+        {
+            const auto frameCountBeforeWrite = writer.frameCount;
+            writeFrame_(writer, writer.heldFrame);
+            if (writer.frameCount == frameCountBeforeWrite) {
+                discardOpenClip_(
+                    writer,
+                    framesInClip,
+                    clipPaths,
+                    lastWriteAt,
+                    lastWriteTp,
+                    hasLastWriteTp
+                );
+                result.reason = "write_frame_failed";
+                return result;
+            }
+
+            wroteAnySampleThisPass = true;
+            framesInClip = static_cast<int>(writer.frameCount);
+            const auto sampleOffset = writer.nextSampleAt - writer.clipStartAt;
+            const auto sampleWallTime =
+                writer.clipStartWallTime +
+                std::chrono::duration_cast<std::chrono::system_clock::duration>(sampleOffset);
+            lastWriteAt = Clock::now();
+            lastWriteTp = getTimePartsForSystemTime_(sampleWallTime);
+            hasLastWriteTp = true;
+            writer.nextSampleAt += sampleInterval;
+        }
+
+        const bool targetSatisfied =
+            writer.frameCount > 0 &&
+            writer.nextSampleAt > targetAt;
+        if (writer.frameCount >= targetSamples || targetSatisfied || targetAt >= clipEndAt) {
+            break;
+        }
+
+        if (!wroteAnySampleThisPass) {
+            break;
+        }
+    }
+
+    if (framesInClip <= 0 || writer.frameCount <= 0) {
+        result.reason = "no_frames_materialized";
+        return result;
+    }
+
+    const TimeParts forcedEndTp = getTimePartsForSystemTime_(targetUtc);
+    if (!finalizeOpenClip_(
+            writer,
+            clipSeconds,
+            framesInClip,
+            clipPaths,
+            lastWriteAt,
+            lastWriteTp,
+            hasLastWriteTp,
+            jobsTargets,
+            shouldCopyInferenceVideo,
+            &forcedEndTp))
+    {
+        result.reason = "finalize_failed";
+        return result;
+    }
+
+    clearSegmentTimeline_(writer);
+    writer.path.clear();
+
+    result.materialized = true;
+    result.reason = "materialized_to_target";
+    result.finalizedEndUtcIso = formatUtcIso_(targetUtc);
+    if (!clipPaths.empty()) {
+        result.finalizedPath = clipPaths.back();
+    }
+    return result;
+}
+
+bool FrameDiskWriter::forceFinalizeProfile_(
+    SegmentWriter& writer,
+    int clipSeconds,
+    int& framesInClip,
+    std::deque<std::string>& clipPaths,
+    std::chrono::steady_clock::time_point& lastWriteAt,
+    TimeParts& lastWriteTp,
+    bool& hasLastWriteTp,
+    std::chrono::system_clock::time_point& lastFrameWallTime,
+    bool& hasLastFrameWallTime,
+    const std::vector<JobsCopyTarget>& jobsTargets,
+    bool shouldCopyInferenceVideo,
+    const std::string& reason)
+{
+    if ((!writer.timelineInitialized && !writer.isOpened()) ||
+        !hasLastFrameWallTime ||
+        lastFrameWallTime.time_since_epoch().count() == 0)
+    {
+        return false;
+    }
+
+    const auto clipStartUtc = writer.clipStartWallTime;
+    const auto clipScheduledEndUtc = clipStartUtc + std::chrono::seconds(clipSeconds);
+    auto targetUtc = lastFrameWallTime;
+    if (targetUtc < clipStartUtc) {
+        targetUtc = clipStartUtc;
+    }
+    if (targetUtc > clipScheduledEndUtc) {
+        targetUtc = clipScheduledEndUtc;
+    }
+
+    const MaterializeOpenClipResult result =
+        materializeProfileThroughUtc_(
+            writer,
+            clipSeconds,
+            framesInClip,
+            clipPaths,
+            lastWriteAt,
+            lastWriteTp,
+            hasLastWriteTp,
+            lastFrameWallTime,
+            hasLastFrameWallTime,
+            jobsTargets,
+            shouldCopyInferenceVideo,
+            targetUtc
+        );
+
+    if (result.materialized) {
+        Logger::instance().logDebug(
+            cameraId_,
+            "FrameDiskWriter: force-finalized open clip reason=" + reason +
+            " profile=" + std::to_string(clipSeconds) +
+            " finalized_end_utc=" + result.finalizedEndUtcIso +
+            " path=" + result.finalizedPath
+        );
+        return true;
+    }
+
+    Logger::instance().logDebug(
+        cameraId_,
+        "FrameDiskWriter: force-finalize skipped reason=" + reason +
+        " profile=" + std::to_string(clipSeconds) +
+        " status=" + result.reason
+    );
+    return false;
+}
+
+FrameDiskWriter::MaterializeOpenClipResult FrameDiskWriter::materializeOpenClipThroughUtc(
+    const std::chrono::system_clock::time_point& targetUtc,
+    int preferredClipSeconds)
+{
+    if (!asyncWorkerEnabled_) {
+        std::lock_guard<std::mutex> lk(writerMutex_);
+        return materializeOpenClipThroughUtcLocked_(targetUtc, preferredClipSeconds);
+    }
+
+    beginSynchronousWorkerBarrier_(true);
+    try {
+        std::lock_guard<std::mutex> lk(writerMutex_);
+        auto result = materializeOpenClipThroughUtcLocked_(targetUtc, preferredClipSeconds);
+        endSynchronousWorkerBarrier_();
+        return result;
+    }
+    catch (...) {
+        endSynchronousWorkerBarrier_();
+        throw;
+    }
+}
+
+void FrameDiskWriter::forceFinalizeAllOpenClips(const std::string& reason)
+{
+    if (!asyncWorkerEnabled_) {
+        std::lock_guard<std::mutex> lk(writerMutex_);
+        forceFinalizeAllOpenClipsLocked_(reason);
+        return;
+    }
+
+    beginSynchronousWorkerBarrier_(true);
+    try {
+        std::lock_guard<std::mutex> lk(writerMutex_);
+        forceFinalizeAllOpenClipsLocked_(reason);
+        endSynchronousWorkerBarrier_();
+    }
+    catch (...) {
+        endSynchronousWorkerBarrier_();
+        throw;
+    }
+}
+
+FrameDiskWriter::MaterializeOpenClipResult FrameDiskWriter::materializeOpenClipThroughUtcLocked_(
+    const std::chrono::system_clock::time_point& targetUtc,
+    int preferredClipSeconds)
+{
+    bool shouldCopyInferenceVideo = true;
+    if (inferenceCopyEnabledProvider_) {
+        try {
+            shouldCopyInferenceVideo = inferenceCopyEnabledProvider_();
+        }
+        catch (...) {
+            shouldCopyInferenceVideo = true;
+        }
+    }
+
+    std::vector<JobsCopyTarget> jobsTargets;
+    if (jobsTargetsProvider_) {
+        try {
+            jobsTargets = jobsTargetsProvider_();
+        }
+        catch (...) {
+            jobsTargets.clear();
+        }
+    }
+
+    const int normalizedClipSeconds = preferredClipSeconds >= 60 ? 60 : 10;
+    MaterializeOpenClipResult result =
+        normalizedClipSeconds >= 60
+            ? materializeProfileThroughUtc_(
+                  writer60_,
+                  60,
+                  framesIn60_,
+                  sixtySecondPaths_,
+                  lastVideoFrameWriteAt60_,
+                  lastVideoFrameWriteTp60_,
+                  hasLastVideoFrameWriteTp60_,
+                  lastVideoFrameWallTime60_,
+                  hasLastVideoFrameWallTime60_,
+                  jobsTargets,
+                  shouldCopyInferenceVideo,
+                  targetUtc)
+            : materializeProfileThroughUtc_(
+                  writer10_,
+                  10,
+                  framesIn10_,
+                  tenSecondPaths_,
+                  lastVideoFrameWriteAt10_,
+                  lastVideoFrameWriteTp10_,
+                  hasLastVideoFrameWriteTp10_,
+                  lastVideoFrameWallTime10_,
+                  hasLastVideoFrameWallTime10_,
+                  jobsTargets,
+                  shouldCopyInferenceVideo,
+                  targetUtc);
+
+    Logger::instance().logDebug(
+        cameraId_,
+        "FrameDiskWriter: materializeOpenClipThroughUtc profile=" +
+            std::to_string(normalizedClipSeconds) +
+            " target_utc=" + formatUtcIso_(targetUtc) +
+            " status=" + result.reason +
+            " materialized=" + std::string(result.materialized ? "true" : "false") +
+            " waiting=" + std::string(result.waitingForTarget ? "true" : "false") +
+            " no_open_clip=" + std::string(result.noOpenClip ? "true" : "false")
+    );
+    return result;
+}
+
+void FrameDiskWriter::forceFinalizeAllOpenClipsLocked_(const std::string& reason)
+{
+
+    bool shouldCopyInferenceVideo = true;
+    if (inferenceCopyEnabledProvider_) {
+        try {
+            shouldCopyInferenceVideo = inferenceCopyEnabledProvider_();
+        }
+        catch (...) {
+            shouldCopyInferenceVideo = true;
+        }
+    }
+
+    std::vector<JobsCopyTarget> jobsTargets;
+    if (jobsTargetsProvider_) {
+        try {
+            jobsTargets = jobsTargetsProvider_();
+        }
+        catch (...) {
+            jobsTargets.clear();
+        }
+    }
+
+    forceFinalizeProfile_(
+        writer10_,
+        10,
+        framesIn10_,
+        tenSecondPaths_,
+        lastVideoFrameWriteAt10_,
+        lastVideoFrameWriteTp10_,
+        hasLastVideoFrameWriteTp10_,
+        lastVideoFrameWallTime10_,
+        hasLastVideoFrameWallTime10_,
+        jobsTargets,
+        shouldCopyInferenceVideo,
+        reason.empty() ? "force_finalize_all" : reason
+    );
+    forceFinalizeProfile_(
+        writer60_,
+        60,
+        framesIn60_,
+        sixtySecondPaths_,
+        lastVideoFrameWriteAt60_,
+        lastVideoFrameWriteTp60_,
+        hasLastVideoFrameWriteTp60_,
+        lastVideoFrameWallTime60_,
+        hasLastVideoFrameWallTime60_,
+        jobsTargets,
+        shouldCopyInferenceVideo,
+        reason.empty() ? "force_finalize_all" : reason
+    );
+}
+
+
+
+bool FrameDiskWriter::isValidMp4_(const std::string& path)
+{
+    std::error_code ec;
+    auto size = fs::file_size(path, ec);
+    if (ec) return false;
+
+    // Treat tiny / zero-length files as suspicious
+    if (size < 1024) { // 1 KB threshold – tune if you want
+        return false;
+    }
+
+    fs::path p(path);
+    if (!p.has_extension() || p.extension() != ".mp4") {
+        return false;
+    }
+
+    // Do NOT try to decode it here; ffmpeg concat will be the real test.
+    return true;
+}
+
+
+
+
+void FrameDiskWriter::initializeFromDisk_()
+{
+    // We only care about today's folder for this camera: baseDir/cam_<id>/YYYY/MM/DD
+    TimeParts tp = getTimeParts_();
+    std::string prefix = ensureBaseDirAndMakePrefix_(tp);
+    fs::path dir = fs::path(prefix).parent_path(); // drop "<id>_YYYYMMDD_HHMMSS" part
+
+    if (!fs::exists(dir)) return;
+
+    std::vector<std::string> tens;
+    std::vector<std::string> sixties;
+
+    for (auto& entry : fs::directory_iterator(dir))
+    {
+        if (!entry.is_regular_file()) continue;
+
+        const std::string filename = entry.path().filename().string();
+        const std::string full = entry.path().string();
+
+        bool isLegacyPartialShort = false;
+        for (int s = 1; s <= 9; ++s) {
+            const std::string marker = "_" + std::to_string(s) + "s.mp4";
+            if (filename.find(marker) != std::string::npos) {
+                isLegacyPartialShort = true;
+                break;
+            }
+        }
+        if (isLegacyPartialShort) {
+            std::error_code rmEc;
+            fs::remove(entry.path(), rmEc);
+            if (rmEc) {
+                Logger::instance().logDebug(
+                    cameraId_,
+                    "FrameDiskWriter: failed removing legacy partial clip " + full +
+                    " err=" + rmEc.message()
+                );
+            }
+            else {
+                Logger::instance().logDebug(
+                    cameraId_,
+                    "FrameDiskWriter: removed legacy partial clip " + full
+                );
+            }
+            continue;
+        }
+
+        // Only look at clips created by this writer
+        bool is10 = filename.find("_10s.mp4") != std::string::npos;
+        bool is60 = filename.find("_60s.mp4") != std::string::npos;
+
+        if (!is10 && !is60) continue;
+
+        if (is10 && !hasExplicitStartAndEndTimestampsInName(filename)) {
+            Logger::instance().logDebug(
+                cameraId_,
+                "FrameDiskWriter: skipping non-finalized 10s clip " + full
+            );
+            continue;
+        }
+
+        if (!isValidMp4_(full)) {
+            Logger::instance().logDebug(
+                cameraId_,
+                "FrameDiskWriter: skipping suspicious clip " + full);
+            continue;
+        }
+
+        if (is10)      tens.push_back(full);
+        else if (is60) sixties.push_back(full);
+    }
+
+    // Sort clips by start timestamp so merges always use the oldest first
+    auto sortByTimestamp = [&](std::vector<std::string>& vec) {
+        std::sort(vec.begin(), vec.end(),
+            [&](const std::string& A, const std::string& B) {
+                std::string camA, sdA, stA, edA, etA;
+                std::string camB, sdB, stB, edB, etB;
+
+                parseClipNameParts(fs::path(A).filename().string(),
+                    camA, sdA, stA, edA, etA);
+                parseClipNameParts(fs::path(B).filename().string(),
+                    camB, sdB, stB, edB, etB);
+
+                // compare by start date+time
+                return (sdA + stA) < (sdB + stB);
+            });
+        };
+
+    sortByTimestamp(tens);
+    sortByTimestamp(sixties);
+
+    for (auto& p : tens)    tenSecondPaths_.push_back(p);
+    for (auto& p : sixties) sixtySecondPaths_.push_back(p);
+
+    Logger::instance().logDebug(
+        cameraId_,
+        "FrameDiskWriter: initializeFromDisk_ loaded " +
+        std::to_string(tenSecondPaths_.size()) + " existing 10s clips and " +
+        std::to_string(sixtySecondPaths_.size()) + " existing 60s clips"
+    );
+}

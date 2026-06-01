@@ -1,0 +1,58 @@
+# Prompt 31 - Contrato backend/agente/status para Start da camera
+
+Objetivo:
+Corrigir o contrato entre UI, backend e agente para Start/Stop de camera no Linux. A UI nao deve ficar presa em `reconnecting` sem causa clara. O backend deve diferenciar agente ausente, camera ausente, permissao negada, timeout real de captura e sucesso parcial.
+
+Contexto obrigatorio:
+- Leia os relatorios das fases 29 e 30.
+- Leia:
+  - `DrakonSite/src/worker/index.ts`
+  - `DrakonSite/src/react-app/utils/cameraService.ts`
+  - `DrakonSite/src/react-app/pages/Cameras.tsx`
+  - componentes relacionados a status/eventos de camera
+  - `Perceptrum/linux/LinuxJobRuntime.cpp`
+  - `Perceptrum/linux/LinuxCameraSessionManager.*` se existir
+
+Restricoes:
+- Nao fazer commit.
+- Nao fazer push.
+- Nao expor tokens/chaves em resposta HTTP, logs ou relatorio.
+- Nao declarar camera online sem confirmacao minima do agente.
+
+Tarefas:
+1. Revisar `enqueueStartCameraCommand`:
+   - remover dependencia de clip completo para retorno de sucesso;
+   - usar timeout compativel com ack rapido do agente;
+   - antes de enfileirar, validar se existe pairing ativo com heartbeat recente;
+   - retornar `linux_agent_not_running` quando nao houver agente pollando.
+2. Revisar `/api/agent/commands/:commandId/result`:
+   - sucesso de Start deve atualizar `cameras.is_service_running=1` e `is_online=1` quando `started=true` e `first_frame_captured=true`;
+   - falha deve reverter `is_service_running` conforme `was_service_running_before`;
+   - eventos devem guardar erro real em `details_json`/`metadata` sem segredos.
+3. Ajustar UI:
+   - mostrar erro real de Start;
+   - sair do estado reconnecting quando o backend retorna falha;
+   - oferecer diagnostico simples: agente offline, webcam sem permissao, fonte indisponivel.
+4. Adicionar endpoint/diagnostico local opcional:
+   - status do agente;
+   - ultimo heartbeat;
+   - quantidade de comandos pendentes/sent/failed;
+   - sem segredos.
+5. Adicionar testes:
+   - agente ausente retorna erro claro;
+   - agente responde Start com sucesso;
+   - agente responde Start com falha;
+   - UI/service interpreta falha sem ficar reconnecting infinito.
+
+Validacao obrigatoria:
+```bash
+(cd DrakonSite && npm run test:platform-boundaries)
+(cd DrakonSite && npm run test:local-sqlite-bootstrap)
+(cd DrakonSite && npm run build)
+(cd Perceptrum && cmake --build out/build/linux-debug -j$(nproc))
+(cd Perceptrum && ctest --test-dir out/build/linux-debug -R 'agent|camera|job' --output-on-failure)
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase31-linux-backend-camera-contract-status-ui.md`.
+- Relatorio deve incluir os codigos de erro finais e como eles aparecem na UI.

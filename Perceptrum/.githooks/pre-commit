@@ -1,0 +1,10 @@
+#!/bin/sh
+
+repo_root="$(git rev-parse --show-toplevel)"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$repo_root/scripts/sync-release-artifacts.ps1" -Quiet
+status=$?
+
+if [ "$status" -ne 0 ]; then
+  echo "pre-commit: failed to sync tracked release artifacts."
+  exit "$status"
+fi

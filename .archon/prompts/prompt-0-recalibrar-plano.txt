@@ -1,0 +1,68 @@
+PROMPT 0 — CONSOLIDAR RELATÓRIOS DO ARCHON E RECALIBRAR A MIGRAÇÃO
+
+Atue como arquiteto sênior de C++23, CMake, Linux desktop, Windows desktop, macOS, GTK/WebView, SQLite, PostgreSQL, runtime local, segurança de secrets e arquitetura multiplataforma.
+
+Contexto:
+Estou no Ubuntu, no projeto:
+
+/home/marcello-guimaraes/dev/perceptrum_desktop_aspp
+
+Depois de limpar/baixar o GitHub, o Archon gerou cinco relatórios em:
+
+- .archon/plans/anchor-inventario-projeto.md
+- .archon/plans/anchor-matriz-paridade-windows-linux.md
+- .archon/plans/anchor-plano-migracao-desktop-linux.md
+- .archon/plans/anchor-riscos-multiplataforma.md
+- .archon/plans/anchor-comandos-validacao.md
+
+O Archon observou que:
+- AppHost é a casca desktop Windows e é fortemente Windows-specific.
+- DrakonSite é frontend/backend TypeScript e deve ser preservado como base local/backend quando necessário.
+- Existe núcleo nativo em Perceptrum/Perceptrum.
+- Existem artefatos Linux anteriores em Perceptrum/out/build/linux-debug.
+- Porém os diretórios/arquivos canônicos de Linux, como Perceptrum/linux e Perceptrum/CMakeLists.txt, podem não existir mais na árvore atual.
+- Portanto, não devemos tratar artefatos de build como fonte canônica.
+- A prioridade deve ser criar/restaurar um alvo CMake Linux reprodutível a partir dos fontes reais.
+
+Regras absolutas:
+- Não alterar código.
+- Não fazer commit.
+- Não fazer push.
+- Não apagar arquivos.
+- Não usar git reset --hard.
+- Não usar Perceptrum/out/build como fonte de verdade.
+- Não mexer em AppHost.
+- Não mexer em .vcxproj.
+- Não mexer em .sln.
+- Não quebrar Windows/macOS.
+- Usar somente Codex/gpt-5.5.
+- Não usar Claude, opus, sonnet ou haiku.
+
+Tarefas:
+1. Leia os cinco relatórios em .archon/plans.
+2. Verifique o estado real da árvore atual.
+3. Confirme se Perceptrum/CMakeLists.txt existe ou não.
+4. Confirme se Perceptrum/linux existe ou não.
+5. Confirme quais arquivos fonte reais existem em Perceptrum/Perceptrum.
+6. Confirme quais artefatos existem em Perceptrum/out/build e marque todos como não-canônicos.
+7. Revise a matriz de paridade e ajuste o plano para a árvore atual.
+8. Identifique inconsistências: por exemplo, se AppHost é WPF, WinUI 3, WebView2 ou mistura; não assumir sem evidência.
+9. Gere um novo plano corrigido, adaptado ao estado atual do GitHub limpo.
+
+Saída obrigatória:
+Gerar:
+
+.archon/plans/plano-recalibrado-pos-reset-github.md
+
+O relatório deve conter:
+- estado real da árvore atual;
+- o que é fonte canônica;
+- o que é artefato;
+- o que foi perdido em relação à refatoração anterior;
+- prioridade técnica real;
+- sequência nova de fases;
+- riscos;
+- primeira fase segura de implementação.
+
+Não altere código.
+Não faça commit.

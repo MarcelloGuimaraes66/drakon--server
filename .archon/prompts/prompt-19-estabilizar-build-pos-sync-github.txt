@@ -1,0 +1,42 @@
+# Prompt 19 - Estabilizar build apos sync GitHub
+
+Objetivo:
+Depois da integracao com `origin/main`, deixar TypeScript, Vite, CMake, CTest e o host Linux em estado verde novamente.
+
+Contexto obrigatorio:
+- Leia `.archon/plans/relatorio-fase18-integracao-origin-main.md`.
+- Trabalhe na branch integrada criada no Prompt 18.
+
+Restricoes:
+- Nao fazer push.
+- Nao remover funcionalidades remotas recem-integradas para "passar build".
+- Nao mascarar erros com `any`, `@ts-ignore`, testes removidos ou guards falsos sem justificativa no relatorio.
+- Nao mover dependencias de plataforma para a UI comum React.
+
+Tarefas:
+1. Corrigir erros TypeScript/ESLint/build causados pela integracao.
+2. Corrigir erros CMake/C++ causados pela integracao.
+3. Atualizar scripts de teste se os nomes/rotas mudaram no GitHub.
+4. Garantir que `AppHost/Runtime/desktop-local-server.mjs` continue servindo:
+   - `/__perceptrum/health`
+   - `/api/runtime/local-session`
+   - `/api/runtime/camera-discovery`
+   - rotas novas de control-plane/local-agent ingress trazidas do GitHub
+5. Garantir que `Perceptrum/linux-desktop/run-linux-dev.sh` continue abrindo WebKitGTK e backend local.
+6. Reexecutar validacoes ate ficar verde ou documentar bloqueador real.
+
+Validacao obrigatoria:
+```bash
+cd DrakonSite && npm run test:platform-boundaries
+cd DrakonSite && npm run test:local-sqlite-bootstrap
+cd DrakonSite && npm run test:semantic
+cd DrakonSite && npm run build
+cd Perceptrum && cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cd Perceptrum && cmake --build out/build/linux-debug -j$(nproc)
+cd Perceptrum && ctest --test-dir out/build/linux-debug --output-on-failure
+./Perceptrum/linux-desktop/run-linux-dev.sh --check-backend --print-web-root --no-open
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase19-build-pos-sync-github.md`.
+- O relatorio deve indicar se o sistema integrado compila, quais testes passaram e quais areas ainda faltam para paridade funcional.

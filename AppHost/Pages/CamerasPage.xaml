@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Background="Transparent"
+    RequestedTheme="Dark">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <Grid Padding="24">
+            <StackPanel
+                MaxWidth="1600"
+                HorizontalAlignment="Center"
+                Spacing="20">
+                <StackPanel Spacing="6">
+                    <TextBlock
+                        Style="{StaticResource DrakonDisplayTitleTextStyle}"
+                        Text="Câmeras" />
+                    <TextBlock
+                        Style="{StaticResource DrakonBodyTextStyle}"
+                        Text="Port do modulo Cameras do DrakonSite, agora com CRUD local de interface, dialog nativo e comportamento adaptativo por largura."
+                        TextWrapping="WrapWholeWords" />
+                </StackPanel>
+
+                <InfoBar
+                    x:Name="CameraPageInfoBar"
+                    IsOpen="False"
+                    IsClosable="True"
+                    Severity="Informational" />
+
+                <StackPanel
+                    x:Name="DesktopLayout"
+                    Spacing="20">
+                    <Grid ColumnSpacing="16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <StackPanel Spacing="4">
+                            <TextBlock
+                                Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                Text="Manage your security cameras" />
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Mesmo shape da tabela web: Name, IP Address, Manufacturer, Description, Status e Actions."
+                                TextWrapping="WrapWholeWords" />
+                        </StackPanel>
+
+                        <StackPanel
+                            Grid.Column="1"
+                            Orientation="Horizontal"
+                            Spacing="12">
+                            <Button
+                                x:Name="DesktopRefreshButton"
+                                Content="Refresh runtime" />
+                            <Button
+                                x:Name="DesktopAddButton"
+                                Content="Add Camera"
+                                Style="{StaticResource AccentButtonStyle}" />
+                        </StackPanel>
+                    </Grid>
+
+                    <Border
+                        x:Name="DesktopTableBorder"
+                        Style="{StaticResource DrakonPanelStyle}"
+                        Padding="0">
+                        <StackPanel>
+                            <Grid
+                                Padding="24,18"
+                                Background="{StaticResource DrakonPanelAltBrush}"
+                                BorderBrush="{StaticResource DrakonPanelBorderBrush}"
+                                BorderThickness="0,0,0,1"
+                                ColumnSpacing="16">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="1.5*" />
+                                    <ColumnDefinition Width="1.1*" />
+                                    <ColumnDefinition Width="1*" />
+                                    <ColumnDefinition Width="1.7*" />
+                                    <ColumnDefinition Width="0.9*" />
+                                    <ColumnDefinition Width="1*" />
+                                </Grid.ColumnDefinitions>
+
+                                <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Name" />
+                                <TextBlock Grid.Column="1" Style="{StaticResource DrakonCaptionTextStyle}" Text="IP Address" />
+                                <TextBlock Grid.Column="2" Style="{StaticResource DrakonCaptionTextStyle}" Text="Manufacturer" />
+                                <TextBlock Grid.Column="3" Style="{StaticResource DrakonCaptionTextStyle}" Text="Description" />
+                                <TextBlock Grid.Column="4" Style="{StaticResource DrakonCaptionTextStyle}" Text="Status" />
+                                <TextBlock Grid.Column="5" Style="{StaticResource DrakonCaptionTextStyle}" Text="Actions" />
+                            </Grid>
+
+                            <StackPanel x:Name="DesktopRowsHost" />
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+
+                <StackPanel
+                    x:Name="CompactLayout"
+                    Visibility="Collapsed"
+                    Spacing="16">
+                    <Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+
+                        <Button
+                            x:Name="CompactRefreshButton"
+                            Content="Refresh runtime" />
+                        <Button
+                            x:Name="CompactAddButton"
+                            Grid.Column="1"
+                            Content="Add Camera"
+                            Style="{StaticResource AccentButtonStyle}" />
+                    </Grid>
+
+                    <StackPanel x:Name="CompactCardsHost" Spacing="16" />
+                </StackPanel>
+
+                <Border
+                    x:Name="EmptyStateBorder"
+                    Style="{StaticResource DrakonPanelStyle}"
+                    Visibility="Collapsed">
+                    <StackPanel
+                        HorizontalAlignment="Center"
+                        Spacing="12">
+                        <SymbolIcon
+                            Width="40"
+                            Height="40"
+                            Symbol="Camera" />
+                        <TextBlock
+                            Style="{StaticResource DrakonSectionTitleTextStyle}"
+                            Text="No cameras added yet" />
+                        <TextBlock
+                            Style="{StaticResource DrakonCaptionTextStyle}"
+                            Text="O estado vazio do DrakonSite tambem sera preservado no executavel."
+                            TextWrapping="WrapWholeWords" />
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </Grid>
+    </ScrollViewer>
+</Page>

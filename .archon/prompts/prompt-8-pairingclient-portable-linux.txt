@@ -1,0 +1,56 @@
+# Prompt 8 - PairingClient portatil para Linux
+
+Objetivo:
+Refatorar o `PairingClient` para que o fluxo Linux de pareamento use interfaces multiplataforma e `RuntimePaths`, sem gravar token, client id, exe id ou timezone em arquivos relativos ao CWD.
+
+Escopo permitido:
+- Criar contrato portatil para config nao sensivel de pareamento.
+- Fazer `PairingClient` aceitar `ITokenStore`, config store e `IRuntimeLogger` opcionais.
+- Preservar o construtor/API legado de Windows.
+- Usar o mesmo `PairingClient` no comando Linux `perceptrum-agent pair`.
+- Adicionar testes CTest para garantir que o Linux usa runtime paths e nao CWD.
+- Atualizar o relatorio `.archon/plans/relatorio-fase8-pairingclient-portable-linux.md`.
+
+Restrições:
+- Nao alterar `AppHost/`.
+- Nao alterar `.vcxproj`.
+- Nao alterar `.sln`.
+- Nao fazer commit.
+- Nao fazer push.
+- Nao introduzir dependencia WinUI/WebView2 na UI comum React.
+- Nao habilitar AgentCore completo, CameraSession, FrameDiskWriter, OpenCV, RTSP ou JobRuntime no target Linux minimo.
+
+Validacao obrigatoria:
+
+```bash
+cd Perceptrum
+cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build out/build/linux-debug -j$(nproc)
+ctest --test-dir out/build/linux-debug --output-on-failure
+```
+
+Validacao manual obrigatoria:
+
+```bash
+export APP_RUNTIME_DATA_ROOT=/tmp/perceptrum-runtime-test/data
+export APP_RUNTIME_CONFIG_ROOT=/tmp/perceptrum-runtime-test/config
+export APP_RUNTIME_CACHE_ROOT=/tmp/perceptrum-runtime-test/cache
+export APP_RUNTIME_STATE_ROOT=/tmp/perceptrum-runtime-test/state
+export APP_RUNTIME_LOG_ROOT=/tmp/perceptrum-runtime-test/state/logs
+rm -rf /tmp/perceptrum-runtime-test
+mkdir -p "$APP_RUNTIME_DATA_ROOT" "$APP_RUNTIME_CONFIG_ROOT" "$APP_RUNTIME_CACHE_ROOT" "$APP_RUNTIME_STATE_ROOT" "$APP_RUNTIME_LOG_ROOT"
+./out/build/linux-debug/perceptrum-agent pair --base-url http://127.0.0.1:9 --pair-code TEST-CODE || true
+APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 ./out/build/linux-debug/perceptrum-agent provision --base-url http://localhost:4000 --exe-token TEST_TOKEN --client-id test-client --timezone America/Manaus
+./out/build/linux-debug/perceptrum-agent status || true
+find /tmp/perceptrum-runtime-test -maxdepth 5 -type f -print
+grep -R "TEST_TOKEN" /tmp/perceptrum-runtime-test/data /tmp/perceptrum-runtime-test/state 2>/dev/null || true
+```
+
+Relatorio deve confirmar:
+- quais arquivos foram criados/alterados;
+- se `PairingClient.cpp` entrou no build Linux;
+- que o construtor/API legado Windows foi preservado;
+- que o Linux usa `LinuxTokenStore` e config store baseada em `RuntimePaths`;
+- que o token nao aparece em health/logs/data/state;
+- que AppHost, `.vcxproj` e `.sln` nao foram alterados;
+- resultado de CMake, build, CTest e validacao manual.

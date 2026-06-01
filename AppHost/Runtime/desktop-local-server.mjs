@@ -1,0 +1,1638 @@
+import { createServer } from "http";
+import { Readable } from "stream";
+import fs from "fs";
+import path from "path";
+import { webcrypto } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { Pool } from "../../DrakonSite/node_modules/pg/esm/index.mjs";
+import { WebSocketServer } from "../../DrakonSite/node_modules/ws/wrapper.mjs";
+import { discoverCameraDevices } from "./camera-discovery.mjs";
+
+import {
+  resolveActiveBrandRuntime,
+  resolveDatabaseBackend,
+  resolveDefaultSqlitePath,
+} from "../../DrakonSite/server/brand.ts";
+import { loadEnv } from "../../DrakonSite/server/env.ts";
+import { LocalR2Bucket } from "../../DrakonSite/server/local-r2.ts";
+import { PgD1Database } from "../../DrakonSite/server/pg-d1.ts";
+import { SqliteD1Database } from "../../DrakonSite/server/sqlite-d1.ts";
+import {
+  checkpointPlaintextSqlite,
+  createDesktopSqliteDatabase,
+  encryptPlaintextSqliteInPlace,
+  hasPlaintextSqliteHeader,
+  isDesktopSqliteEncryptionRequired,
+  resolveDesktopSqliteEncryptionConfig,
+} from "../../DrakonSite/server/sqlite-encryption.ts";
+import worker from "../../DrakonSite/src/worker/index.ts";
+import {
+  registerSharedFindRelayConnection,
+  routeSharedFindRelayClientMessage,
+  unregisterSharedFindRelayConnection,
+} from "../../DrakonSite/src/worker/sharedFindRelayState.ts";
+import { startLocalAgentIngressPump } from "../../DrakonSite/src/worker/localAgentIngress.ts";
+import {
+  registerWorkspaceRelayConnection,
+  routeWorkspaceRelayClientMessage,
+  unregisterWorkspaceRelayConnection,
+} from "../../DrakonSite/src/worker/workspaceRelayState.ts";
+
+if (!globalThis.crypto) {
+  Object.defineProperty(globalThis, "crypto", {
+    value: webcrypto,
+    configurable: true,
+  });
+}
+
+loadEnv();
+
+const port = Number(process.env.PORT || 4000);
+const bindHost = process.env.APP_BIND_HOST || "127.0.0.1";
+const runtimeProfile = (process.env.APP_RUNTIME_ENV || "local").toLowerCase();
+const isServerRuntime = runtimeProfile === "server";
+const moduleFilename =
+  typeof __filename === "string" && __filename
+    ? __filename
+    : import.meta?.url
+      ? fileURLToPath(import.meta.url)
+      : "";
+const runtimeRoot = process.env.APP_RUNTIME_ROOT
+  ? path.resolve(process.env.APP_RUNTIME_ROOT)
+  : moduleFilename
+    ? path.dirname(moduleFilename)
+    : path.resolve(process.cwd(), "..");
+const storageRoot = process.env.STORAGE_ROOT
+  ? path.resolve(process.env.STORAGE_ROOT)
+  : path.resolve(process.cwd(), "storage");
+const staticRoot = process.env.APP_STATIC_ROOT
+  ? path.resolve(process.env.APP_STATIC_ROOT)
+  : "";
+const r2Root = path.join(storageRoot, "r2");
+const appBaseUrl = process.env.APP_BASE_URL || `http://${bindHost}:${port}`;
+const agentBaseUrl = String(process.env.APP_AGENT_BASE_URL || "").trim().replace(/\/+$/, "");
+const serverRole = String(process.env.APP_SERVER_ROLE || "ui").trim().toLowerCase();
+const isAgentServer = serverRole === "agent";
+const serviceSessionDir = process.env.APP_SERVICE_SESSION_DIR
+  ? path.resolve(process.env.APP_SERVICE_SESSION_DIR)
+  : path.resolve(storageRoot, "desktop-session");
+const activeBrand = resolveActiveBrandRuntime();
+const databaseBackend = resolveDatabaseBackend(activeBrand);
+let sqliteEncryptionConfig = null;
+let sqliteEncryptionConfigError = null;
+try {
+  sqliteEncryptionConfig = resolveDesktopSqliteEncryptionConfig(process.env);
+} catch (error) {
+  sqliteEncryptionConfigError = summarizeError(error);
+}
+const runtimeHealthRoute = "/api/runtime/health";
+const runtimeAgentHealthRoute = "/api/runtime/agent-health";
+const legacyHealthRoute = "/__perceptrum/health";
+const sqliteCriticalTables = [
+  "app_users",
+  "cameras",
+  "commands",
+  "events",
+  "local_sessions",
+  "local_users",
+];
+
+let cachedExeId = String(process.env.APP_PROVISIONED_EXE_ID || "").trim();
+let activeCameraDiscoveryPromise = null;
+
+fs.mkdirSync(serviceSessionDir, { recursive: true });
+
+let pool = null;
+let sqliteDb = null;
+const R2_BUCKET = new LocalR2Bucket(r2Root);
+let runtimeState = createRuntimeState({
+  summary: "Local runtime is initializing.",
+  details: {
+    backend: databaseBackend,
+    brand: activeBrand.id,
+  },
+});
+
+function createRuntimeState(overrides = {}) {
+  const baseState = {
+    ready: false,
+    fatal: false,
+    summary: "Local runtime is not ready.",
+    details: {
+      backend: databaseBackend,
+      brand: activeBrand.id,
+      port,
+      staticRoot: staticRoot || null,
+      sqliteEncryption:
+        databaseBackend === "sqlite"
+          ? sqliteEncryptionConfig?.mode || (sqliteEncryptionConfigError ? "invalid" : "off")
+          : "off",
+      sqliteKeyVersion:
+        databaseBackend === "sqlite" && sqliteEncryptionConfig
+          ? sqliteEncryptionConfig.keyVersion
+          : null,
+      dailyReportsEnabled: resolveDailyReportsEnabled(),
+    },
+    env: null,
+  };
+
+  return {
+    ...baseState,
+    ...overrides,
+    details: {
+      ...baseState.details,
+      ...(overrides.details || {}),
+    },
+  };
+}
+
+function summarizeError(error) {
+  if (error instanceof Error) {
+    return error.stack || error.message;
+  }
+  return String(error || "Unknown error");
+}
+
+function parseOptionalBooleanFlag(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
+  if (
+    normalized === "1" ||
+    normalized === "true" ||
+    normalized === "yes" ||
+    normalized === "on"
+  ) {
+    return true;
+  }
+
+  if (
+    normalized === "0" ||
+    normalized === "false" ||
+    normalized === "no" ||
+    normalized === "off"
+  ) {
+    return false;
+  }
+
+  return null;
+}
+
+function resolveDailyReportsEnabled() {
+  for (const value of [process.env.DAILY_REPORTS, process.env.daily_reports]) {
+    const parsed = parseOptionalBooleanFlag(value);
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+
+  return false;
+}
+
+function persistDailyReportsFlagFile() {
+  const enabled = resolveDailyReportsEnabled();
+  const targetPath = path.join(serviceSessionDir, "daily_reports_enabled.txt");
+
+  try {
+    fs.writeFileSync(targetPath, enabled ? "true\n" : "false\n", "utf8");
+    console.log(
+      `[desktop-server] daily reports ${
+        enabled ? "enabled" : "disabled"
+      } config synced to ${targetPath}`
+    );
+  } catch (error) {
+    console.warn(
+      `[desktop-server] failed to sync daily reports config to ${targetPath}: ${summarizeError(
+        error
+      )}`
+    );
+  }
+
+  return enabled;
+}
+
+function resolveOptionalEnvSecretValue(inlineValue, filePathValue) {
+  const secretPath = String(filePathValue || "").trim();
+  if (secretPath) {
+    const resolvedPath = path.isAbsolute(secretPath)
+      ? secretPath
+      : path.resolve(process.cwd(), secretPath);
+
+    try {
+      return fs.readFileSync(resolvedPath, "utf8").trim();
+    } catch (error) {
+      throw new Error(
+        `Failed to read desktop runtime secret file at ${resolvedPath}: ${String(error)}`
+      );
+    }
+  }
+
+  return String(inlineValue || "").replace(/\\n/g, "\n").trim();
+}
+
+function buildDesktopGoogleRedirectUri(baseUrl) {
+  try {
+    const normalizedBaseUrl = String(baseUrl || "").trim();
+    if (normalizedBaseUrl) {
+      return new URL(
+        "/auth/callback",
+        normalizedBaseUrl.endsWith("/") ? normalizedBaseUrl : `${normalizedBaseUrl}/`
+      ).toString();
+    }
+  } catch {
+  }
+
+  return `http://${bindHost}:${port}/auth/callback`;
+}
+
+function createWorkerEnv(DB) {
+  const configuredGoogleRedirectUri = String(
+    process.env.GOOGLE_OAUTH_REDIRECT_URI || ""
+  ).trim();
+  const configuredDesktopGoogleClientId = String(
+    process.env.DESKTOP_GOOGLE_OAUTH_CLIENT_ID || ""
+  ).trim();
+  const configuredDesktopGoogleClientSecret = String(
+    process.env.DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET || ""
+  ).trim();
+  const configuredDesktopGoogleRedirectUri = String(
+    process.env.DESKTOP_GOOGLE_OAUTH_REDIRECT_URI || ""
+  ).trim();
+  const effectiveDesktopGoogleRedirectUri =
+    configuredDesktopGoogleClientId
+      ? configuredDesktopGoogleRedirectUri || buildDesktopGoogleRedirectUri(appBaseUrl)
+      : configuredDesktopGoogleRedirectUri;
+  const centralAuthPublicKey = resolveOptionalEnvSecretValue(
+    process.env.CENTRAL_AUTH_PUBLIC_KEY,
+    process.env.CENTRAL_AUTH_PUBLIC_KEY_PATH
+  );
+
+  return {
+    DB,
+    R2_BUCKET,
+    GOOGLE_OAUTH_CLIENT_ID: process.env.GOOGLE_OAUTH_CLIENT_ID || "",
+    GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET || "",
+    DESKTOP_GOOGLE_OAUTH_CLIENT_ID: configuredDesktopGoogleClientId,
+    DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET: configuredDesktopGoogleClientSecret,
+    GOOGLE_OAUTH_REDIRECT_URI: configuredGoogleRedirectUri,
+    DESKTOP_GOOGLE_OAUTH_REDIRECT_URI: effectiveDesktopGoogleRedirectUri,
+    GOOGLE_GEOCODING_API_KEY: process.env.GOOGLE_GEOCODING_API_KEY || "",
+    GEONAMES_USERNAME: process.env.GEONAMES_USERNAME || "",
+    CHAT_V2_ENABLED: process.env.CHAT_V2_ENABLED || "",
+    STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || "",
+    STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET || "",
+    STRIPE_CHAT_PAYG_PRICE_ID: process.env.STRIPE_CHAT_PAYG_PRICE_ID || "",
+    R2_PUBLIC_BASE_URL:
+      process.env.R2_PUBLIC_BASE_URL || `${appBaseUrl}/media`,
+    APP_ALLOWED_ORIGINS: process.env.APP_ALLOWED_ORIGINS || "",
+    APP_AGENT_BASE_URL: process.env.APP_AGENT_BASE_URL || "",
+    APP_SERVER_ROLE: process.env.APP_SERVER_ROLE || "",
+    USD_TO_BRL: process.env.USD_TO_BRL || "",
+    SCHEDULER_TICK_SECRET: process.env.SCHEDULER_TICK_SECRET || "",
+    LOCAL_AGENT_INGEST_MODE: process.env.LOCAL_AGENT_INGEST_MODE || "",
+    LOCAL_AGENT_INGEST_POLL_MS: process.env.LOCAL_AGENT_INGEST_POLL_MS || "",
+    LOCAL_AGENT_EVENT_BATCH_SIZE: process.env.LOCAL_AGENT_EVENT_BATCH_SIZE || "",
+    LOCAL_AGENT_LATEST_BATCH_SIZE: process.env.LOCAL_AGENT_LATEST_BATCH_SIZE || "",
+    LOCAL_AGENT_EVENT_MAX_ATTEMPTS: process.env.LOCAL_AGENT_EVENT_MAX_ATTEMPTS || "",
+    CENTRAL_AUTH_BASE_URL: process.env.CENTRAL_AUTH_BASE_URL || "",
+    CENTRAL_AUTH_PUBLIC_KEY: centralAuthPublicKey,
+    CENTRAL_AUTH_GRANT_TTL_HOURS: process.env.CENTRAL_AUTH_GRANT_TTL_HOURS || "",
+    CENTRAL_AUTH_KEY_ID: process.env.CENTRAL_AUTH_KEY_ID || "",
+  };
+}
+
+function resolveBundledSqliteSeedPath(brand) {
+  return path.join(runtimeRoot, "bootstrap", `${brand.id}_site.seed.sqlite`);
+}
+
+async function closeDatabaseHandles() {
+  sqliteDb?.close();
+  sqliteDb = null;
+
+  if (pool) {
+    const activePool = pool;
+    pool = null;
+    await activePool.end().catch(() => {});
+  }
+}
+
+function sqliteArtifactPaths(sqlitePath) {
+  return [
+    sqlitePath,
+    `${sqlitePath}-wal`,
+    `${sqlitePath}-shm`,
+    `${sqlitePath}-journal`,
+  ];
+}
+
+function backupSqliteArtifacts(sqlitePath, reason) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (const artifactPath of sqliteArtifactPaths(sqlitePath)) {
+    if (!fs.existsSync(artifactPath)) {
+      continue;
+    }
+
+    const backupPath = `${artifactPath}.${reason}.${stamp}.bak`;
+    fs.renameSync(artifactPath, backupPath);
+  }
+}
+
+function snapshotSqliteArtifacts(sqlitePath, reason) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (const artifactPath of sqliteArtifactPaths(sqlitePath)) {
+    if (!fs.existsSync(artifactPath)) {
+      continue;
+    }
+
+    const backupPath = `${artifactPath}.${reason}.${stamp}.bak`;
+    fs.copyFileSync(artifactPath, backupPath);
+  }
+}
+
+function removeSqliteSidecars(sqlitePath) {
+  for (const artifactPath of sqliteArtifactPaths(sqlitePath).slice(1)) {
+    if (fs.existsSync(artifactPath)) {
+      fs.rmSync(artifactPath, { force: true });
+    }
+  }
+}
+
+function removeSqliteArtifacts(sqlitePath) {
+  for (const artifactPath of sqliteArtifactPaths(sqlitePath)) {
+    if (fs.existsSync(artifactPath)) {
+      fs.rmSync(artifactPath, { force: true });
+    }
+  }
+}
+
+function copyBundledSqliteSeed(seedPath, sqlitePath) {
+  fs.mkdirSync(path.dirname(sqlitePath), { recursive: true });
+  removeSqliteSidecars(sqlitePath);
+  fs.copyFileSync(seedPath, sqlitePath);
+}
+
+function sqliteEncryptionRequired() {
+  return Boolean(
+    sqliteEncryptionConfig && isDesktopSqliteEncryptionRequired(sqliteEncryptionConfig)
+  );
+}
+
+function openSqliteForInspection(sqlitePath) {
+  if (hasPlaintextSqliteHeader(sqlitePath)) {
+    return new SqliteD1Database(sqlitePath);
+  }
+
+  if (!sqliteEncryptionRequired()) {
+    throw new Error(
+      "SQLite database appears encrypted or unreadable, but desktop encryption is disabled for this runtime."
+    );
+  }
+
+  return createDesktopSqliteDatabase(sqlitePath, sqliteEncryptionConfig);
+}
+
+async function createEncryptedSqliteTempFromSource(sourcePath, tempPath) {
+  if (!sqliteEncryptionRequired()) {
+    throw new Error("Desktop SQLite encryption is required, but no encryption config is loaded.");
+  }
+
+  removeSqliteArtifacts(tempPath);
+  fs.mkdirSync(path.dirname(tempPath), { recursive: true });
+  fs.copyFileSync(sourcePath, tempPath);
+  await encryptPlaintextSqliteInPlace(tempPath, sqliteEncryptionConfig);
+}
+
+async function inspectSqliteSchema(sqlitePath) {
+  if (!fs.existsSync(sqlitePath)) {
+    return {
+      ok: false,
+      missingCriticalTables: [...sqliteCriticalTables],
+      tableNames: [],
+      error: `SQLite database file was not found at ${sqlitePath}`,
+    };
+  }
+
+  let db = null;
+  try {
+    db = openSqliteForInspection(sqlitePath);
+    const { results = [] } = await db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+      )
+      .all();
+    const tableNames = results
+      .map((row) => String(row?.name || "").trim())
+      .filter(Boolean);
+    const existingTables = new Set(tableNames.map((name) => name.toLowerCase()));
+    const missingCriticalTables = sqliteCriticalTables.filter(
+      (name) => !existingTables.has(name)
+    );
+
+    return {
+      ok: missingCriticalTables.length === 0,
+      missingCriticalTables,
+      tableNames,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      missingCriticalTables: [...sqliteCriticalTables],
+      tableNames: [],
+      error: summarizeError(error),
+    };
+  } finally {
+    db?.close();
+  }
+}
+
+async function provisionSqliteDatabase(sqlitePath, seedPath) {
+  const actions = [];
+  const seedExists = fs.existsSync(seedPath);
+  const encryptionRequired = sqliteEncryptionRequired();
+
+  if (sqliteEncryptionConfigError) {
+    return {
+      ready: false,
+      summary: sqliteEncryptionConfigError,
+      details: {
+        sqlitePath,
+        seedPath: seedExists ? seedPath : null,
+        actions,
+        missingCriticalTables: [...sqliteCriticalTables],
+      },
+    };
+  }
+
+  if (!fs.existsSync(sqlitePath)) {
+    if (!seedExists) {
+      return {
+        ready: false,
+        summary: `Bundled SQLite seed was not found at ${seedPath}.`,
+        details: {
+          sqlitePath,
+          seedPath,
+          actions,
+          missingCriticalTables: [...sqliteCriticalTables],
+        },
+      };
+    }
+
+    if (encryptionRequired) {
+      const tempPath = `${sqlitePath}.provisioning`;
+      try {
+        await createEncryptedSqliteTempFromSource(seedPath, tempPath);
+        removeSqliteArtifacts(sqlitePath);
+        fs.renameSync(tempPath, sqlitePath);
+      } catch (error) {
+        removeSqliteArtifacts(tempPath);
+        return {
+          ready: false,
+          summary: "Failed to create the encrypted local SQLite database from the bundled seed.",
+          details: {
+            sqlitePath,
+            seedPath,
+            actions,
+            missingCriticalTables: [...sqliteCriticalTables],
+            encryptionError: summarizeError(error),
+          },
+        };
+      }
+      actions.push("created the local SQLite database from the bundled seed");
+      actions.push("encrypted the local SQLite database with the desktop installation key");
+    } else {
+      copyBundledSqliteSeed(seedPath, sqlitePath);
+      actions.push("copied bundled SQLite seed because the local database was missing");
+    }
+  } else if (encryptionRequired && hasPlaintextSqliteHeader(sqlitePath)) {
+    const tempPath = `${sqlitePath}.encrypting`;
+    try {
+      await checkpointPlaintextSqlite(sqlitePath);
+      await createEncryptedSqliteTempFromSource(sqlitePath, tempPath);
+      const tempInspection = await inspectSqliteSchema(tempPath);
+      if (!tempInspection.ok) {
+        throw new Error(
+          tempInspection.error ||
+            `Encrypted SQLite temp database is missing required tables: ${tempInspection.missingCriticalTables.join(", ")}`
+        );
+      }
+      snapshotSqliteArtifacts(sqlitePath, "plaintext-backup");
+      removeSqliteArtifacts(sqlitePath);
+      fs.renameSync(tempPath, sqlitePath);
+      actions.push("encrypted the existing local SQLite database with the desktop installation key");
+    } catch (error) {
+      removeSqliteArtifacts(tempPath);
+      return {
+        ready: false,
+        summary: "Failed to migrate the existing local SQLite database to encrypted storage.",
+        details: {
+          sqlitePath,
+          seedPath: seedExists ? seedPath : null,
+          actions,
+          missingCriticalTables: [...sqliteCriticalTables],
+          migrationError: summarizeError(error),
+        },
+      };
+    }
+  }
+
+  const sqliteLooksPlaintext = hasPlaintextSqliteHeader(sqlitePath);
+  let inspection = await inspectSqliteSchema(sqlitePath);
+  if (!inspection.ok) {
+    if (!sqliteLooksPlaintext) {
+      return {
+        ready: false,
+        summary:
+          inspection.error ||
+          "Encrypted SQLite database could not be opened with the current desktop key.",
+        details: {
+          sqlitePath,
+          seedPath: seedExists ? seedPath : null,
+          actions,
+          missingCriticalTables: inspection.missingCriticalTables,
+          inspectionError: inspection.error,
+        },
+      };
+    }
+
+    if (!seedExists) {
+      return {
+        ready: false,
+        summary:
+          inspection.error ||
+          `SQLite database is missing required tables: ${inspection.missingCriticalTables.join(", ")}`,
+        details: {
+          sqlitePath,
+          seedPath,
+          actions,
+          missingCriticalTables: inspection.missingCriticalTables,
+          inspectionError: inspection.error,
+        },
+      };
+    }
+
+    backupSqliteArtifacts(sqlitePath, "invalid-schema");
+    if (encryptionRequired) {
+      const tempPath = `${sqlitePath}.reseed`;
+      try {
+        await createEncryptedSqliteTempFromSource(seedPath, tempPath);
+        removeSqliteArtifacts(sqlitePath);
+        fs.renameSync(tempPath, sqlitePath);
+      } catch (error) {
+        removeSqliteArtifacts(tempPath);
+        return {
+          ready: false,
+          summary: "Failed to rebuild the encrypted local SQLite database from the bundled seed.",
+          details: {
+            sqlitePath,
+            seedPath,
+            actions,
+            missingCriticalTables: inspection.missingCriticalTables,
+            inspectionError: inspection.error,
+            encryptionError: summarizeError(error),
+          },
+        };
+      }
+    } else {
+      copyBundledSqliteSeed(seedPath, sqlitePath);
+    }
+    actions.push(
+      "replaced the local SQLite database with the bundled seed after schema validation failed"
+    );
+    if (encryptionRequired) {
+      actions.push("encrypted the rebuilt local SQLite database with the desktop installation key");
+    }
+    inspection = await inspectSqliteSchema(sqlitePath);
+  }
+
+  if (!inspection.ok) {
+    return {
+      ready: false,
+      summary:
+        inspection.error ||
+        `SQLite database is still missing required tables: ${inspection.missingCriticalTables.join(", ")}`,
+      details: {
+        sqlitePath,
+        seedPath,
+        actions,
+        missingCriticalTables: inspection.missingCriticalTables,
+        inspectionError: inspection.error,
+      },
+    };
+  }
+
+  return {
+    ready: true,
+    summary:
+      actions.length > 0
+        ? "SQLite database prepared for the local runtime."
+        : "SQLite database schema already available.",
+    details: {
+      sqlitePath,
+      seedPath: seedExists ? seedPath : null,
+      actions,
+      tableCount: inspection.tableNames.length,
+      sqliteEncryption:
+        sqliteEncryptionConfig?.mode || (sqliteEncryptionConfigError ? "invalid" : "off"),
+    },
+  };
+}
+
+async function warmWorkerBootstrap(env) {
+  const response = await invokeWorkerFetch(
+    `${appBaseUrl}/api/auth/me`,
+    "GET",
+    new Headers({
+      accept: "application/json",
+    }),
+    undefined,
+    env
+  );
+
+  if (response.ok) {
+    return;
+  }
+
+  const body = await response.text().catch(() => "");
+  throw new Error(
+    `Worker warm-up failed with HTTP ${response.status}${
+      body ? `: ${body.trim()}` : ""
+    }`
+  );
+}
+
+async function initializeRuntimeState() {
+  persistDailyReportsFlagFile();
+
+  if (databaseBackend === "sqlite") {
+    const sqlitePath = resolveDefaultSqlitePath(activeBrand, storageRoot);
+    const seedPath = resolveBundledSqliteSeedPath(activeBrand);
+    const provision = await provisionSqliteDatabase(sqlitePath, seedPath);
+
+    if (!provision.ready) {
+      return createRuntimeState({
+        fatal: true,
+        summary: provision.summary,
+        details: provision.details,
+      });
+    }
+
+    try {
+      const DB = await createDatabase(sqlitePath);
+      const env = createWorkerEnv(DB);
+      await warmWorkerBootstrap(env);
+
+      return createRuntimeState({
+        ready: true,
+        summary: provision.summary,
+        details: provision.details,
+        env,
+      });
+    } catch (error) {
+      await closeDatabaseHandles();
+      return createRuntimeState({
+        fatal: true,
+        summary: "SQLite database is present, but backend warm-up failed.",
+        details: {
+          ...provision.details,
+          warmupError: summarizeError(error),
+        },
+      });
+    }
+  }
+
+  try {
+    const DB = await createDatabase();
+    const env = createWorkerEnv(DB);
+    await warmWorkerBootstrap(env);
+    return createRuntimeState({
+      ready: true,
+      summary: "Backend warm-up completed successfully.",
+      env,
+    });
+  } catch (error) {
+    await closeDatabaseHandles();
+    return createRuntimeState({
+      fatal: true,
+      summary: "Backend warm-up failed.",
+      details: {
+        warmupError: summarizeError(error),
+      },
+    });
+  }
+}
+
+async function createDatabase(sqlitePathOverride = null) {
+  if (databaseBackend === "sqlite") {
+    const sqlitePath =
+      sqlitePathOverride || resolveDefaultSqlitePath(activeBrand, storageRoot);
+    sqliteDb = createDesktopSqliteDatabase(
+      sqlitePath,
+      sqliteEncryptionConfig || resolveDesktopSqliteEncryptionConfig(process.env)
+    );
+    console.log(
+      `[desktop-server] SQLite database: ${sqlitePath} (encryption=${sqliteEncryptionConfig?.mode || "off"})`
+    );
+    return sqliteDb;
+  }
+
+  pool = new Pool({
+    host: process.env.PGHOST || "localhost",
+    port: Number(process.env.PGPORT || 5433),
+    database: process.env.PGDATABASE || "perceptrum_site",
+    user: process.env.PGUSER || "postgres",
+    password: process.env.PGPASSWORD || "1234",
+  });
+  return new PgD1Database(pool);
+}
+
+async function startServer() {
+  runtimeState = await initializeRuntimeState();
+  if (runtimeState.ready) {
+    console.log(`[desktop-server] preflight ready: ${runtimeState.summary}`);
+  } else {
+    console.error(`[desktop-server] preflight failed: ${runtimeState.summary}`);
+    if (runtimeState.details?.warmupError) {
+      console.error(runtimeState.details.warmupError);
+    }
+  }
+
+  if (isAgentServer && runtimeState.env) {
+    startLocalAgentIngressPump({
+      env: runtimeState.env,
+      dispatch: (request) =>
+        worker.fetch(request, runtimeState.env, { waitUntil: () => {} }),
+    });
+  }
+
+  const relayWss = new WebSocketServer({ noServer: true });
+  const workspaceRelayWss = new WebSocketServer({ noServer: true });
+
+  const server = createServer(async (req, res) => {
+    if (!req.url) {
+      res.statusCode = 400;
+      res.end("Bad Request");
+      return;
+    }
+
+    const url = new URL(req.url, `http://${req.headers.host}`);
+
+    if (url.pathname === legacyHealthRoute) {
+      writeJson(res, 200, {
+        ok: true,
+        brand: activeBrand.id,
+        backend: databaseBackend,
+        staticRoot: staticRoot || null,
+        staticReady: Boolean(staticRoot && fs.existsSync(path.join(staticRoot, "index.html"))),
+      });
+      return;
+    }
+
+    if (url.pathname === runtimeHealthRoute) {
+      writeJson(res, runtimeState.ready ? 200 : runtimeState.fatal ? 503 : 202, {
+        ready: runtimeState.ready,
+        fatal: runtimeState.fatal,
+        summary: runtimeState.summary,
+        details: runtimeState.details,
+      });
+      return;
+    }
+
+    if (url.pathname === runtimeAgentHealthRoute) {
+      writeJson(res, 200, await buildRuntimeAgentHealthPayload(runtimeState.env));
+      return;
+    }
+
+    if (url.pathname === "/api/auth/country" && req.method === "GET") {
+      writeJson(res, 200, {
+        detectedCountryCode: detectCountryFromHeaders(req),
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/runtime/local-session" && req.method === "POST") {
+      if (!runtimeState.ready || !runtimeState.env) {
+        writeRuntimeUnavailable(res, url.pathname);
+        return;
+      }
+
+      await handleRuntimeLocalSession(req, res, runtimeState.env);
+      return;
+    }
+
+    if (url.pathname === "/api/runtime/camera-discovery" && req.method === "POST") {
+      await handleCameraDiscovery(req, res);
+      return;
+    }
+
+    if (url.pathname.startsWith("/media/")) {
+      await serveMedia(res, url.pathname);
+      return;
+    }
+
+    if (isAgentServer && !isAgentRequestPath(url.pathname)) {
+      res.statusCode = 404;
+      res.end("Not Found");
+      return;
+    }
+
+    if (!isAgentServer && agentBaseUrl && isAgentRequestPath(url.pathname)) {
+      const forwarded = await forwardHttpRequest(
+        req,
+        new URL(
+          `${url.pathname}${url.search}`,
+          agentBaseUrl.endsWith("/") ? agentBaseUrl : `${agentBaseUrl}/`
+        )
+      );
+      await writeWorkerResponse(res, forwarded);
+      return;
+    }
+
+    if (url.pathname.startsWith("/ws/")) {
+      res.statusCode = 501;
+      res.end("WebSocket not supported in local server");
+      return;
+    }
+
+    if (await tryServeStatic(res, url.pathname)) {
+      return;
+    }
+
+    if (!runtimeState.ready || !runtimeState.env) {
+      writeRuntimeUnavailable(res, url.pathname);
+      return;
+    }
+
+    const response = await proxyWorkerRequest(req, url, runtimeState.env);
+    await writeWorkerResponse(res, response);
+  });
+
+  relayWss.on("connection", (ws, request) => {
+    const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    const token = requestUrl.searchParams.get("token") || "";
+    const registered = registerSharedFindRelayConnection(token, ws);
+
+    if (!registered) {
+      try {
+        ws.send(JSON.stringify({ type: "relay_error", error: "invalid_or_expired_session" }));
+      } catch {
+        // ignore send errors during close
+      }
+      ws.close(1008, "invalid_or_expired_session");
+      return;
+    }
+
+    const { publicId, expiresAt } = registered;
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "relay_ready",
+          public_id: publicId,
+          expires_at: expiresAt,
+        })
+      );
+    } catch {
+      ws.close(1011, "relay_ready_failed");
+      return;
+    }
+
+    ws.on("message", (rawData) => {
+      let payload = null;
+      try {
+        payload = JSON.parse(String(rawData || "{}"));
+      } catch {
+        try {
+          ws.send(JSON.stringify({ type: "relay_error", error: "invalid_json" }));
+        } catch {
+          // ignore send errors
+        }
+        return;
+      }
+
+      const routed = routeSharedFindRelayClientMessage(publicId, payload);
+      if (!routed.ok && routed.error) {
+        try {
+          ws.send(JSON.stringify({ type: "relay_error", error: routed.error }));
+        } catch {
+          // ignore send errors
+        }
+      }
+    });
+
+    ws.on("close", () => {
+      unregisterSharedFindRelayConnection(publicId, ws);
+    });
+  });
+
+  workspaceRelayWss.on("connection", (ws, request) => {
+    const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    const token = requestUrl.searchParams.get("token") || "";
+    const registered = registerWorkspaceRelayConnection(token, ws);
+
+    if (!registered) {
+      try {
+        ws.send(JSON.stringify({ type: "relay_error", error: "invalid_or_expired_session" }));
+      } catch {
+        // ignore send errors during close
+      }
+      ws.close(1008, "invalid_or_expired_session");
+      return;
+    }
+
+    const { publicId, expiresAt } = registered;
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "relay_ready",
+          public_id: publicId,
+          expires_at: expiresAt,
+        })
+      );
+    } catch {
+      ws.close(1011, "relay_ready_failed");
+      return;
+    }
+
+    ws.on("message", (rawData) => {
+      let payload = null;
+      try {
+        payload = JSON.parse(String(rawData || "{}"));
+      } catch {
+        try {
+          ws.send(JSON.stringify({ type: "relay_error", error: "invalid_json" }));
+        } catch {
+          // ignore send errors
+        }
+        return;
+      }
+
+      const routed = routeWorkspaceRelayClientMessage(publicId, payload);
+      if (!routed.ok && routed.error) {
+        try {
+          ws.send(JSON.stringify({ type: "relay_error", error: routed.error }));
+        } catch {
+          // ignore send errors
+        }
+      }
+    });
+
+    ws.on("close", () => {
+      unregisterWorkspaceRelayConnection(publicId, ws);
+    });
+  });
+
+  server.on("upgrade", (req, socket, head) => {
+    if (!req.url) {
+      socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    const requestUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    if (requestUrl.pathname === "/ws/find-relay") {
+      relayWss.handleUpgrade(req, socket, head, (ws) => {
+        relayWss.emit("connection", ws, req);
+      });
+      return;
+    }
+
+    if (requestUrl.pathname === "/ws/workspace-relay") {
+      workspaceRelayWss.handleUpgrade(req, socket, head, (ws) => {
+        workspaceRelayWss.emit("connection", ws, req);
+      });
+      return;
+    }
+
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
+  });
+
+  server.listen(port, bindHost, () => {
+    console.log(
+      `[desktop-server] role=${serverRole} brand=${activeBrand.id} profile=${runtimeProfile} backend=${databaseBackend} listening on http://${bindHost}:${port} static=${staticRoot || "<none>"} sessionDir=${serviceSessionDir} health=${runtimeState.ready ? "ready" : "error"}${
+        !isAgentServer && agentBaseUrl ? ` agentProxy=${agentBaseUrl}` : ""
+      }`
+    );
+  });
+}
+
+async function handleRuntimeLocalSession(req, res, env) {
+  try {
+    const body = await readJsonBody(req);
+    const exeId = resolveOrCreateExeId(body?.exe_id);
+    const timezoneIana =
+      typeof body?.timezone_iana === "string" ? body.timezone_iana.trim() : "";
+
+    const generateResponse = await invokeWorkerFetch(
+      `${appBaseUrl}/api/pairing/generate`,
+      "POST",
+      buildForwardHeaders(req),
+      undefined,
+      env
+    );
+
+    if (!generateResponse.ok) {
+      await writeWorkerResponse(res, generateResponse);
+      return;
+    }
+
+    const generatePayload = await generateResponse.json();
+    const pairCode = String(generatePayload?.pair_code || "").trim();
+    if (!pairCode) {
+      res.statusCode = 500;
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      res.end(JSON.stringify({ error: "Unable to generate local pair code." }));
+      return;
+    }
+
+    const pairResponse = await invokeWorkerFetch(
+      `${appBaseUrl}/api/pairing/pair`,
+      "POST",
+      buildForwardHeaders(req, {
+        "content-type": "application/json; charset=utf-8",
+      }),
+      JSON.stringify({
+        pair_code: pairCode,
+        exe_id: exeId,
+        timezone_iana: timezoneIana,
+      }),
+      env
+    );
+
+    await writeWorkerResponse(res, pairResponse);
+  } catch (error) {
+    console.error("[desktop-server] local-session failed", error);
+    res.statusCode = 500;
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    res.end(
+      JSON.stringify({
+        error:
+          error instanceof Error ? error.message : "Unable to provision local session.",
+      })
+    );
+  }
+}
+
+async function handleCameraDiscovery(req, res) {
+  let body = {};
+
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    writeJson(res, 400, {
+      error:
+        error instanceof Error ? error.message : "Invalid JSON body for camera discovery.",
+    });
+    return;
+  }
+
+  try {
+    if (!activeCameraDiscoveryPromise) {
+      activeCameraDiscoveryPromise = discoverCameraDevices(body).finally(() => {
+        activeCameraDiscoveryPromise = null;
+      });
+    }
+
+    const payload = await activeCameraDiscoveryPromise;
+    writeJson(res, 200, payload);
+  } catch (error) {
+    console.error("[desktop-server] camera discovery failed", error);
+    writeJson(res, 500, {
+      error:
+        error instanceof Error ? error.message : "Failed to scan the local network for cameras.",
+    });
+  }
+}
+
+function resolveOrCreateExeId(candidate) {
+  const direct = typeof candidate === "string" ? candidate.trim() : "";
+  if (direct) {
+    cachedExeId = direct;
+    return direct;
+  }
+
+  if (cachedExeId) {
+    return cachedExeId;
+  }
+
+  cachedExeId = `desktop-${Date.now()}`;
+  return cachedExeId;
+}
+
+function buildForwardHeaders(req, overrides = {}) {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (typeof item === "string") {
+          headers.append(key, item);
+        }
+      }
+      continue;
+    }
+
+    if (typeof value === "string") {
+      headers.set(key, value);
+    }
+  }
+
+  for (const [key, value] of Object.entries(overrides)) {
+    headers.set(key, value);
+  }
+
+  return headers;
+}
+
+function isAgentRequestPath(pathname) {
+  return pathname === "/api/agent" || pathname.startsWith("/api/agent/");
+}
+
+async function forwardHttpRequest(req, targetUrl) {
+  const method = req.method || "GET";
+  const body = method === "GET" || method === "HEAD" ? undefined : Readable.toWeb(req);
+  const init = {
+    method,
+    headers: req.headers,
+    body,
+  };
+
+  if (body) {
+    init.duplex = "half";
+  }
+
+  return fetch(new Request(targetUrl.toString(), init));
+}
+
+async function proxyWorkerRequest(req, url, env) {
+  const method = req.method || "GET";
+  const body = method === "GET" || method === "HEAD" ? undefined : Readable.toWeb(req);
+  const init = {
+    method,
+    headers: req.headers,
+    body,
+  };
+
+  if (body) {
+    init.duplex = "half";
+  }
+
+  return worker.fetch(
+    new Request(url.toString(), init),
+    env,
+    { waitUntil: () => {} }
+  );
+}
+
+function invokeWorkerFetch(url, method, headers, body, env) {
+  const init = {
+    method,
+    headers,
+    body,
+  };
+
+  if (body) {
+    init.duplex = "half";
+  }
+
+  return worker.fetch(
+    new Request(url, init),
+    env,
+    { waitUntil: () => {} }
+  );
+}
+
+async function writeWorkerResponse(res, response) {
+  res.statusCode = response.status;
+
+  const getSetCookie =
+    typeof response.headers.getSetCookie === "function"
+      ? response.headers.getSetCookie()
+      : null;
+  const setCookieValues = Array.isArray(getSetCookie)
+    ? getSetCookie
+    : (() => {
+        const single = response.headers.get("set-cookie");
+        return single ? [single] : [];
+      })();
+
+  response.headers.forEach((value, key) => {
+    if (key.toLowerCase() === "set-cookie") {
+      return;
+    }
+    res.setHeader(key, value);
+  });
+
+  if (setCookieValues.length > 0) {
+    res.setHeader(
+      "set-cookie",
+      setCookieValues.map((value) => rewriteSetCookie(value))
+    );
+  }
+
+  if (response.body) {
+    await new Promise((resolve, reject) => {
+      Readable.fromWeb(response.body).on("error", reject).on("end", resolve).pipe(res);
+    }).catch(() => {
+      if (!res.headersSent) {
+        res.statusCode = 500;
+        res.end("Unable to proxy worker response");
+      }
+    });
+    return;
+  }
+
+  res.end();
+}
+
+async function readJsonBody(req) {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  if (chunks.length === 0) {
+    return {};
+  }
+
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (!raw) {
+    return {};
+  }
+
+  return JSON.parse(raw);
+}
+
+function writeJson(res, statusCode, payload) {
+  res.statusCode = statusCode;
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(payload));
+}
+
+function selectedRuntimeEnvironment() {
+  return {
+    SQLITE_DB_PATH: process.env.SQLITE_DB_PATH ? path.resolve(process.env.SQLITE_DB_PATH) : null,
+    STORAGE_ROOT: storageRoot,
+    APP_RUNTIME_DATA_ROOT: process.env.APP_RUNTIME_DATA_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_DATA_ROOT)
+      : null,
+    APP_RUNTIME_CONFIG_ROOT: process.env.APP_RUNTIME_CONFIG_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_CONFIG_ROOT)
+      : null,
+    APP_RUNTIME_CACHE_ROOT: process.env.APP_RUNTIME_CACHE_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_CACHE_ROOT)
+      : null,
+    APP_RUNTIME_STATE_ROOT: process.env.APP_RUNTIME_STATE_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_STATE_ROOT)
+      : null,
+    APP_RUNTIME_LOG_ROOT: process.env.APP_RUNTIME_LOG_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_LOG_ROOT)
+      : null,
+    APP_BASE_URL: appBaseUrl,
+    APP_SERVER_ROLE: serverRole,
+    PORT: port,
+  };
+}
+
+function readAgentHealthSnapshot() {
+  const dataRoot = process.env.APP_RUNTIME_DATA_ROOT
+    ? path.resolve(process.env.APP_RUNTIME_DATA_ROOT)
+    : storageRoot;
+  const snapshotPath = path.join(dataRoot, "agent_health.json");
+  try {
+    const raw = fs.readFileSync(snapshotPath, "utf8");
+    const snapshot = JSON.parse(raw);
+    const heartbeatMs = Number(snapshot?.heartbeat_unix_ms || 0);
+    const ageMs = heartbeatMs > 0 ? Math.max(0, Date.now() - heartbeatMs) : null;
+    const staleAfterMs = Number(process.env.PERCEPTRUM_AGENT_HEALTH_STALE_SECONDS || 30) * 1000;
+    return {
+      path: snapshotPath,
+      exists: true,
+      stale: ageMs === null || ageMs > staleAfterMs,
+      heartbeat_age_seconds: ageMs === null ? null : Math.floor(ageMs / 1000),
+      status: typeof snapshot?.status === "string" ? snapshot.status : null,
+      pid: Number.isFinite(Number(snapshot?.pid)) ? Number(snapshot.pid) : null,
+      client_id: typeof snapshot?.client_id === "string" ? snapshot.client_id : "",
+      exe_id: typeof snapshot?.exe_id === "string" ? snapshot.exe_id : "",
+      agent_runtime: typeof snapshot?.agent_runtime === "string" ? snapshot.agent_runtime : "",
+      runtime_mode: typeof snapshot?.runtime_mode === "string" ? snapshot.runtime_mode : "",
+      job_runtime_enabled: Boolean(snapshot?.job_runtime_enabled),
+      job_runtime_commands_polled: Number(snapshot?.job_runtime_commands_polled || 0),
+      job_runtime_commands_completed: Number(snapshot?.job_runtime_commands_completed || 0),
+      job_runtime_commands_failed: Number(snapshot?.job_runtime_commands_failed || 0),
+      last_command_type:
+        typeof snapshot?.job_runtime_last_command_type === "string"
+          ? snapshot.job_runtime_last_command_type
+          : "",
+      last_error:
+        typeof snapshot?.job_runtime_last_error === "string"
+          ? snapshot.job_runtime_last_error
+          : "",
+      active_camera_sessions: Array.isArray(snapshot?.active_camera_sessions)
+        ? snapshot.active_camera_sessions
+        : [],
+      camera_session_last_errors:
+        snapshot?.camera_session_last_errors &&
+        typeof snapshot.camera_session_last_errors === "object"
+          ? snapshot.camera_session_last_errors
+          : {},
+      camera_session_last_thumbnails:
+        snapshot?.camera_session_last_thumbnails &&
+        typeof snapshot.camera_session_last_thumbnails === "object"
+          ? snapshot.camera_session_last_thumbnails
+          : {},
+      camera_session_clip_directories:
+        snapshot?.camera_session_clip_directories &&
+        typeof snapshot.camera_session_clip_directories === "object"
+          ? snapshot.camera_session_clip_directories
+          : {},
+      camera_session_ffmpeg_child_pids:
+        snapshot?.camera_session_ffmpeg_child_pids &&
+        typeof snapshot.camera_session_ffmpeg_child_pids === "object"
+          ? snapshot.camera_session_ffmpeg_child_pids
+          : {},
+    };
+  } catch (error) {
+    return {
+      path: snapshotPath,
+      exists: false,
+      stale: true,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function readAgentCommandCounts(env) {
+  const db = env?.DB;
+  if (!db || typeof db.prepare !== "function") {
+    return {
+      pending: 0,
+      sent: 0,
+      failed: 0,
+      completed: 0,
+    };
+  }
+
+  try {
+    const { results } = await db
+      .prepare(
+        `SELECT COALESCE(status, 'pending') AS status, COUNT(*) AS count
+         FROM commands
+         WHERE command_type IN ('start_camera', 'stop_camera')
+         GROUP BY COALESCE(status, 'pending')`
+      )
+      .all();
+    const counts = {
+      pending: 0,
+      sent: 0,
+      failed: 0,
+      completed: 0,
+    };
+    for (const row of results || []) {
+      const status = String(row?.status || "pending").trim().toLowerCase();
+      const count = Number(row?.count || 0);
+      if (status === "pending" || status === "sent" || status === "failed" || status === "completed") {
+        counts[status] = count;
+      }
+    }
+    return counts;
+  } catch {
+    return {
+      pending: 0,
+      sent: 0,
+      failed: 0,
+      completed: 0,
+    };
+  }
+}
+
+async function buildRuntimeAgentHealthPayload(envInput) {
+  const env = selectedRuntimeEnvironment();
+  const sqlitePath =
+    runtimeState.details?.sqlitePath ||
+    env.SQLITE_DB_PATH ||
+    resolveDefaultSqlitePath(activeBrand, storageRoot);
+  const snapshot = readAgentHealthSnapshot();
+  const commandCounts = await readAgentCommandCounts(envInput);
+  return {
+    ok: snapshot.exists && !snapshot.stale,
+    backend: {
+      pid: process.pid,
+      sqlite_path: sqlitePath,
+      storage_root: storageRoot,
+      runtime_ready: runtimeState.ready,
+    },
+    env,
+    agent: snapshot,
+    commands: commandCounts,
+  };
+}
+
+function detectCountryFromHeaders(req) {
+  const value = String(
+    req.headers["cf-ipcountry"] ||
+      req.headers["x-country-code"] ||
+      req.headers["x-app-country-code"] ||
+      ""
+  )
+    .trim()
+    .toUpperCase();
+
+  if (!value || value === "XX") {
+    return null;
+  }
+
+  return value;
+}
+
+function writeRuntimeUnavailable(res, pathname) {
+  writeJson(res, 503, {
+    error: runtimeState.summary,
+    ready: runtimeState.ready,
+    fatal: runtimeState.fatal,
+    path: pathname,
+    details: runtimeState.details,
+  });
+}
+
+async function tryServeStatic(res, pathname) {
+  if (!staticRoot || pathname.startsWith("/api/") || pathname.startsWith("/runtime/")) {
+    return false;
+  }
+
+  const safeRoot = path.resolve(staticRoot);
+  let requestedPath = pathname === "/" ? "/index.html" : pathname;
+  const cleanRelativePath = requestedPath.replace(/^\/+/, "");
+  let filePath = path.resolve(path.join(safeRoot, cleanRelativePath));
+
+  if (!filePath.startsWith(safeRoot)) {
+    res.statusCode = 400;
+    res.end("Invalid path");
+    return true;
+  }
+
+  if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
+    filePath = path.join(filePath, "index.html");
+  }
+
+  if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+    await serveFile(res, filePath, requestedPath);
+    return true;
+  }
+
+  if (path.extname(cleanRelativePath)) {
+    res.statusCode = 404;
+    res.end("Not found");
+    return true;
+  }
+
+  const spaFallback = path.join(safeRoot, "index.html");
+  if (fs.existsSync(spaFallback)) {
+    await serveFile(res, spaFallback, "/index.html");
+    return true;
+  }
+
+  return false;
+}
+
+async function serveFile(res, filePath, requestPath = "") {
+  const contentType = guessContentType(filePath);
+  if (contentType) {
+    res.setHeader("content-type", contentType);
+  }
+
+  const normalizedRequestPath = String(requestPath).replace(/\\/g, "/").toLowerCase();
+  const isBrandingAsset = normalizedRequestPath.includes("/branding/current/");
+
+  if (
+    isBrandingAsset ||
+    (contentType && (contentType.startsWith("text/") || contentType.includes("javascript")))
+  ) {
+    res.setHeader("cache-control", "no-cache");
+  } else {
+    res.setHeader("cache-control", "public, max-age=31536000, immutable");
+  }
+
+  await new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filePath);
+    stream.on("error", reject);
+    stream.on("end", resolve);
+    stream.pipe(res);
+  }).catch(() => {
+    if (!res.headersSent) {
+      res.statusCode = 500;
+      res.end("Unable to read file");
+    }
+  });
+}
+
+async function serveMedia(res, pathname) {
+  const key = decodeURIComponent(pathname.replace(/^\/media\//, ""));
+  const safeRoot = path.resolve(r2Root);
+  const filePath = path.resolve(path.join(r2Root, key));
+
+  if (!filePath.startsWith(safeRoot)) {
+    res.statusCode = 400;
+    res.end("Invalid path");
+    return;
+  }
+
+  if (!fs.existsSync(filePath)) {
+    res.statusCode = 404;
+    res.end("Not found");
+    return;
+  }
+
+  const meta = readMeta(filePath);
+  const contentType = meta?.contentType || guessContentType(filePath);
+
+  if (contentType) {
+    res.setHeader("content-type", contentType);
+  }
+  res.setHeader("cache-control", "public, max-age=31536000, immutable");
+
+  fs.createReadStream(filePath).pipe(res);
+}
+
+function readMeta(filePath) {
+  const metaPath = `${filePath}.meta.json`;
+  if (!fs.existsSync(metaPath)) return null;
+  try {
+    const raw = fs.readFileSync(metaPath, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function guessContentType(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".js":
+    case ".mjs":
+      return "application/javascript; charset=utf-8";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".svg":
+      return "image/svg+xml";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".png":
+      return "image/png";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    case ".ico":
+      return "image/x-icon";
+    case ".woff":
+      return "font/woff";
+    case ".woff2":
+      return "font/woff2";
+    case ".mp4":
+      return "video/mp4";
+    case ".webm":
+      return "video/webm";
+    case ".mov":
+      return "video/quicktime";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function rewriteSetCookie(value) {
+  if (isServerRuntime) {
+    return value;
+  }
+
+  return value
+    .replace(/;\s*Secure/gi, "")
+    .replace(/SameSite=None/gi, "SameSite=Lax");
+}
+
+void startServer().catch(async (error) => {
+  console.error("[desktop-server] failed to start", error);
+  await closeDatabaseHandles();
+  process.exit(1);
+});
+
+process.on("exit", () => {
+  sqliteDb?.close();
+  sqliteDb = null;
+});
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, async () => {
+    try {
+      await closeDatabaseHandles();
+    } finally {
+      process.exit(0);
+    }
+  });
+}

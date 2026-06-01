@@ -1,0 +1,47 @@
+# Prompt 24 - Shared camera, workspace e access parity no Linux
+
+Objetivo:
+Garantir que os recursos novos do GitHub de shared camera, remote workspace, account access e desktop relay funcionem no Linux local sem quebrar Windows.
+
+Contexto obrigatorio:
+- Leia `.archon/plans/relatorio-fase23-linux-jobs-llm-inference-runtime.md`.
+- Inspecione os modulos do GitHub integrados no Prompt 18:
+  - `sharedCameraAccess`
+  - `cameraResourceAdmission`
+  - `workspaceLocalState`
+  - `workspaceRelayClient`
+  - `workspaceRelayState`
+  - `accountAccess`
+  - telas `AccountUsersPanel` e `WorkspaceAccessPanel`
+
+Restricoes:
+- Nao fazer push.
+- Nao acoplar essas features ao AppHost WinUI.
+- Nao expor convites, grants, tokens ou relay ids em logs sem redacao.
+- Manter SQLite local e Postgres/server quando aplicavel.
+
+Tarefas:
+1. Mapear todos os endpoints e tabelas novos desses recursos.
+2. Garantir que migrations/bootstrap SQLite local tenham as tabelas/indices necessarios.
+3. Adaptar backend local Linux para suportar fluxos desktop/local quando o central server nao estiver disponivel.
+4. Garantir que a UI mostre estados corretos no Linux:
+   - sem workspace remoto;
+   - com dados locais;
+   - com relay indisponivel;
+   - com permissao negada.
+5. Criar testes SQLite/worker para os principais fluxos.
+6. Rodar bateria visual em telas impactadas.
+
+Validacao obrigatoria:
+```bash
+cd DrakonSite
+npm run test:local-sqlite-bootstrap
+npm run test:platform-boundaries
+npm run build
+npm run visual:linux
+cd ../Perceptrum && ctest --test-dir out/build/linux-debug --output-on-failure
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase24-linux-shared-camera-workspace-access-parity.md`.
+- O relatorio deve separar recursos totalmente suportados, degradados localmente e ainda dependentes de servidor central.

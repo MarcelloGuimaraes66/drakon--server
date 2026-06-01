@@ -1,0 +1,764 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Background="Transparent"
+    RequestedTheme="Dark">
+
+    <Page.Resources>
+        <Style x:Key="SettingsTabButtonBaseStyle" TargetType="Button">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="999" />
+            <Setter Property="Foreground" Value="{StaticResource DrakonStrongTextBrush}" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="MinHeight" Value="40" />
+            <Setter Property="MinWidth" Value="0" />
+            <Setter Property="Padding" Value="16,10" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border
+                            x:Name="RootBorder"
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="{TemplateBinding CornerRadius}">
+                            <ContentPresenter
+                                HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                Content="{TemplateBinding Content}"
+                                ContentTemplate="{TemplateBinding ContentTemplate}"
+                                Padding="{TemplateBinding Padding}"
+                                TextElement.FontSize="{TemplateBinding FontSize}"
+                                TextElement.FontWeight="{TemplateBinding FontWeight}"
+                                TextElement.Foreground="{TemplateBinding Foreground}" />
+                        </Border>
+
+                        <VisualStateManager.VisualStateGroups>
+                            <VisualStateGroup x:Name="CommonStates">
+                                <VisualState x:Name="Normal" />
+                                <VisualState x:Name="PointerOver">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootBorder.Opacity" Value="0.92" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Pressed">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootBorder.Opacity" Value="0.82" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Disabled">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootBorder.Opacity" Value="0.4" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                            </VisualStateGroup>
+                        </VisualStateManager.VisualStateGroups>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style
+            x:Key="SettingsTabButtonStyle"
+            TargetType="Button"
+            BasedOn="{StaticResource SettingsTabButtonBaseStyle}">
+            <Setter Property="Foreground" Value="{StaticResource DrakonSecondaryTextBrush}" />
+        </Style>
+
+        <Style
+            x:Key="SettingsTabButtonActiveStyle"
+            TargetType="Button"
+            BasedOn="{StaticResource SettingsTabButtonBaseStyle}">
+            <Setter Property="Background" Value="{StaticResource DrakonAccentBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource DrakonAccentBrush}" />
+            <Setter Property="Foreground" Value="White" />
+        </Style>
+    </Page.Resources>
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <Grid Padding="24">
+            <StackPanel
+                MaxWidth="1320"
+                HorizontalAlignment="Center"
+                Spacing="20">
+                <StackPanel Spacing="6">
+                    <TextBlock
+                        Style="{StaticResource DrakonDisplayTitleTextStyle}"
+                        Text="Settings" />
+                    <TextBlock
+                        Style="{StaticResource DrakonBodyTextStyle}"
+                        Text="Perfil do usuário, pairing do executável, chaves de API e alertas do Telegram convertidos do DrakonSite."
+                        TextWrapping="WrapWholeWords" />
+                </StackPanel>
+
+                <InfoBar
+                    x:Name="SettingsInfoBar"
+                    IsOpen="False"
+                    IsClosable="True"
+                    Severity="Informational" />
+
+                <StackPanel Spacing="16">
+                    <Button
+                        x:Name="SettingsRefreshButton"
+                        HorizontalAlignment="Right"
+                        Content="Refresh"
+                        MinWidth="112" />
+
+                    <Border
+                        Padding="4"
+                        Background="{StaticResource DrakonPanelAltBrush}"
+                        BorderBrush="{StaticResource DrakonPanelBorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="999">
+                        <Grid ColumnSpacing="4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+
+                            <Button
+                                x:Name="UserTabButton"
+                                Content="Usuario"
+                                Style="{StaticResource SettingsTabButtonActiveStyle}"
+                                Tag="0" />
+                            <Button
+                                x:Name="UsersTabButton"
+                                Grid.Column="1"
+                                Content="Usuarios"
+                                Style="{StaticResource SettingsTabButtonStyle}"
+                                Tag="1" />
+                            <Button
+                                x:Name="ApiKeysTabButton"
+                                Grid.Column="2"
+                                Content="Chaves de API"
+                                Style="{StaticResource SettingsTabButtonStyle}"
+                                Tag="2" />
+                            <Button
+                                x:Name="AlertsTabButton"
+                                Grid.Column="3"
+                                Content="Alertas"
+                                Style="{StaticResource SettingsTabButtonStyle}"
+                                Tag="3" />
+                            <Button
+                                x:Name="ConnectivityTabButton"
+                                Grid.Column="4"
+                                Content="Conectividade do EXE"
+                                Style="{StaticResource SettingsTabButtonStyle}"
+                                Tag="4" />
+                        </Grid>
+                    </Border>
+
+                    <StackPanel
+                        x:Name="UserSettingsSection"
+                        Spacing="16">
+                        <Border Style="{StaticResource DrakonPanelStyle}">
+                            <StackPanel Spacing="14">
+                                <TextBlock
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="User Profile" />
+
+                            <Grid ColumnSpacing="16" RowSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+
+                                <StackPanel Spacing="6">
+                                    <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Name" />
+                                    <TextBox x:Name="UserNameTextBox" IsReadOnly="True" />
+                                </StackPanel>
+
+                                <StackPanel
+                                    Grid.Column="1"
+                                    Spacing="6">
+                                    <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Email" />
+                                    <TextBox x:Name="UserEmailTextBox" IsReadOnly="True" />
+                                </StackPanel>
+
+                                <StackPanel
+                                    Grid.Row="1"
+                                    Spacing="6">
+                                    <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Country" />
+                                    <TextBox x:Name="UserCountryTextBox" IsReadOnly="True" />
+                                </StackPanel>
+
+                                <StackPanel
+                                    Grid.Row="1"
+                                    Grid.Column="1"
+                                    Spacing="6">
+                                    <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Account created" />
+                                    <TextBox x:Name="UserCreatedAtTextBox" IsReadOnly="True" />
+                                </StackPanel>
+                            </Grid>
+                        </StackPanel>
+                        </Border>
+                    </StackPanel>
+
+                    <StackPanel
+                        x:Name="UsersSettingsSection"
+                        Visibility="Collapsed"
+                        Spacing="16">
+                        <Border Style="{StaticResource DrakonPanelStyle}">
+                            <StackPanel Spacing="14">
+                                <TextBlock
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="Users &amp; Rights" />
+                                <TextBlock
+                                    Style="{StaticResource DrakonBodyTextStyle}"
+                                    Text="Create subaccounts, grant full access or granular module rights, and rotate admin-managed passwords."
+                                    TextWrapping="WrapWholeWords" />
+
+                                <Grid ColumnSpacing="16" RowSpacing="12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="220" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+
+                                    <StackPanel Spacing="6">
+                                        <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Subaccount email" />
+                                        <TextBox x:Name="CreateAccountUserEmailTextBox" PlaceholderText="operator@company.com" />
+                                    </StackPanel>
+
+                                    <StackPanel
+                                        Grid.Column="1"
+                                        Spacing="6">
+                                        <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Initial password" />
+                                        <PasswordBox x:Name="CreateAccountUserPasswordBox" />
+                                    </StackPanel>
+
+                                    <StackPanel
+                                        Grid.Column="2"
+                                        Spacing="6">
+                                        <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Role" />
+                                        <ComboBox x:Name="CreateAccountRoleComboBox" SelectedIndex="0">
+                                            <ComboBoxItem Content="Member" Tag="member" />
+                                            <ComboBoxItem Content="Admin" Tag="admin" />
+                                        </ComboBox>
+                                    </StackPanel>
+
+                                    <CheckBox
+                                        x:Name="CreateAccountFullAccessCheckBox"
+                                        Grid.Row="1"
+                                        Content="Full access"
+                                        IsChecked="False" />
+
+                                    <StackPanel
+                                        Grid.Row="2"
+                                        Grid.ColumnSpan="3"
+                                        Spacing="10">
+                                        <StackPanel Orientation="Horizontal" Spacing="16">
+                                            <CheckBox x:Name="CreateAccountViewCamerasCheckBox" Content="View cameras" />
+                                            <CheckBox x:Name="CreateAccountExecuteCamerasCheckBox" Content="Execute cameras" />
+                                            <CheckBox x:Name="CreateAccountViewTasksCheckBox" Content="View tasks" />
+                                            <CheckBox x:Name="CreateAccountExecuteTasksCheckBox" Content="Execute tasks" />
+                                        </StackPanel>
+                                        <StackPanel Orientation="Horizontal" Spacing="16">
+                                            <CheckBox x:Name="CreateAccountViewAgentsCheckBox" Content="View agents" />
+                                            <CheckBox x:Name="CreateAccountExecuteAgentsCheckBox" Content="Execute agents" />
+                                            <CheckBox x:Name="CreateAccountChatCheckBox" Content="Chat" />
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Grid>
+
+                                <StackPanel Orientation="Horizontal" Spacing="12">
+                                    <Button
+                                        x:Name="CreateAccountUserButton"
+                                        Content="Create subaccount"
+                                        MinWidth="180" />
+                                    <TextBlock
+                                        x:Name="CreateAccountUserStatusText"
+                                        Style="{StaticResource DrakonBodyTextStyle}"
+                                        Text=""
+                                        TextWrapping="WrapWholeWords" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource DrakonPanelStyle}">
+                            <StackPanel Spacing="14">
+                                <TextBlock
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="Manage existing users" />
+
+                                <StackPanel Spacing="6">
+                                    <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Select user" />
+                                    <ComboBox x:Name="ManagedUsersComboBox" PlaceholderText="Choose a subaccount" />
+                                </StackPanel>
+
+                                <TextBlock
+                                    x:Name="ManagedUserEmptyStateText"
+                                    Style="{StaticResource DrakonBodyTextStyle}"
+                                    Text="No subaccounts available yet."
+                                    Visibility="Collapsed" />
+
+                                <Grid x:Name="ManagedUserEditorGrid" ColumnSpacing="16" RowSpacing="12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="220" />
+                                        <ColumnDefinition Width="220" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+
+                                    <StackPanel Spacing="6">
+                                        <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Email" />
+                                        <TextBox x:Name="ManagedUserEmailTextBox" IsReadOnly="True" />
+                                    </StackPanel>
+
+                                    <StackPanel
+                                        Grid.Column="1"
+                                        Spacing="6">
+                                        <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Role" />
+                                        <ComboBox x:Name="ManagedUserRoleComboBox" SelectedIndex="0">
+                                            <ComboBoxItem Content="Member" Tag="member" />
+                                            <ComboBoxItem Content="Admin" Tag="admin" />
+                                        </ComboBox>
+                                    </StackPanel>
+
+                                    <StackPanel
+                                        Grid.Column="2"
+                                        Spacing="6">
+                                        <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Status" />
+                                        <ComboBox x:Name="ManagedUserStatusComboBox" SelectedIndex="0">
+                                            <ComboBoxItem Content="Active" Tag="active" />
+                                            <ComboBoxItem Content="Disabled" Tag="disabled" />
+                                        </ComboBox>
+                                    </StackPanel>
+
+                                    <CheckBox
+                                        x:Name="ManagedUserFullAccessCheckBox"
+                                        Grid.Row="1"
+                                        Content="Full access"
+                                        IsChecked="False" />
+
+                                    <StackPanel
+                                        Grid.Row="2"
+                                        Grid.ColumnSpan="3"
+                                        Spacing="10">
+                                        <StackPanel Orientation="Horizontal" Spacing="16">
+                                            <CheckBox x:Name="ManagedUserViewCamerasCheckBox" Content="View cameras" />
+                                            <CheckBox x:Name="ManagedUserExecuteCamerasCheckBox" Content="Execute cameras" />
+                                            <CheckBox x:Name="ManagedUserViewTasksCheckBox" Content="View tasks" />
+                                            <CheckBox x:Name="ManagedUserExecuteTasksCheckBox" Content="Execute tasks" />
+                                        </StackPanel>
+                                        <StackPanel Orientation="Horizontal" Spacing="16">
+                                            <CheckBox x:Name="ManagedUserViewAgentsCheckBox" Content="View agents" />
+                                            <CheckBox x:Name="ManagedUserExecuteAgentsCheckBox" Content="Execute agents" />
+                                            <CheckBox x:Name="ManagedUserChatCheckBox" Content="Chat" />
+                                        </StackPanel>
+                                    </StackPanel>
+
+                                    <StackPanel
+                                        Grid.Row="3"
+                                        Grid.ColumnSpan="3"
+                                        Orientation="Horizontal"
+                                        Spacing="12">
+                                        <Button
+                                            x:Name="SaveManagedUserButton"
+                                            Content="Save changes"
+                                            MinWidth="150" />
+                                        <PasswordBox
+                                            x:Name="ManagedUserPasswordBox"
+                                            Width="280"
+                                            PlaceholderText="New password" />
+                                        <Button
+                                            x:Name="ResetManagedUserPasswordButton"
+                                            Content="Update password"
+                                            MinWidth="160" />
+                                    </StackPanel>
+                                </Grid>
+
+                                <TextBlock
+                                    x:Name="ManagedUserStatusText"
+                                    Style="{StaticResource DrakonBodyTextStyle}"
+                                    Text=""
+                                    TextWrapping="WrapWholeWords" />
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+
+                    <StackPanel
+                        x:Name="ConnectivitySettingsSection"
+                        Visibility="Collapsed"
+                        Spacing="16">
+                        <Border Style="{StaticResource DrakonPanelStyle}">
+                            <StackPanel Spacing="14">
+                            <Grid ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+
+                                <TextBlock
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="Connect EXE" />
+
+                                <StackPanel
+                                    Grid.Column="1"
+                                    Orientation="Horizontal"
+                                    Spacing="8"
+                                    VerticalAlignment="Center">
+                                    <Border
+                                        x:Name="PairingStatusDot"
+                                        Width="12"
+                                        Height="12"
+                                        CornerRadius="6"
+                                        Background="{StaticResource DrakonMutedBrush}" />
+                                    <TextBlock
+                                        x:Name="PairingStatusText"
+                                        Style="{StaticResource DrakonBodyTextStyle}"
+                                        Text="Not connected" />
+                                </StackPanel>
+                            </Grid>
+
+                            <Border
+                                x:Name="ConnectionDetailsBorder"
+                                Visibility="Collapsed"
+                                Style="{StaticResource DrakonInsetPanelStyle}">
+                                <StackPanel Spacing="10">
+                                    <Grid ColumnSpacing="12" RowSpacing="12">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
+
+                                        <StackPanel Spacing="6">
+                                            <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Client ID" />
+                                            <Grid ColumnSpacing="8">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <Border
+                                                    MinWidth="0"
+                                                    Padding="12,10"
+                                                    Background="{StaticResource DrakonPanelAltBrush}"
+                                                    BorderBrush="{StaticResource DrakonPanelBorderBrush}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="12">
+                                                    <TextBlock
+                                                        x:Name="PairingClientIdTextBlock"
+                                                        FontFamily="Cascadia Mono"
+                                                        IsTextSelectionEnabled="True"
+                                                        TextWrapping="Wrap" />
+                                                </Border>
+                                                <Button
+                                                    x:Name="CopyClientIdButton"
+                                                    Grid.Column="1"
+                                                    Content="Copy" />
+                                            </Grid>
+                                        </StackPanel>
+
+                                        <StackPanel
+                                            Grid.Column="1"
+                                            Spacing="6">
+                                            <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="EXE ID" />
+                                            <Grid ColumnSpacing="8">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <Border
+                                                    MinWidth="0"
+                                                    Padding="12,10"
+                                                    Background="{StaticResource DrakonPanelAltBrush}"
+                                                    BorderBrush="{StaticResource DrakonPanelBorderBrush}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="12">
+                                                    <TextBlock
+                                                        x:Name="PairingExeIdTextBlock"
+                                                        FontFamily="Cascadia Mono"
+                                                        IsTextSelectionEnabled="True"
+                                                        TextWrapping="Wrap" />
+                                                </Border>
+                                                <Button
+                                                    x:Name="CopyExeIdButton"
+                                                    Grid.Column="1"
+                                                    Content="Copy" />
+                                            </Grid>
+                                        </StackPanel>
+
+                                        <StackPanel
+                                            Grid.Row="1"
+                                            Spacing="6">
+                                            <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Timezone" />
+                                            <TextBox x:Name="PairingTimezoneTextBox" IsReadOnly="True" />
+                                        </StackPanel>
+
+                                        <StackPanel
+                                            Grid.Row="1"
+                                            Grid.Column="1"
+                                            Spacing="6">
+                                            <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Heartbeat" />
+                                            <TextBox x:Name="PairingHeartbeatTextBox" IsReadOnly="True" />
+                                        </StackPanel>
+                                    </Grid>
+                                </StackPanel>
+                            </Border>
+
+                            <Border
+                                x:Name="PairCodeBorder"
+                                Visibility="Collapsed"
+                                Style="{StaticResource DrakonHeroPanelStyle}">
+                                <StackPanel Spacing="10">
+                                    <TextBlock
+                                        Style="{StaticResource DrakonCaptionTextStyle}"
+                                        Foreground="{StaticResource DrakonStrongTextBrush}"
+                                        Text="Pair Code" />
+                                    <Grid ColumnSpacing="12">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock
+                                            x:Name="PairCodeValueText"
+                                            FontFamily="Cascadia Mono"
+                                            FontSize="28"
+                                            FontWeight="SemiBold"
+                                            Foreground="{StaticResource DrakonStrongTextBrush}"
+                                            Text="------" />
+                                        <Button
+                                            x:Name="CopyPairCodeButton"
+                                            Grid.Column="1"
+                                            Content="Copy" />
+                                    </Grid>
+                                    <TextBlock
+                                        x:Name="PairCodeExpiryText"
+                                        Style="{StaticResource DrakonCaptionTextStyle}"
+                                        Foreground="{StaticResource DrakonStrongTextBrush}"
+                                        Text="Expires in: --:--" />
+                                </StackPanel>
+                            </Border>
+
+                            <StackPanel
+                                Orientation="Horizontal"
+                                Spacing="10">
+                                <Button
+                                    x:Name="GeneratePairCodeButton"
+                                    Content="Generate Pair Code" />
+                                <Button
+                                    x:Name="DisconnectExeButton"
+                                    Content="Disconnect EXE"
+                                    IsEnabled="False" />
+                            </StackPanel>
+
+                            <Button
+                                x:Name="ToggleQuickInstructionsButton"
+                                HorizontalAlignment="Left"
+                                Content="Quick Instructions" />
+
+                            <Border
+                                x:Name="QuickInstructionsBorder"
+                                Visibility="Collapsed"
+                                Style="{StaticResource DrakonInsetPanelStyle}">
+                                <StackPanel Spacing="8">
+                                    <TextBlock Style="{StaticResource DrakonBodyTextStyle}" Text="1. Abra o executável novo e mantenha a sessão autenticada." TextWrapping="WrapWholeWords" />
+                                    <TextBlock Style="{StaticResource DrakonBodyTextStyle}" Text="2. Gere um pair code nesta tela e copie o valor." TextWrapping="WrapWholeWords" />
+                                    <TextBlock Style="{StaticResource DrakonBodyTextStyle}" Text="3. Informe o código no runtime local para concluir o vínculo." TextWrapping="WrapWholeWords" />
+                                    <TextBlock Style="{StaticResource DrakonBodyTextStyle}" Text="4. Aguarde o status mudar para connected e verifique o heartbeat." TextWrapping="WrapWholeWords" />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </Border>
+
+                    </StackPanel>
+
+                    <StackPanel
+                        x:Name="ApiKeysSettingsSection"
+                        Visibility="Collapsed"
+                        Spacing="16">
+                        <Border Style="{StaticResource DrakonPanelStyle}">
+                            <StackPanel Spacing="14">
+                            <Grid ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+
+                                <TextBlock
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="Z.ai API Key" />
+
+                                <StackPanel
+                                    Grid.Column="1"
+                                    Orientation="Horizontal"
+                                    Spacing="10">
+                                    <TextBlock
+                                        x:Name="ZAiStatusText"
+                                        Style="{StaticResource DrakonCaptionTextStyle}"
+                                        Text="Not configured" />
+                                    <Button
+                                        x:Name="ZAiPortalButton"
+                                        Content="Open Z.ai API Keys" />
+                                </StackPanel>
+                            </Grid>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Stored key preview" />
+                                <TextBox x:Name="ZAiPreviewTextBox" IsReadOnly="True" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="New Z.ai API key" />
+                                <PasswordBox x:Name="ZAiPasswordBox" />
+                            </StackPanel>
+
+                            <StackPanel
+                                Orientation="Horizontal"
+                                Spacing="10">
+                                <Button
+                                    x:Name="RemoveZAiButton"
+                                    Content="Remove Key" />
+                                <Button
+                                    x:Name="SaveZAiButton"
+                                    Content="Save Z.ai Key" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource DrakonPanelStyle}">
+                        <StackPanel Spacing="14">
+                            <Grid ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+
+                                <TextBlock
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="OpenAI API Key" />
+
+                                <StackPanel
+                                    Grid.Column="1"
+                                    Orientation="Horizontal"
+                                    Spacing="10">
+                                    <TextBlock
+                                        x:Name="OpenAiStatusText"
+                                        Style="{StaticResource DrakonCaptionTextStyle}"
+                                        Text="Not configured" />
+                                    <Button
+                                        x:Name="OpenAiPortalButton"
+                                        Content="Open OpenAI API Keys" />
+                                </StackPanel>
+                            </Grid>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Stored key preview" />
+                                <TextBox x:Name="OpenAiPreviewTextBox" IsReadOnly="True" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="New OpenAI API key" />
+                                <PasswordBox x:Name="OpenAiPasswordBox" />
+                            </StackPanel>
+
+                            <StackPanel
+                                Orientation="Horizontal"
+                                Spacing="10">
+                                <Button
+                                    x:Name="RemoveOpenAiButton"
+                                    Content="Remove Key" />
+                                <Button
+                                    x:Name="SaveOpenAiButton"
+                                    Content="Save OpenAI Key" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    </StackPanel>
+
+                    <StackPanel
+                        x:Name="AlertsSettingsSection"
+                        Visibility="Collapsed"
+                        Spacing="16">
+                        <Border Style="{StaticResource DrakonPanelStyle}">
+                            <StackPanel Spacing="14">
+                            <TextBlock
+                                Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                Text="Telegram Alerts" />
+
+                            <Grid ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+
+                                <StackPanel Spacing="4">
+                                    <TextBlock Style="{StaticResource DrakonBodyTextStyle}" Text="Enable Telegram notifications" />
+                                    <TextBlock
+                                        Style="{StaticResource DrakonCaptionTextStyle}"
+                                        Text="Receive alerts directly in your Telegram chat."
+                                        TextWrapping="WrapWholeWords" />
+                                </StackPanel>
+
+                                <ToggleSwitch
+                                    x:Name="TelegramEnabledToggle"
+                                    Grid.Column="1" />
+                            </Grid>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Telegram Chat ID" />
+                                <TextBox x:Name="TelegramChatIdTextBox" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="Bot Token" />
+                                <PasswordBox x:Name="TelegramBotTokenPasswordBox" />
+                            </StackPanel>
+
+                            <Button
+                                x:Name="SaveTelegramButton"
+                                HorizontalAlignment="Left"
+                                Content="Save Settings" />
+
+                            <Border Style="{StaticResource DrakonInsetPanelStyle}">
+                                <StackPanel Spacing="8">
+                                    <TextBlock
+                                        Style="{StaticResource DrakonBodyTextStyle}"
+                                        Text="How to get your Chat ID and Bot Token"
+                                        TextWrapping="WrapWholeWords" />
+                                    <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="1. Search for @BotFather in Telegram and create a new bot." TextWrapping="WrapWholeWords" />
+                                    <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="2. Copy the Bot Token from BotFather." TextWrapping="WrapWholeWords" />
+                                    <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="3. Search for @userinfobot in Telegram and start it." TextWrapping="WrapWholeWords" />
+                                    <TextBlock Style="{StaticResource DrakonCaptionTextStyle}" Text="4. Copy your Chat ID from the response and save both values here." TextWrapping="WrapWholeWords" />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </Border>
+                    </StackPanel>
+                </StackPanel>
+            </StackPanel>
+        </Grid>
+    </ScrollViewer>
+</Page>

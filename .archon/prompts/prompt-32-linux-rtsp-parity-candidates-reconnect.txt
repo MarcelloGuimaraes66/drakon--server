@@ -1,0 +1,57 @@
+# Prompt 32 - Paridade RTSP no Linux: candidatos, conexao e reconexao
+
+Objetivo:
+Portar para o Linux o fluxo de RTSP do sistema fonte, incluindo montagem de candidatos a partir dos campos da camera, tentativa de conexao, thumbnail inicial, gravacao, status online/offline e erros de reconexao.
+
+Contexto obrigatorio:
+- Leia os relatorios das fases 29 a 31.
+- Compare com:
+  - `Perceptrum/Perceptrum/core/AgentCore.cpp`
+  - `Perceptrum/Perceptrum/camera/CameraSession.cpp`
+  - `Perceptrum/Perceptrum/camera/RtspCapture.cpp`
+  - `Perceptrum/Perceptrum/orchestrator/skills/CreateCameraSkill.cpp`
+- Leia:
+  - `Perceptrum/linux/LinuxRtspThumbnailProbe.cpp`
+  - `Perceptrum/linux/LinuxFrameDiskWriter.cpp`
+  - `Perceptrum/linux/LinuxCameraSessionManager.*`
+  - `DrakonSite/src/worker/index.ts`
+
+Restricoes:
+- Nao fazer commit.
+- Nao fazer push.
+- Nao imprimir senhas RTSP.
+- Nao exigir camera RTSP real para testes automatizados.
+- Nao quebrar WEBCAM implementado nas fases anteriores.
+
+Tarefas:
+1. Implementar builder Linux de candidatos RTSP:
+   - usar `rtsp_url`/`stream_url` quando existir;
+   - senao montar a partir de `ip`, `rtsp_port`, `username`, `password`, `channel`, `subtype`, `manufacturer`;
+   - mascarar credenciais em logs/eventos.
+2. Integrar RTSP no `LinuxCameraSessionManager`:
+   - Start tenta candidatos em ordem;
+   - primeiro frame capturado vira ack de sucesso;
+   - grava clips em background;
+   - stop encerra processos;
+   - reconexao tenta novamente com backoff.
+3. Publicar eventos compativeis:
+   - `camera_started`;
+   - `camera_connection_failed`;
+   - detalhes de reconnect sem segredos;
+   - `active_rtsp_url` mascarado.
+4. Adicionar testes com fonte sintetica:
+   - `lavfi` liberado apenas em teste;
+   - arquivo local como source;
+   - RTSP invalido gera erro controlado.
+5. Atualizar runbook com comando RTSP real.
+
+Validacao obrigatoria:
+```bash
+(cd Perceptrum && cmake --build out/build/linux-debug -j$(nproc))
+(cd Perceptrum && ctest --test-dir out/build/linux-debug -R 'rtsp|camera|recording|job' --output-on-failure)
+(cd DrakonSite && npm run build)
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase32-linux-rtsp-parity-candidates-reconnect.md`.
+- Relatorio deve listar os formatos RTSP suportados e exemplos mascarados.

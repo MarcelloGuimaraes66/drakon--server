@@ -1,0 +1,50 @@
+# Prompt 12 - Empacotamento Linux dev e DEB
+
+Objetivo:
+Fechar um pacote Linux instalavel o suficiente para testar em Ubuntu, incluindo binarios, web build, launcher desktop, backend local e dependencias declaradas.
+
+Escopo:
+- Garantir que `cmake --install` instala:
+  - `perceptrum-desktop`
+  - `perceptrum-agent`
+  - `DrakonSite/dist`
+  - `.desktop`
+  - launcher shell
+  - icones
+- Garantir CPack `.deb`.
+- Incluir ou documentar runtime Node/backend local.
+- Declarar dependencias Debian:
+  - `libcurl4`
+  - `libgtk-3-0`
+  - `libwebkit2gtk-4.1-0`
+  - `ffmpeg`
+  - `nodejs`
+  - `xdg-utils`
+  - `libsecret-tools`
+- Preservar dados do usuario em remove/upgrade.
+
+Restricoes:
+- Nao alterar AppHost, `.vcxproj`, `.sln`.
+- Nao fazer commit/push.
+- Nao copiar `Perceptrum/out` como fonte canonica.
+
+Validacao obrigatoria:
+
+```bash
+cd DrakonSite
+npm run build
+
+cd ../Perceptrum
+cmake -S . -B out/build/linux-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DPERCEPTRUM_BUILD_WEB=OFF
+cmake --build out/build/linux-release -j$(nproc)
+ctest --test-dir out/build/linux-release --output-on-failure
+cmake --build out/build/linux-release --target package
+```
+
+Relatorio:
+Criar `.archon/plans/relatorio-fase12-linux-packaging-dev-and-deb.md` com:
+- arquivos instalados;
+- pacote gerado;
+- dependencias;
+- comandos para instalar/remover;
+- comportamento de dados/config.

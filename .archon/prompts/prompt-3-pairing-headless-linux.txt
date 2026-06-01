@@ -1,0 +1,303 @@
+PROMPT 3 — PAIRING, PROVISIONING E HEADLESSSERVICE LINUX MÍNIMO
+
+Atue como engenheiro sênior de C++23, CMake, Linux/Ubuntu, runtime local, pairing/provisioning, secrets, healthcheck, segurança de tokens, arquitetura multiplataforma e refatoração segura.
+
+Contexto:
+Estou no Ubuntu, no projeto:
+
+/home/marcello-guimaraes/dev/perceptrum_desktop_aspp
+
+As Fases 1 e 2 já foram executadas.
+
+Fase 1 criou uma base Linux reprodutível mínima:
+- Perceptrum/CMakeLists.txt
+- Perceptrum/linux/main.cpp
+- Perceptrum/linux-desktop/main.cpp
+- Perceptrum/linux-desktop/XdgPaths.h
+- Perceptrum/linux-desktop/XdgPaths.cpp
+
+Fase 2 fortaleceu runtime Linux:
+- APP_RUNTIME_DATA_ROOT
+- APP_RUNTIME_CONFIG_ROOT
+- APP_RUNTIME_CACHE_ROOT
+- APP_RUNTIME_STATE_ROOT
+- APP_RUNTIME_LOG_ROOT
+- XDG fallback
+- logs
+- agent_health.json
+- CTest com 7 testes reais
+- secrets Linux fail-closed por padrão
+- fallback plaintext apenas com flag explícita
+
+Relatório da Fase 2:
+.archon/plans/relatorio-fase2-runtime-xdg-secrets-linux.md
+
+O relatório da Fase 2 recomenda como próxima etapa:
+integrar pairing/config real ao runtime Linux mínimo e preparar a entrada segura do HeadlessService, mantendo AgentCore, CameraSession, FrameDiskWriter e JobRuntime fora do build Linux até os acoplamentos Win32 serem isolados.
+
+Objetivo desta Fase 3:
+Implementar pairing/provisioning/config real no agente Linux mínimo e preparar uma ponte segura para HeadlessService, sem ainda integrar AgentCore/câmeras/jobs pesados.
+
+Esta fase NÃO deve converter a interface completa.
+Esta fase NÃO deve mexer em câmera real.
+Esta fase NÃO deve integrar AgentCore completo ainda.
+Esta fase NÃO deve mexer no AppHost Windows.
+Esta fase NÃO deve alterar .vcxproj ou .sln.
+
+Arquivos a ler antes de alterar:
+- .archon/plans/plano-recalibrado-pos-reset-github.md
+- .archon/plans/relatorio-fase1-base-linux-reprodutivel.md
+- .archon/plans/relatorio-fase2-runtime-xdg-secrets-linux.md
+- .archon/plans/anchor-riscos-multiplataforma.md
+- .archon/plans/anchor-comandos-validacao.md
+- Perceptrum/CMakeLists.txt
+- Perceptrum/linux/main.cpp
+- Perceptrum/linux/RuntimePaths.h
+- Perceptrum/linux/RuntimePaths.cpp
+- Perceptrum/linux-desktop/main.cpp
+- Perceptrum/linux-desktop/XdgPaths.h
+- Perceptrum/linux-desktop/XdgPaths.cpp
+- Perceptrum/Perceptrum/runtime/HeadlessService.cpp
+- Perceptrum/Perceptrum/runtime/HeadlessService.h
+- Perceptrum/Perceptrum/runtime/BrandingRuntime.cpp
+- Perceptrum/Perceptrum/runtime/BrandingRuntime.h
+- Perceptrum/Perceptrum/comm/PairingClient.cpp
+- Perceptrum/Perceptrum/comm/PairingClient.h
+- Perceptrum/Perceptrum/comm/BackendConfig.h
+- Perceptrum/Perceptrum/comm/SecureLocalStore.cpp
+- Perceptrum/Perceptrum/comm/SecureLocalStore.h
+- Perceptrum/Perceptrum/platform/platform_secure_store.cpp
+- Perceptrum/Perceptrum/platform/platform_secure_store.h
+- brand.config.json
+
+Regras absolutas:
+1. Não fazer commit.
+2. Não fazer push.
+3. Não executar git reset --hard.
+4. Não apagar código.
+5. Não alterar AppHost.
+6. Não alterar .vcxproj.
+7. Não alterar .sln.
+8. Não quebrar Windows.
+9. Não quebrar macOS.
+10. Não copiar código de Perceptrum/out como fonte sem revisão.
+11. Perceptrum/out é artefato histórico, não fonte canônica.
+12. Não transformar o Linux em site externo.
+13. Não implementar interface completa nesta fase.
+14. Não integrar AgentCore completo ainda.
+15. Não integrar CameraSession, captura RTSP, FrameDiskWriter ou JobRuntime pesado ainda.
+16. Não usar Claude, opus, sonnet ou haiku.
+17. Usar somente Codex/gpt-5.5.
+18. Se precisar de apt install, parar e informar exatamente o comando antes de continuar.
+
+Implementar nesta fase:
+
+A. Comandos do agente Linux
+Garantir que o binário perceptrum-agent suporte, de forma funcional e segura:
+
+1. --help
+2. version
+3. validate-config [--base-url <url>]
+4. check-deps
+5. status
+6. healthcheck [--max-heartbeat-age-seconds <seconds>]
+7. run
+8. pair --pair-code <code> [--base-url <url>]
+9. provision --base-url <url> --exe-token <token> --client-id <id> [--exe-id <id>] [--timezone <iana>]
+
+Se algum desses comandos já existir, revisar e fortalecer.
+Se algum ainda não existir, implementar no escopo mínimo seguro.
+
+B. Configuração persistente
+Implementar persistência local em APP_RUNTIME_CONFIG_ROOT para:
+
+1. base_url;
+2. client_id;
+3. exe_id, se fornecido;
+4. timezone;
+5. estado de paired/provisioned;
+6. metadados não sensíveis.
+
+Regras:
+- Não gravar exe-token em plaintext.
+- Não gravar pair-code em plaintext.
+- Não imprimir tokens em logs.
+- Não imprimir tokens no terminal.
+- Não salvar secrets se o secure store negar armazenamento.
+- Se o usuário tentar provisionar com token e secure store não estiver disponível, falhar com erro claro e seguro.
+- Permitir fallback plaintext somente com flag explícita já definida na Fase 2.
+
+C. Pairing
+Implementar ou preparar o fluxo:
+
+perceptrum-agent pair --pair-code <code> --base-url <url>
+
+Comportamento esperado:
+1. Validar campos obrigatórios.
+2. Validar base_url.
+3. Se backend não estiver acessível, retornar erro funcional claro.
+4. Se pair-code for inválido, retornar erro funcional claro.
+5. Se pair-code for aceito pelo backend, persistir config não sensível e secret via secure store.
+6. Não crashar quando backend estiver ausente.
+7. Não bloquear indefinidamente.
+
+Se não houver contrato backend claro ainda, implementar uma camada bem definida e documentada, com erro funcional explícito:
+"pairing backend contract not available yet" ou equivalente.
+Mas o comando deve existir e ser testável.
+
+D. Provisioning
+Implementar ou fortalecer:
+
+perceptrum-agent provision --base-url <url> --exe-token <token> --client-id <id> [--exe-id <id>] [--timezone <iana>]
+
+Comportamento esperado:
+1. Validar base_url.
+2. Validar exe-token obrigatório.
+3. Validar client-id obrigatório.
+4. Validar timezone se fornecido.
+5. Persistir base_url, client_id, exe_id e timezone em APP_RUNTIME_CONFIG_ROOT.
+6. Armazenar exe-token somente via secure store.
+7. Se secure store não estiver disponível, falhar fechado, exceto com flag explícita de fallback.
+8. Atualizar agent_health.json para paired=true ou provisioned=true quando aplicável.
+9. Não expor token em terminal, log ou health JSON.
+
+E. HeadlessService mínimo
+Preparar entrada segura para HeadlessService sem ativar AgentCore completo ainda.
+
+Objetivo:
+1. run deve continuar criando heartbeat e agent_health.json.
+2. run deve carregar config persistida.
+3. run deve refletir paired/provisioned corretamente.
+4. run deve usar base_url e client_id persistidos.
+5. run não deve iniciar captura de câmera nem jobs pesados nesta fase.
+6. run deve ter caminho claro para futuramente chamar HeadlessService real.
+7. Se HeadlessService atual for Windows-acoplado, criar adaptador Linux mínimo ou wrapper seguro, sem quebrar Windows.
+
+F. Health/status
+Atualizar status e healthcheck para refletir:
+
+1. not_paired;
+2. paired/provisioned;
+3. missing_snapshot;
+4. stale_heartbeat;
+5. alive;
+6. config_invalid;
+7. secure_store_unavailable;
+8. backend_unreachable, se testado.
+
+G. CTest
+Adicionar ou atualizar testes CTest para:
+
+1. agent_help;
+2. agent_version;
+3. agent_validate_config_tmp_runtime;
+4. agent_check_deps_tmp_runtime;
+5. agent_status_missing_snapshot;
+6. agent_run_writes_health_snapshot;
+7. agent_healthcheck_not_paired;
+8. agent_provision_requires_base_url;
+9. agent_provision_requires_token;
+10. agent_provision_requires_client_id;
+11. agent_provision_fails_closed_without_secret_store_when_token_needed;
+12. agent_provision_with_plaintext_recovery_flag_uses_0600_file, se viável sem expor secret real;
+13. agent_status_after_provision_reads_config, se viável;
+14. pair_requires_pair_code;
+15. pair_backend_unreachable_is_functional_error.
+
+Os testes devem usar runtime isolado em /tmp/perceptrum-ctest-runtime ou diretório temporário equivalente.
+
+H. Desktop stub
+Manter perceptrum-desktop como stub ou shell mínimo.
+Não converter telas.
+Apenas garantir que ele leia ou mostre o estado de paired/provisioned se isso já for simples.
+Não avançar para paridade visual.
+
+I. CMake
+Atualizar CMake apenas se necessário:
+1. manter lista explícita de fontes;
+2. não globar tudo;
+3. não incluir AppHost;
+4. não incluir .vcxproj/.sln;
+5. não incluir arquivos *_old.cpp;
+6. não incluir UI Windows-only;
+7. preservar build Linux reprodutível.
+
+Validação obrigatória:
+Executar exatamente:
+
+cd Perceptrum
+cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build out/build/linux-debug -j$(nproc)
+ctest --test-dir out/build/linux-debug --output-on-failure
+
+Executar também manualmente com runtime isolado:
+
+export APP_RUNTIME_DATA_ROOT=/tmp/perceptrum-runtime-test/data
+export APP_RUNTIME_CONFIG_ROOT=/tmp/perceptrum-runtime-test/config
+export APP_RUNTIME_CACHE_ROOT=/tmp/perceptrum-runtime-test/cache
+export APP_RUNTIME_STATE_ROOT=/tmp/perceptrum-runtime-test/state
+export APP_RUNTIME_LOG_ROOT=/tmp/perceptrum-runtime-test/state/logs
+
+rm -rf /tmp/perceptrum-runtime-test
+mkdir -p "$APP_RUNTIME_DATA_ROOT" "$APP_RUNTIME_CONFIG_ROOT" "$APP_RUNTIME_CACHE_ROOT" "$APP_RUNTIME_STATE_ROOT" "$APP_RUNTIME_LOG_ROOT"
+
+./out/build/linux-debug/perceptrum-agent --help
+./out/build/linux-debug/perceptrum-agent version
+./out/build/linux-debug/perceptrum-agent validate-config
+./out/build/linux-debug/perceptrum-agent check-deps
+./out/build/linux-debug/perceptrum-agent status || true
+./out/build/linux-debug/perceptrum-agent healthcheck || true
+
+Testes funcionais esperados:
+./out/build/linux-debug/perceptrum-agent provision || true
+./out/build/linux-debug/perceptrum-agent provision --base-url http://localhost:4000 || true
+./out/build/linux-debug/perceptrum-agent provision --base-url http://localhost:4000 --exe-token TEST_TOKEN || true
+./out/build/linux-debug/perceptrum-agent provision --base-url http://localhost:4000 --exe-token TEST_TOKEN --client-id test-client --timezone America/Manaus || true
+
+./out/build/linux-debug/perceptrum-agent pair || true
+./out/build/linux-debug/perceptrum-agent pair --pair-code TEST-CODE --base-url http://localhost:4000 || true
+
+timeout 10s ./out/build/linux-debug/perceptrum-agent run || true
+./out/build/linux-debug/perceptrum-agent status || true
+./out/build/linux-debug/perceptrum-agent healthcheck || true
+find /tmp/perceptrum-runtime-test -maxdepth 5 -type f -print
+
+Saída obrigatória:
+Gerar relatório em:
+
+.archon/plans/relatorio-fase3-pairing-headless-linux.md
+
+O relatório deve conter:
+1. Arquivos lidos.
+2. Arquivos criados.
+3. Arquivos alterados.
+4. Comandos implementados ou revisados.
+5. Como pair foi implementado ou preparado.
+6. Como provision foi implementado.
+7. Como base_url/client_id/exe_id/timezone são persistidos.
+8. Como exe-token é protegido.
+9. Como o secure store se comportou neste Ubuntu.
+10. Quais flags explícitas de fallback existem.
+11. Como run/status/healthcheck refletem paired/provisioned.
+12. Quais testes CTest foram adicionados.
+13. Resultado do CMake.
+14. Resultado do build.
+15. Resultado do ctest.
+16. Resultado dos comandos manuais.
+17. Confirmação de que AppHost não foi alterado.
+18. Confirmação de que .vcxproj e .sln não foram alterados.
+19. Confirmação de que nenhum commit foi feito.
+20. Riscos pendentes.
+21. Próxima fase recomendada.
+
+Critério de sucesso:
+A Fase 3 só é considerada concluída se:
+- build Linux continuar reprodutível;
+- ctest passar;
+- provision validar erros obrigatórios;
+- pair validar erros obrigatórios;
+- secrets não forem expostos;
+- run/status/healthcheck refletirem config;
+- AppHost/.vcxproj/.sln não forem alterados;
+- nenhum commit for feito.
+

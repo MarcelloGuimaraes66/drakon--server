@@ -1,0 +1,332 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{34db560c-3c01-4995-a4ca-271af68245ed}</ProjectGuid>
+    <RootNamespace>Perceptrum</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <PropertyGroup Label="Branding">
+    <BrandSelectorPath>$(MSBuildThisFileDirectory)..\..\brand.txt</BrandSelectorPath>
+    <MSBuildAllProjects>$(MSBuildAllProjects);$(BrandSelectorPath)</MSBuildAllProjects>
+    <SelectedBrand Condition="Exists('$(BrandSelectorPath)')">$([System.String]::Copy($([System.IO.File]::ReadAllText('$(BrandSelectorPath)'))).Trim().ToLowerInvariant())</SelectedBrand>
+    <SelectedBrand Condition="'$(SelectedBrand)'==''">drakon</SelectedBrand>
+    <TargetName Condition="'$(SelectedBrand)'=='drakon'">Drakon</TargetName>
+    <TargetName Condition="'$(SelectedBrand)'=='perceptrum'">Perceptrum</TargetName>
+    <StaleTargetName Condition="'$(TargetName)'=='Drakon'">Perceptrum</StaleTargetName>
+    <StaleTargetName Condition="'$(TargetName)'=='Perceptrum'">Drakon</StaleTargetName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+  </PropertyGroup>
+  <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <VcpkgInstalledDir>C:\dev\vcpkg</VcpkgInstalledDir>
+  </PropertyGroup>
+  <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <VcpkgInstalledDir>C:\dev\vcpkg</VcpkgInstalledDir>
+  </PropertyGroup>
+  <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <VcpkgInstalledDir>C:\dev\vcpkg</VcpkgInstalledDir>
+  </PropertyGroup>
+  <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <VcpkgInstalledDir>C:\dev\vcpkg</VcpkgInstalledDir>
+  </PropertyGroup>
+  <PropertyGroup>
+    <PostgreSqlRoot Condition="'$(PostgreSqlRoot)'==''">C:\Program Files\PostgreSQL\17\</PostgreSqlRoot>
+    <VcpkgLibraryRoot Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(VcpkgInstalledDir)\installed\x64-windows\debug\lib\</VcpkgLibraryRoot>
+    <VcpkgLibraryRoot Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(VcpkgInstalledDir)\installed\x64-windows\lib\</VcpkgLibraryRoot>
+    <CurlImportLibrary Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">libcurl-d.lib</CurlImportLibrary>
+    <CurlImportLibrary Condition="'$(Configuration)|$(Platform)'=='Release|x64'">libcurl.lib</CurlImportLibrary>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp23</LanguageStandard>
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalIncludeDirectories>C:\libs\opencv-4.11.0\build\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>C:\libs\opencv-4.11.0\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>opencv_world4110d.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp23</LanguageStandard>
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalIncludeDirectories>C:\libs\opencv-4.11.0\build\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>C:\libs\opencv-4.11.0\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>opencv_world4110d.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp23</LanguageStandard>
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalIncludeDirectories>C:\libs\opencv-4.11.0\build\include;%(AdditionalIncludeDirectories);C:\dev\vcpkg\installed\x64-windows\include</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>$(PostgreSqlRoot)lib;C:\libs\opencv-4.11.0\build\x64\vc16\lib;$(VcpkgLibraryRoot);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>opencv_world4110d.lib;$(CurlImportLibrary);avcodec.lib;avformat.lib;avutil.lib;swresample.lib;swscale.lib;libpq.lib;shell32.lib;winhttp.lib;comctl32.lib;dbghelp.lib;bcrypt.lib;crypt32.lib;d3d11.lib;d3d12.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp23</LanguageStandard>
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalIncludeDirectories>C:\libs\opencv-4.11.0\build\include;%(AdditionalIncludeDirectories);C:\dev\vcpkg\installed\x64-windows\include</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>$(PostgreSqlRoot)lib;C:\libs\opencv-4.11.0\build\x64\vc16\lib;$(VcpkgLibraryRoot);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>opencv_world4110.lib;$(CurlImportLibrary);avcodec.lib;avformat.lib;avutil.lib;swresample.lib;swscale.lib;libpq.lib;shell32.lib;winhttp.lib;comctl32.lib;dbghelp.lib;bcrypt.lib;crypt32.lib;d3d11.lib;d3d12.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="app\PairingDialog.h" />
+    <ClInclude Include="app\TrayIcon.h" />
+    <ClInclude Include="camera\CameraConfig.h" />
+    <ClInclude Include="camera\CameraSession.h" />
+    <ClInclude Include="camera\Frame.h" />
+    <ClInclude Include="camera\FrameBuffer.h" />
+    <ClInclude Include="camera\FrameDiskWriter.h" />
+    <ClInclude Include="camera\MotionDetector.h" />
+    <ClInclude Include="camera\PortalCounter.h" />
+    <ClInclude Include="camera\PerfMetrics.h" />
+    <ClInclude Include="camera\RtspCapture.h" />
+    <ClInclude Include="comm\BackendConfig.h" />
+    <ClInclude Include="comm\PairingClient.h" />
+    <ClInclude Include="comm\SecureLocalStore.h" />
+    <ClInclude Include="comm\PgClient.h" />
+    <ClInclude Include="comm\TelegramNotifier.h" />
+    <ClInclude Include="comm\TelegramSettings.h" />
+    <ClInclude Include="core\AnalysisRegionGeometry.h" />
+    <ClInclude Include="core\AgentCore.h" />
+    <ClInclude Include="core\Localization.h" />
+    <ClInclude Include="core\TemporalEngine.h" />
+    <ClInclude Include="core\VideoPolygonOverlayRenderer.h" />
+    <ClInclude Include="framework.h" />
+    <ClInclude Include="jobs\JobPayloadParser.h" />
+    <ClInclude Include="jobs\JobRuntime.h" />
+    <ClInclude Include="jobs\JobTypes.h" />
+    <ClInclude Include="logging\Logging.h" />
+    <ClInclude Include="orchestrator\ChatV2Orchestrator.h" />
+    <ClInclude Include="orchestrator\ChatModelConfig.h" />
+    <ClInclude Include="orchestrator\ConfigUtils.h" />
+    <ClInclude Include="orchestrator\HttpUtils.h" />
+    <ClInclude Include="orchestrator\KnowledgeBase.h" />
+    <ClInclude Include="orchestrator\LocalLlmClient.h" />
+    <ClInclude Include="orchestrator\LocalLlmRuntimeManager.h" />
+    <ClInclude Include="orchestrator\OperationTaskState.h" />
+    <ClInclude Include="orchestrator\PromptBuilder.h" />
+    <ClInclude Include="orchestrator\RoutingLexicon.h" />
+    <ClInclude Include="orchestrator\SkillRegistry.h" />
+    <ClInclude Include="orchestrator\SkillTypes.h" />
+    <ClInclude Include="orchestrator\skills\CreateCameraAgentSkill.h" />
+    <ClInclude Include="orchestrator\skills\CreateCameraSkill.h" />
+    <ClInclude Include="orchestrator\skills\CreateCamerasBatchSkill.h" />
+    <ClInclude Include="orchestrator\skills\CreateJobSkill.h" />
+    <ClInclude Include="orchestrator\skills\ControlCameraSkill.h" />
+    <ClInclude Include="orchestrator\skills\ControlJobSkill.h" />
+    <ClInclude Include="orchestrator\skills\EditCameraAgentSkill.h" />
+    <ClInclude Include="orchestrator\skills\EditCameraSkill.h" />
+    <ClInclude Include="orchestrator\skills\EditCamerasBatchSkill.h" />
+    <ClInclude Include="orchestrator\skills\EditJobSkill.h" />
+    <ClInclude Include="orchestrator\skills\ExplainAppSkill.h" />
+    <ClInclude Include="orchestrator\skills\GenerateReportSkill.h" />
+    <ClInclude Include="orchestrator\skills\ReadStateSkill.h" />
+    <ClInclude Include="orchestrator\skills\ScanNetworkSkill.h" />
+    <ClInclude Include="orchestrator\skills\shared\AgentAuthoringShared.h" />
+    <ClInclude Include="orchestrator\skills\shared\JobBlueprintShared.h" />
+    <ClInclude Include="orchestrator\skills\VideoSearchSkill.h" />
+    <ClInclude Include="platform\platform_common.h" />
+    <ClInclude Include="platform\platform_process.h" />
+    <ClInclude Include="platform\platform_secure_store.h" />
+    <ClInclude Include="platform\platform_shutdown.h" />
+    <ClInclude Include="runtime\BrandingRuntime.h" />
+    <ClInclude Include="Perceptrum.h" />
+    <ClInclude Include="Resource.h" />
+    <ClInclude Include="targetver.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="app\PairingDialog.cpp" />
+    <ClCompile Include="app\TrayIcon.cpp" />
+    <ClCompile Include="camera\CameraSession.cpp" />
+    <ClCompile Include="camera\FrameBuffer.cpp" />
+    <ClCompile Include="camera\FrameDiskWriter.cpp" />
+    <ClCompile Include="camera\MotionDetector.cpp" />
+    <ClCompile Include="camera\PortalCounter.cpp" />
+    <ClCompile Include="camera\RtspCapture.cpp" />
+    <ClCompile Include="comm\PairingClient.cpp" />
+    <ClCompile Include="comm\SecureLocalStore.cpp" />
+    <ClCompile Include="comm\TelegramNotifier.cpp" />
+    <ClCompile Include="comm\TelegramNotifierSendVideo.cpp" />
+    <ClCompile Include="core\AnalysisRegionGeometry.cpp" />
+    <ClCompile Include="core\AgentCore.cpp" />
+    <ClCompile Include="core\VideoPolygonOverlayRenderer.cpp" />
+    <ClCompile Include="jobs\JobPayloadParser.cpp" />
+    <ClCompile Include="jobs\JobRuntime.cpp" />
+    <ClCompile Include="logging\Logging.cpp" />
+    <ClCompile Include="orchestrator\ChatV2Orchestrator.cpp" />
+    <ClCompile Include="orchestrator\ChatModelConfig.cpp" />
+    <ClCompile Include="orchestrator\ConfigUtils.cpp" />
+    <ClCompile Include="orchestrator\HttpUtils.cpp" />
+    <ClCompile Include="orchestrator\KnowledgeBase.cpp" />
+    <ClCompile Include="orchestrator\LocalLlmClient.cpp" />
+    <ClCompile Include="orchestrator\LocalLlmRuntimeManager.cpp" />
+    <ClCompile Include="orchestrator\OperationTaskState.cpp" />
+    <ClCompile Include="orchestrator\PromptBuilder.cpp" />
+    <ClCompile Include="orchestrator\RoutingLexicon.cpp" />
+    <ClCompile Include="orchestrator\SkillRegistry.cpp" />
+    <ClCompile Include="orchestrator\skills\CreateCameraAgentSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\CreateCameraSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\CreateCamerasBatchSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\CreateJobSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\ControlCameraSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\ControlJobSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\EditCameraAgentSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\EditCameraSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\EditCamerasBatchSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\EditJobSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\ExplainAppSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\GenerateReportSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\ReadStateSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\ScanNetworkSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\shared\AgentAuthoringShared.cpp" />
+    <ClCompile Include="orchestrator\skills\shared\JobBlueprintShared.cpp" />
+    <ClCompile Include="orchestrator\skills\VideoSearchSkill.cpp" />
+    <ClCompile Include="platform\platform_common.cpp" />
+    <ClCompile Include="platform\platform_process.cpp" />
+    <ClCompile Include="platform\platform_secure_store.cpp" />
+    <ClCompile Include="platform\platform_shutdown.cpp" />
+    <ClCompile Include="runtime\BrandingRuntime.cpp" />
+    <ClCompile Include="Perceptrum.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="Perceptrum.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="Perceptrum.ico" />
+    <Image Include="small.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\x64\Release\Release.zip" />
+  </ItemGroup>
+  <Target Name="ApplyBranding" BeforeTargets="AssignTargetPaths;PrepareForBuild">
+    <Error Condition="'$(SelectedBrand)'!='drakon' and '$(SelectedBrand)'!='perceptrum'" Text="Invalid brand '$(SelectedBrand)' in $(BrandSelectorPath). Use drakon or perceptrum." />
+    <Exec Command='node "$(ProjectDir)..\..\branding\apply-brand.mjs" --brand "$(SelectedBrand)"' />
+    <Delete Files="$(OutDir)$(StaleTargetName).exe;$(OutDir)$(StaleTargetName).pdb;$(OutDir)$(StaleTargetName).lib;$(OutDir)$(StaleTargetName).exp;$(OutDir)$(StaleTargetName).iobj;$(OutDir)$(StaleTargetName).ipdb" ContinueOnError="WarnAndContinue" />
+  </Target>
+  <Target Name="CopyKnowledgeFiles" AfterTargets="Build">
+    <ItemGroup>
+      <KnowledgeContent Include="$(ProjectDir)orchestrator\knowledge\**\*.md" />
+    </ItemGroup>
+    <MakeDir Directories="$(TargetDir)orchestrator\knowledge" />
+    <Copy
+      SourceFiles="@(KnowledgeContent)"
+      DestinationFiles="@(KnowledgeContent->'$(TargetDir)orchestrator\knowledge\%(RecursiveDir)%(Filename)%(Extension)')"
+      SkipUnchangedFiles="true" />
+  </Target>
+  <Target Name="CopyMsvcRuntime" AfterTargets="Build" Condition="'$(UseDebugLibraries)'!='true'">
+    <Exec Command='powershell -NoProfile -ExecutionPolicy Bypass -File "$(ProjectDir)..\scripts\copy-msvc-runtime.ps1" -TargetDir "$(TargetDir)." -PlatformName "$(Platform)" -VCToolsRedistDir "$(VCToolsRedistDir)"' />
+  </Target>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>
