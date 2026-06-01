@@ -1,0 +1,56 @@
+# Prompt 26 - Secure store, logging e packaging final Linux/Windows
+
+Objetivo:
+Fechar secure store, logging, runtime interfaces e empacotamento Linux/Windows apos a integracao completa.
+
+Contexto obrigatorio:
+- Leia `.archon/plans/relatorio-fase25-fluent-ui-parity-pos-github-sync.md`.
+- Inspecione:
+  - `platform_secure_store.cpp`
+  - `Logging.cpp`
+  - adapters em `Perceptrum/linux`
+  - `Perceptrum/linux-desktop`
+  - CPack/deb packaging
+  - AppHost packaging Windows
+
+Restricoes:
+- Nao fazer push.
+- Nao registrar tokens, chaves, RTSP com credenciais, cookies, grants ou segredo em logs.
+- Nao exigir plaintext secret fallback em producao.
+- Nao quebrar DPAPI/Windows.
+- Nao instalar pacotes com sudo; se faltar dependencia, documentar comando.
+
+Tarefas:
+1. Garantir que Linux usa Secret Service/`secret-tool` quando disponivel.
+2. Definir claramente modo dev fallback `APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1`, com permissao `0600`, sem habilitar por padrao em producao.
+3. Revisar redacao de logs e health para:
+   - API keys;
+   - exe-token;
+   - RTSP credentials;
+   - workspace/relay tokens;
+   - OAuth/secrets.
+4. Atualizar `.deb`:
+   - dependencias;
+   - launcher;
+   - desktop file;
+   - web build;
+   - backend runtime;
+   - agent/desktop binaries.
+5. Garantir que Windows AppHost continua Windows-only e nao recebeu dependencia Linux.
+6. Criar/atualizar runbook de install/run/remove.
+
+Validacao obrigatoria:
+```bash
+cd DrakonSite && npm run build
+cd Perceptrum
+cmake -S . -B out/build/linux-release -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build out/build/linux-release -j$(nproc)
+ctest --test-dir out/build/linux-release --output-on-failure
+cpack --config out/build/linux-release/CPackConfig.cmake
+dpkg-deb --info out/build/linux-release/perceptrum-desktop_*.deb
+dpkg-deb --contents out/build/linux-release/perceptrum-desktop_*.deb | grep -E 'perceptrum-(desktop|agent)|perceptrum-local-backend|index.html'
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase26-secure-store-logging-packaging-final.md`.
+- Atualizar `RUNBOOK-LINUX.md`.

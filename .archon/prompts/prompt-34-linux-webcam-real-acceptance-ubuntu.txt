@@ -1,0 +1,70 @@
+# Prompt 34 - Aceite real no Ubuntu com webcam /dev/video0
+
+Objetivo:
+Validar no Ubuntu real que a webcam local cadastrada na UI no indice 0 inicia, fica online, grava arquivos nos diretorios corretos, gera thumbnail, permite pergunta para a camera e nao fica presa em reconnecting.
+
+Contexto obrigatorio:
+- Leia os relatorios das fases 29 a 33.
+- Leia `RUNBOOK-LINUX.md`.
+- Inspecione banco/logs locais antes e depois do teste:
+  - `~/.local/share/PerceptrumData/storage/sqlite/local-site/perceptrum_site.sqlite`
+  - `~/.local/state/Perceptrum/logs/perceptrum-agent.log`
+  - `~/.local/state/Perceptrum/logs/perceptrum-desktop.log`
+  - `~/.cache/Perceptrum/agentcore/camera-thumbnails`
+  - `~/.local/share/PerceptrumData/frames`
+
+Restricoes:
+- Nao fazer commit.
+- Nao fazer push.
+- Nao apagar banco do usuario.
+- Nao imprimir segredos.
+- Nao declarar pronto se a UI real nao foi testada ou se o teste so rodou via CLI.
+
+Tarefas:
+1. Preparar ambiente de teste:
+   - verificar `/dev/video0`;
+   - verificar permissao/ACL;
+   - verificar `ffmpeg`;
+   - matar apenas processos antigos do Perceptrum que atrapalham porta/agente.
+2. Rodar teste direto:
+   - capturar JPEG de `/dev/video0` com ffmpeg.
+3. Rodar teste pelo agente/backend:
+   - abrir app dev ou pacote release;
+   - confirmar agente pollando;
+   - cadastrar/usar webcam indice 0;
+   - clicar Start;
+   - confirmar status online;
+   - confirmar thumbnail e clip no disco;
+   - fazer uma pergunta para a webcam com chave OpenAI se disponivel.
+4. Se falhar:
+   - coletar comando, result, events, camera_runtime_sessions, logs;
+   - corrigir causa no codigo;
+   - repetir o teste.
+5. Se passar:
+   - registrar evidencias no relatorio sem segredos.
+
+Validacao obrigatoria:
+```bash
+ffmpeg -y -hide_banner -f v4l2 -framerate 15 -i /dev/video0 -frames:v 1 /tmp/perceptrum-webcam-real.jpg
+(cd DrakonSite && npm run build)
+(cd Perceptrum && cmake --build out/build/linux-debug -j$(nproc))
+APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 ./Perceptrum/linux-desktop/run-linux-dev.sh
+```
+
+Consultas finais sugeridas:
+```bash
+pgrep -a -f 'perceptrum|desktop-local-server|ffmpeg'
+find ~/.cache/Perceptrum/agentcore/camera-thumbnails -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\n' | sort | tail
+find ~/.local/share/PerceptrumData/frames -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\n' | sort | tail
+tail -160 ~/.local/state/Perceptrum/logs/perceptrum-agent.log
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase34-linux-webcam-real-acceptance-ubuntu.md`.
+- Relatorio deve responder objetivamente:
+  - Start funcionou na UI?
+  - camera ficou online?
+  - thumbnail apareceu?
+  - clip apareceu?
+  - pergunta para webcam chamou LLM real ou ficou bloqueada por chave/provider?
+  - quais comandos o usuario deve rodar agora.

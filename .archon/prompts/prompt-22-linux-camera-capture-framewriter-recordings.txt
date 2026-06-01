@@ -1,0 +1,56 @@
+# Prompt 22 - Camera real, FrameDiskWriter e recordings no Linux
+
+Objetivo:
+Portar captura de camera, RTSP/Webcam, escrita de frames/clips e recordings para Linux, integrando com o AgentCore portavel.
+
+Contexto obrigatorio:
+- Leia `.archon/plans/relatorio-fase21-linux-agentcore-portable-foundation.md`.
+- Inspecione:
+  - `Perceptrum/Perceptrum/camera/CameraSession.cpp`
+  - `Perceptrum/Perceptrum/camera/RtspCapture.cpp`
+  - `Perceptrum/Perceptrum/camera/FrameDiskWriter.cpp`
+  - `DrakonSite/src/worker/cameraRecordings.ts`
+  - endpoints `/api/cameras`, `/api/cameras/:id/start`, `/api/cameras/:id/recordings/*`
+
+Restricoes:
+- Nao fazer push.
+- Nao depender de Media Foundation no Linux.
+- Nao quebrar Windows Media Foundation.
+- Nao exigir camera real para testes automatizados; usar fonte sintetica `lavfi`/arquivo quando necessario.
+- Nao gravar em diretorios aleatorios. Usar roots de runtime XDG/AppBrand e documentar.
+
+Tarefas:
+1. Implementar/adaptar backend Linux para captura RTSP/Webcam com ffmpeg/OpenCV quando disponivel.
+2. Portar `FrameDiskWriter` para Linux:
+   - evitar Media Foundation no Linux;
+   - usar ffmpeg/libav ou fallback seguro ja existente;
+   - manter convencoes de diretorios compativeis com `JobRuntime` e recordings.
+3. Definir diretorios finais de:
+   - thumbnails;
+   - clips 10s/60s/300s;
+   - inference temp;
+   - jobs inference temp;
+   - events/health.
+4. Garantir endpoints de recordings no backend local Linux.
+5. Criar testes com fonte sintetica:
+   - captura inicia;
+   - thumbnail e clip sao criados;
+   - evento e health sao publicados;
+   - endpoint de recordings lista segmentos.
+6. Manter gates:
+   - default minimal continua sem camera pesada;
+   - camera/rtsp/framewriter so ligam quando gates estiverem ON.
+
+Validacao obrigatoria:
+```bash
+cd Perceptrum
+cmake -S . -B out/build/linux-camera -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPERCEPTRUM_ENABLE_AGENT_CORE=ON -DPERCEPTRUM_ENABLE_CAMERA_CAPTURE=ON -DPERCEPTRUM_ENABLE_RTSP_CAPTURE=ON -DPERCEPTRUM_ENABLE_FRAME_WRITER=ON
+cmake --build out/build/linux-camera -j$(nproc)
+ctest --test-dir out/build/linux-camera --output-on-failure
+cd ../DrakonSite && npm run build
+./Perceptrum/linux-desktop/run-linux-dev.sh --check-backend --print-web-root --no-open
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase22-linux-camera-capture-framewriter-recordings.md`.
+- O relatorio deve mostrar caminhos de arquivos criados, testes sinteticos, limitacoes para camera real e comando para testar RTSP real.

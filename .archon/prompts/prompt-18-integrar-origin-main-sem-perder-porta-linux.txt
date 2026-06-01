@@ -1,0 +1,45 @@
+# Prompt 18 - Integrar origin/main sem perder a porta Linux
+
+Objetivo:
+Baixar e integrar as novidades de `origin/main` preservando tudo que foi refatorado localmente para Linux/Ubuntu.
+
+Contexto obrigatorio:
+- Leia `.archon/plans/relatorio-fase17-preservacao-sync-github.md`.
+- Leia `.archon/plans/auditoria-linux-github-recursos.md`.
+- Se os backups do Prompt 17 nao existirem ou nao estiverem validos, pare e informe.
+
+Politica de Git:
+- Push proibido.
+- Commit local de checkpoint e permitido apenas nesta fase, somente em branch local `archon/linux-port-origin-main-sync`, para nao perder trabalho durante a integracao.
+- Nao usar `git reset --hard`, `git clean`, `git checkout --`, `git restore` destrutivo.
+- Nao reverter mudancas locais da porta Linux. Resolver conflitos preservando a funcionalidade local e incorporando as novidades remotas.
+
+Tarefas:
+1. Confirmar backup do Prompt 17.
+2. Criar ou entrar na branch local `archon/linux-port-origin-main-sync`.
+3. Fazer um checkpoint local das mudancas atuais nessa branch, incluindo untracked relevantes da porta Linux, prompts e relatorios Archon. Nao incluir `node_modules`, `dist`, `out`, `.visual-chrome-profile`, `visual-artifacts` ou caches grandes.
+4. Mesclar `origin/main` nessa branch.
+5. Resolver conflitos por dominio:
+   - AppHost deve continuar Windows-only para Mica/titlebar/WebView2.
+   - React comum nao pode ganhar dependencia WinUI, GTK ou WebView2.
+   - Linux host deve continuar usando o mesmo build web e adapters multiplataforma.
+   - Backend local deve preservar SQLite/local-session/camera-discovery e incorporar control-plane/local-agent ingress do GitHub.
+   - C++ deve preservar gates Linux e incorporar novidades de AgentCore, camera, jobs, PortalCounter e GPU decode sem quebrar Windows.
+6. Atualizar/adaptar testes que falharem por mudancas legitimas do GitHub.
+7. Nao empacotar ainda; esta fase termina quando o repo integrado compila ou quando houver uma lista objetiva de bloqueadores.
+
+Validacao obrigatoria:
+```bash
+git status --short --branch
+cd DrakonSite && npm run test:platform-boundaries
+cd DrakonSite && npm run test:local-sqlite-bootstrap
+cd DrakonSite && npm run test:semantic
+cd DrakonSite && npm run build
+cd Perceptrum && cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cd Perceptrum && cmake --build out/build/linux-debug -j$(nproc)
+cd Perceptrum && ctest --test-dir out/build/linux-debug --output-on-failure
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase18-integracao-origin-main.md`.
+- O relatorio deve listar conflitos resolvidos, arquivos alterados, commits locais criados, testes executados e falhas restantes.

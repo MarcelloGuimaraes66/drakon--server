@@ -1,0 +1,55 @@
+# Prompt 33 - Jobs e inferencia LLM real usando artefatos da camera Linux
+
+Objetivo:
+Conectar jobs/inferencias no Linux aos frames/thumbnails/clips reais produzidos pelas sessoes de camera, e ativar chamada real de LLM quando houver API key configurada, mantendo fake provider apenas para testes.
+
+Contexto obrigatorio:
+- Leia os relatorios das fases 29 a 32.
+- Compare com:
+  - `Perceptrum/Perceptrum/jobs/JobRuntime.cpp`
+  - `Perceptrum/Perceptrum/core/AgentCore.cpp`
+  - `Perceptrum/Perceptrum/orchestrator/LocalLlmClient.cpp`
+  - `Perceptrum/Perceptrum/orchestrator/ChatModelConfig.cpp`
+- Leia Linux atual:
+  - `Perceptrum/linux/LinuxJobRuntime.cpp`
+  - `Perceptrum/linux/LinuxCameraSessionManager.*`
+  - `Perceptrum/linux/LinuxFrameDiskWriter.cpp`
+  - `DrakonSite/src/worker/index.ts`
+
+Restricoes:
+- Nao fazer commit.
+- Nao fazer push.
+- Nao logar OpenAI API key, Z.ai API key, tokens ou imagens em base64.
+- Nao fazer testes automatizados que gastem creditos de LLM por padrao.
+- Chamada real so deve rodar quando env/teste manual explicitamente habilitar.
+
+Tarefas:
+1. Fazer `job_start` no Linux localizar artefatos reais:
+   - ultimo thumbnail;
+   - ultimo clip 10s/60s/300s quando existir;
+   - jobs inference temp root.
+2. Implementar ponte de LLM real:
+   - usar OpenAI quando `OPENAI_API_KEY` ou chave do usuario estiver disponivel;
+   - manter Z.ai quando configurado;
+   - fallback fake apenas em teste ou quando provider fake foi solicitado.
+3. Garantir que perguntas para webcam usem imagem/clip real recente.
+4. Persistir resultado de inferencia no backend com o mesmo contrato esperado pela UI.
+5. Adicionar testes:
+   - fake provider consome artefato real sintetico;
+   - provider real sem chave falha com `missing_openai_api_key`;
+   - provider real habilitado por env fica fora da suite automatica padrao.
+6. Atualizar `RUNBOOK-LINUX.md`:
+   - como configurar OpenAI;
+   - como perguntar para camera;
+   - onde ver artefatos e logs.
+
+Validacao obrigatoria:
+```bash
+(cd Perceptrum && cmake --build out/build/linux-debug -j$(nproc))
+(cd Perceptrum && ctest --test-dir out/build/linux-debug -R 'job|llm|inference|camera' --output-on-failure)
+(cd DrakonSite && npm run build)
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase33-linux-jobs-llm-real-inference-from-camera-artifacts.md`.
+- Relatorio deve deixar claro o que foi testado com fake e o que exige chave real.

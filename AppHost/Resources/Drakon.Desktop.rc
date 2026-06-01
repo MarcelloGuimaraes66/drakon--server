@@ -1,0 +1,4 @@
+#include "Resource.h"
+#include "..\\generated\\Branding.rc2"
+
+IDI_DRAKON_APP ICON APPHOST_MAIN_ICON

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Perceptrum
+Comment=Perceptrum native Linux desktop host
+Exec=perceptrum-desktop-launcher
+Icon=perceptrum
+Terminal=false
+Categories=Utility;AudioVideo;Security;
+StartupNotify=true

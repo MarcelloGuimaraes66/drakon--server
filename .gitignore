@@ -1,32 +1,122 @@
-# Build
-/build/
-/out/
-/cmake-build-*/
-/CMakeFiles/
-/CMakeCache.txt
-/compile_commands.json
+.codex/
+.codex_tmp/
+.codex-logs/
+.tmp/
+.repo-backups/
+_tmp*/
+.tmp_logs_1/
+tmp_ensureSchema_excerpt.txt
+brand.txt
+*.obj
+*.log
+backup/
+backup.zip
+_CPack_Packages/
+perceptrum-desktop_*.deb
+perceptrum-desktop_*.tar.gz
+scratch/
+/-
 
-# Runtime data
-/data/frames/
-/data/inference/
-/data/alerts/
-/data/events/
-/data/indexes/
-/data/logs/
-/data/db/
-/runtime/
+# Legacy nested git repositories to be flattened into the root repo
+DrakonSite/.git/
+Perceptrum/.git/
 
-# Accidental nested clone audited in Prompt 11.
-/drakon-server/
+# Visual Studio and compiler outputs
+**/.vs/
+**/bin/
+**/obj/
+**/Debug/
+**/Release/
+**/x64/
+**/*.user
+**/*.aps
+**/*.idb
+**/*.ipdb
+**/*.iobj
+**/*.pdb
+**/*.recipe
+**/*.tlog
+**/*.lastbuildstate
+**/*.FileListAbsolute.txt
 
-# Secrets/config local
-config/*.local.json
-config/secrets/
-.env
+# Root workspace artifacts
+_temporal_regression_check.obj
+temporal_engine_smoke.obj
+tmp-dbs/
+tmp_nvidia_frames/
+tmp_video_review/
+tmp-video-frames/
+tmp_drakon_db_snapshot/
+tmp_runtime_backups/
+tmp_perceptrum_trace/
+tmp_runtime_stage/
+tmp_billing_frames/
+tmp_video_analysis/
+tmp_zoom_review/
+tmp_zoom_review_132025/
+tmp_cam127_events/
+tmp_cam127_events_tail/
+tmp_cam127_hog/
+tmp_cam127_samples/
+tmp_cam127_events_sheet.jpg
+tmp_cam127_events_tail_sheet.jpg
+tmp_cam127_yolo_test.jpg
+cam127_gate_count.json
+analyze_cam127_gate.py
+.claude/
+models/
+.archon/backups/
+storage/
 
-# Editors
-.vscode/
-.idea/
-*.swp
-*.swo
-.DS_Store
+# AppHost generated and packaged outputs
+AppHost/dist/
+AppHost/stage/
+AppHost/stage-hotfix-*/
+AppHost/artifacts/
+AppHost/generated/
+AppHost/_icon_debug/
+AppHost/*_h.h
+AppHost/tmp-*/
+
+# DrakonSite local build/runtime artifacts
+DrakonSite/.codex-logs/
+DrakonSite/.wrangler/
+DrakonSite/.dev.vars
+DrakonSite/dist/
+DrakonSite/node_modules/
+DrakonSite/storage/
+DrakonSite/C:*/
+DrakonSite/visual-artifacts/
+DrakonSite/.visual-chrome-profile/
+DrakonSite/index.html
+DrakonSite/src/shared/generated/
+DrakonSite/public/branding/current/
+DrakonSite/tmp_docx_extract/
+DrakonSite/tmp_investigation/
+DrakonSite/tmp_*
+DrakonSite/_deploy_payload/
+DrakonSite/_partner_zip/
+DrakonSite/.deploy-account-delete/
+DrakonSite/_diff_jobruntime.patch
+DrakonSite/db/patches/perceptrum_sql.sql
+DrakonSite/__pycache__/
+DrakonSite/*.docx
+DrakonSite/**/*.bak*
+DrakonSite/.env
+DrakonSite/.env*
+DrakonSite/env.dev
+!DrakonSite/.env.example
+!DrakonSite/.env.*.example
+
+# Local deploy snapshots and ad-hoc database dumps
+_deploy/
+tmp_perceptrum_server_*.sql
+tmp_perceptrum_site_*.sql
+
+# Perceptrum local runtime/build artifacts
+Perceptrum/.local/
+Perceptrum/Perceptrum/generated/
+Perceptrum/Perceptrum/gcm-diagnose.log
+perceptrum_site*.sqlite
+perceptrum_site*.sqlite-shm
+perceptrum_site*.sqlite-wal

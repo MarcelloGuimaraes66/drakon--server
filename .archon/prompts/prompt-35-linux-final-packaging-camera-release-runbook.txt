@@ -1,0 +1,68 @@
+# Prompt 35 - Release Linux final com camera, jobs e runbook
+
+Objetivo:
+Fechar o build Linux testavel hoje com webcam/RTSP, agente residente, gravacao, inferencia e pacote `.deb`, sem declarar paridade falsa. Gerar instrucoes finais para o usuario rodar no Ubuntu desktop.
+
+Contexto obrigatorio:
+- Leia os relatorios das fases 29 a 34.
+- Leia `RUNBOOK-LINUX.md`.
+- Leia `Perceptrum/CMakeLists.txt`, `Perceptrum/linux-desktop/run-linux-dev.sh` e scripts de packaging.
+
+Restricoes:
+- Nao fazer commit.
+- Nao fazer push.
+- Nao apagar dados do usuario.
+- Nao publicar segredos.
+- Nao declarar camera/LLM prontos sem evidencia real ou sem marcar dependencia externa.
+
+Tarefas:
+1. Rodar suite final:
+   - web tests possiveis;
+   - web build;
+   - CMake debug/release;
+   - CTest debug/release;
+   - smoke launcher;
+   - smoke agent/backend commands;
+   - smoke camera sintetica;
+   - se houver `/dev/video0`, smoke camera real.
+2. Gerar pacote:
+   - `.deb`;
+   - `.tar.gz` se configurado.
+3. Validar conteudo do pacote:
+   - `perceptrum-desktop`;
+   - `perceptrum-agent`;
+   - backend local;
+   - web build;
+   - scripts e assets necessarios.
+4. Atualizar `RUNBOOK-LINUX.md` com caminho final:
+   - rodar dev;
+   - instalar pacote;
+   - testar webcam real;
+   - testar RTSP real;
+   - configurar OpenAI;
+   - diagnosticar reconnecting;
+   - localizar thumbnails/clips/logs/banco.
+5. Criar relatorio final com:
+   - testes passados;
+   - testes que dependem de hardware/credencial externa;
+   - arquivos de pacote e SHA256;
+   - comandos finais para o usuario.
+
+Validacao obrigatoria:
+```bash
+git status --short --branch
+(cd DrakonSite && npm run test:platform-boundaries && npm run test:local-sqlite-bootstrap && npm run build)
+(cd Perceptrum && cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPERCEPTRUM_ENABLE_AGENT_CORE=ON -DPERCEPTRUM_ENABLE_CAMERA_CAPTURE=ON -DPERCEPTRUM_ENABLE_RTSP_CAPTURE=ON -DPERCEPTRUM_ENABLE_FRAME_WRITER=ON -DPERCEPTRUM_ENABLE_JOB_RUNTIME=ON)
+(cd Perceptrum && cmake --build out/build/linux-debug -j$(nproc) && ctest --test-dir out/build/linux-debug --output-on-failure)
+(cd Perceptrum && cmake -S . -B out/build/linux-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DPERCEPTRUM_ENABLE_AGENT_CORE=ON -DPERCEPTRUM_ENABLE_CAMERA_CAPTURE=ON -DPERCEPTRUM_ENABLE_RTSP_CAPTURE=ON -DPERCEPTRUM_ENABLE_FRAME_WRITER=ON -DPERCEPTRUM_ENABLE_JOB_RUNTIME=ON)
+(cd Perceptrum && cmake --build out/build/linux-release -j$(nproc) && ctest --test-dir out/build/linux-release --output-on-failure)
+(cd Perceptrum && cpack --config out/build/linux-release/CPackConfig.cmake)
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase35-linux-final-packaging-camera-release-runbook.md`.
+- Atualizar `RUNBOOK-LINUX.md`.
+- Informar comando final para rodar:
+  - dev;
+  - pacote instalado;
+  - diagnostico de camera.

@@ -1,0 +1,95 @@
+PROMPT 1 — RESTAURAR BASE LINUX REPRODUTÍVEL DO PERCEPTRUM
+
+Atue como engenheiro sênior de C++23, CMake, Linux/Ubuntu, GTK/WebKitGTK, arquitetura multiplataforma, refatoração segura e compatibilidade Windows/macOS.
+
+Contexto:
+Estou em um computador Ubuntu no projeto:
+
+/home/marcello-guimaraes/dev/perceptrum_desktop_aspp
+
+O Archon já gerou o relatório:
+
+.archon/plans/plano-recalibrado-pos-reset-github.md
+
+Esse relatório confirmou que, no checkout limpo atual:
+
+- Perceptrum/CMakeLists.txt está ausente.
+- Perceptrum/linux está ausente.
+- Perceptrum/linux-desktop está ausente.
+- Perceptrum/packaging/linux está ausente.
+- Perceptrum/out/build/linux-debug existe, mas é artefato não-canônico.
+- Perceptrum/out/package/perceptrum-desktop_1.0.0_amd64.deb existe, mas é artefato não-canônico.
+- AppHost é o host Windows WinUI 3 + C++/WinRT + WebView2 e não deve ser portado diretamente.
+- DrakonSite é fonte canônica de UI web/backend TypeScript e deve ser preservado.
+- Perceptrum/Perceptrum é a fonte canônica do runtime/agente C++.
+- O objetivo imediato não é converter todas as telas ainda.
+- O objetivo imediato é restaurar/criar uma base Linux CMake reprodutível em fonte canônica.
+
+Objetivo desta fase:
+Criar a base Linux mínima e reprodutível do Perceptrum no código-fonte, sem depender de Perceptrum/out.
+
+Implementar:
+1. Criar Perceptrum/CMakeLists.txt.
+2. Criar Perceptrum/linux/main.cpp como entrada mínima do agente Linux.
+3. Criar Perceptrum/linux-desktop/main.cpp como entrada mínima do desktop Linux, podendo ser stub inicial se dependências gráficas ainda não estiverem disponíveis.
+4. Criar, se necessário, Perceptrum/linux-desktop/XdgPaths.h e XdgPaths.cpp para resolver caminhos Linux/XDG.
+5. Criar alvo CMake perceptrum_core com lista explícita de fontes canônicas em Perceptrum/Perceptrum.
+6. Criar alvo CMake perceptrum-agent.
+7. Criar alvo CMake perceptrum-desktop.
+8. Excluir explicitamente fontes Windows-only, UI Win32 legacy, AppHost, .vcxproj, .sln e arquivos *_old.cpp.
+9. Não copiar código de Perceptrum/out para fonte sem revisão.
+10. Usar Perceptrum/out apenas como inventário histórico, não como fonte.
+11. Se algum arquivo C++ ainda tiver acoplamento Win32 bloqueando build Linux, isolar com #ifdef _WIN32 / __linux__ no menor escopo possível.
+12. Preservar Windows/macOS.
+13. Não alterar AppHost.
+14. Não alterar .vcxproj.
+15. Não alterar .sln.
+16. Não fazer commit.
+17. Não fazer push.
+18. Se precisar de apt install, parar e informar exatamente o comando antes de continuar.
+
+Regras de plataforma:
+- Código Windows deve ficar protegido por #ifdef _WIN32.
+- Código macOS deve ficar protegido por #ifdef __APPLE__.
+- Código Linux deve ficar protegido por #ifdef __linux__ quando for específico.
+- Sempre que possível, usar C++ padrão e módulos platform_* compartilhados.
+- Não quebrar o fluxo existente do Windows.
+- Não quebrar compatibilidade futura com macOS.
+
+Validação obrigatória:
+Depois de implementar, executar:
+
+cd Perceptrum
+cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build out/build/linux-debug -j$(nproc)
+ctest --test-dir out/build/linux-debug --output-on-failure
+
+Se os binários forem gerados, executar também:
+
+./out/build/linux-debug/perceptrum-agent --help
+./out/build/linux-debug/perceptrum-agent validate-config
+./out/build/linux-debug/perceptrum-agent check-deps
+
+Se o desktop for gerado e o ambiente gráfico permitir:
+
+./out/build/linux-debug/perceptrum-desktop
+
+Saída obrigatória:
+Gerar relatório em:
+
+.archon/plans/relatorio-fase1-base-linux-reprodutivel.md
+
+O relatório deve conter:
+- arquivos criados;
+- arquivos alterados;
+- fontes incluídas no perceptrum_core;
+- fontes excluídas e motivo;
+- quais artefatos de Perceptrum/out foram ignorados;
+- comandos executados;
+- resultado do CMake;
+- resultado do build;
+- resultado dos testes;
+- erros remanescentes;
+- dependências apt necessárias, se houver;
+- confirmação de que AppHost, .vcxproj e .sln não foram alterados;
+- confirmação de que nenhum commit foi feito.

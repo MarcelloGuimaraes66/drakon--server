@@ -1,0 +1,75 @@
+# Prompt 30 - LinuxCameraSessionManager e webcam residente
+
+Objetivo:
+Implementar uma sessao residente de camera no Linux para `WEBCAM -> /dev/videoN`, em vez de capturar thumbnail/clip de forma sincrona dentro do comando `start_camera`. O comportamento deve se aproximar do Windows: Start cria ou reutiliza uma sessao, responde rapido, mantem captura ativa, grava frames/clips e permite inferencias posteriores.
+
+Contexto obrigatorio:
+- Leia o relatorio da fase 29.
+- Compare com a implementacao fonte:
+  - `Perceptrum/Perceptrum/core/AgentCore.cpp`
+  - `Perceptrum/Perceptrum/camera/CameraSession.cpp`
+  - `Perceptrum/Perceptrum/camera/FrameDiskWriter.cpp`
+  - `Perceptrum/Perceptrum/jobs/JobRuntime.cpp`
+- Leia a implementacao Linux atual:
+  - `Perceptrum/linux/LinuxJobRuntime.cpp`
+  - `Perceptrum/linux/LinuxRtspThumbnailProbe.cpp`
+  - `Perceptrum/linux/LinuxFrameDiskWriter.cpp`
+  - `Perceptrum/linux/LinuxRuntimeAdapters.cpp`
+
+Restricoes:
+- Nao fazer commit.
+- Nao fazer push.
+- Nao quebrar Windows.
+- Nao depender de Media Foundation no Linux.
+- Nao exigir webcam real para testes automatizados; use `lavfi` ou arquivo quando necessario.
+- Nao bloquear `start_camera` esperando clip de 10s.
+
+Tarefas:
+1. Criar `Perceptrum/linux/LinuxCameraSessionManager.{h,cpp}` ou equivalente local, com:
+   - mapa de sessoes por `camera_id`;
+   - `startCamera(config, payload)` idempotente;
+   - `stopCamera(camera_id)`;
+   - status resumido por camera;
+   - shutdown limpo.
+2. Implementar sessao WEBCAM:
+   - resolver `connection_method=WEBCAM` + `webcam_index=N` para `/dev/videoN`;
+   - aceitar override `APP_AGENT_WEBCAM_DEVICE`;
+   - capturar primeiro frame rapidamente com `ffmpeg`/v4l2;
+   - subir thumbnail para backend;
+   - iniciar gravacao em background nos diretorios XDG corretos;
+   - manter processo(s) vivos ate `stop_camera`;
+   - matar processo(s) no stop/shutdown.
+3. O `start_camera` do Linux deve retornar `completed` rapidamente quando a fonte abriu e pelo menos um frame foi capturado.
+4. O `start_camera` deve retornar `failed` com erro especifico quando:
+   - `/dev/videoN` nao existe;
+   - permissoes negadas;
+   - ffmpeg nao existe;
+   - frame nao capturado no tempo limite;
+   - thumbnail upload falhou.
+5. `stop_camera` deve encerrar sessao residente e atualizar resultado.
+6. Adicionar status no `agent_health.json`:
+   - cameras ativas;
+   - ultimo erro por camera;
+   - ultimo thumbnail;
+   - diretoriors de clips;
+   - processos ffmpeg filhos quando aplicavel.
+
+Validacao obrigatoria:
+```bash
+(cd Perceptrum && cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPERCEPTRUM_ENABLE_AGENT_CORE=ON -DPERCEPTRUM_ENABLE_CAMERA_CAPTURE=ON -DPERCEPTRUM_ENABLE_RTSP_CAPTURE=ON -DPERCEPTRUM_ENABLE_FRAME_WRITER=ON -DPERCEPTRUM_ENABLE_JOB_RUNTIME=ON)
+(cd Perceptrum && cmake --build out/build/linux-debug -j$(nproc))
+(cd Perceptrum && ctest --test-dir out/build/linux-debug -R 'linux.*camera|webcam|job_runtime' --output-on-failure)
+```
+
+Teste manual obrigatorio quando houver `/dev/video0`:
+```bash
+ffmpeg -y -hide_banner -f v4l2 -framerate 15 -i /dev/video0 -frames:v 1 /tmp/perceptrum-webcam-real.jpg
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase30-linux-camera-session-manager-webcam-residente.md`.
+- Relatorio deve mostrar:
+  - contrato de Start/Stop;
+  - paths de thumbnail e clips;
+  - tempo medio de resposta do Start;
+  - como testar webcam real na UI.

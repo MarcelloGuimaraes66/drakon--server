@@ -1,0 +1,47 @@
+# Prompt 10 - Bridge WebKitGTK e local session Linux
+
+Objetivo:
+Implementar no host Linux WebKitGTK a ponte nativa minima equivalente ao AppHost/WebView2 para local session, mensagens JS e callbacks necessarios para o app desktop funcionar como app local, sem navegador externo.
+
+Escopo:
+- Auditar `AppHost/Pages/SiteHostPage.xaml.cpp` apenas como referencia.
+- Nao portar AppHost para Linux.
+- Implementar no `Perceptrum/linux-desktop` um bridge WebKitGTK separado.
+- Injetar compatibilidade JS para que chamadas tipo `window.chrome.webview.postMessage(...)` funcionem no Linux quando necessario.
+- Suportar mensagens:
+  - `resident-runtime-session`
+  - `theme-changed`
+  - `account-delete-cleanup`
+- Interceptar navegacao/callbacks OAuth locais quando aplicavel.
+- Persistir a sessao via endpoints locais/RuntimePaths, sem CWD.
+- Manter React comum sem imports GTK/WebKit/WinUI.
+
+Restricoes:
+- Nao alterar `AppHost/`.
+- Nao alterar `.vcxproj`.
+- Nao alterar `.sln`.
+- Nao introduzir dependencia GTK/WebKit dentro de `DrakonSite/src/react-app`.
+- Nao ativar AgentCore completo.
+- Nao fazer commit/push.
+
+Validacao obrigatoria:
+
+```bash
+cd Perceptrum
+cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build out/build/linux-debug -j$(nproc)
+ctest --test-dir out/build/linux-debug --output-on-failure
+```
+
+Adicionar testes CTest quando possivel para:
+- confirmar que `perceptrum-desktop --print-web-root --no-open --webkit` reporta WebKit compilado;
+- confirmar que `DrakonSite/src/react-app` nao contem `gtk`, `WebKitGTK`, `WinUI`, `WebView2` ou `winrt`;
+- confirmar que `linux-desktop` nao referencia `AppHost`.
+
+Relatorio:
+Criar `.archon/plans/relatorio-fase10-linux-webkit-bridge-local-session.md` com:
+- API da bridge implementada;
+- diferencas intencionais em relacao ao WebView2;
+- caminhos de storage usados;
+- testes executados;
+- riscos remanescentes de OAuth/local session.

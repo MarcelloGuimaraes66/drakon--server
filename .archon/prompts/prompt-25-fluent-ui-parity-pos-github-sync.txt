@@ -1,0 +1,46 @@
+# Prompt 25 - Paridade visual Fluent depois do sync GitHub
+
+Objetivo:
+Converter as telas novas e alteradas pelo GitHub para os mesmos tokens Fluent usados no shell/porta Linux, mantendo visual bonito e identico entre Linux host e Windows WebView2.
+
+Contexto obrigatorio:
+- Leia `.archon/plans/relatorio-fase24-linux-shared-camera-workspace-access-parity.md`.
+- Leia `DrakonSite/docs/visual-battery.md`, se existir.
+- Inspecione telas novas/alteradas:
+  - Dashboard
+  - Cameras
+  - Jobs
+  - Chat
+  - Events
+  - Billing
+  - Settings
+  - Account users/workspace access
+  - Shared camera/workspace flows
+
+Restricoes:
+- Nao fazer push.
+- Nao usar gradientes/sombras/cards proprios fora dos tokens Fluent existentes.
+- Nao criar dependencia WinUI/GTK/WebView2 na UI React comum.
+- Nao fazer landing page; manter app operacional como primeira tela.
+- Nao deixar textos/controles sobrepostos em desktop/mobile.
+
+Tarefas:
+1. Fazer varredura CSS/TSX para cards, shadows, gradients, backgrounds e tokens fora do padrao.
+2. Migrar telas internas novas/alteradas para tokens Fluent centralizados.
+3. Corrigir light/dark em todos os fluxos.
+4. Garantir responsividade minima desktop e mobile nas telas de operacao.
+5. Atualizar bateria visual para incluir telas novas de account/workspace/shared camera.
+6. Gerar screenshots Linux host dark/light.
+7. Deixar instrucoes para Windows WebView2 quando nao for possivel rodar neste Ubuntu.
+
+Validacao obrigatoria:
+```bash
+cd DrakonSite
+npm run test:platform-boundaries
+npm run build
+npm run visual:linux
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase25-fluent-ui-parity-pos-github-sync.md`.
+- O relatorio deve listar telas migradas, screenshots gerados, riscos visuais e comando para bateria Windows WebView2.

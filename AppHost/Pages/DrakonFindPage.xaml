@@ -1,0 +1,478 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Background="Transparent"
+    RequestedTheme="Dark">
+
+    <Grid Padding="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="16" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="16" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Spacing="6">
+            <TextBlock
+                Style="{StaticResource DrakonDisplayTitleTextStyle}"
+                Text="Drakon Find" />
+            <TextBlock
+                Style="{StaticResource DrakonBodyTextStyle}"
+                Text="Port nativo do cockpit de busca distribuída do DrakonSite com catálogo visual, escopo por UF, operações em tempo real, hits e trilha de auditoria."
+                TextWrapping="WrapWholeWords" />
+        </StackPanel>
+
+        <InfoBar
+            x:Name="DrakonFindInfoBar"
+            Grid.Row="2"
+            IsOpen="False"
+            IsClosable="True"
+            Severity="Informational" />
+
+        <ScrollViewer
+            Grid.Row="4"
+            VerticalScrollBarVisibility="Auto">
+            <StackPanel Spacing="16">
+                <Border Style="{StaticResource DrakonHeroPanelStyle}">
+                    <Grid ColumnSpacing="16" RowSpacing="12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <StackPanel Spacing="8">
+                            <TextBlock
+                                Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                Text="Busca distribuída com target visual, geofence e resultados ao vivo" />
+                            <TextBlock
+                                Style="{StaticResource DrakonBodyTextStyle}"
+                                Text="A janela WinUI 3 já cobre leitura do catálogo, escopo operacional, criação de buscas, controle de operações, hits e auditoria usando os endpoints reais do DrakonSite."
+                                TextWrapping="WrapWholeWords" />
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Upload de novas imagens de referência ainda está pendente no próximo slice nativo."
+                                TextWrapping="WrapWholeWords" />
+                        </StackPanel>
+
+                        <Button
+                            x:Name="RefreshDrakonFindButton"
+                            Grid.Column="1"
+                            Content="Refresh"
+                            HorizontalAlignment="Right"
+                            VerticalAlignment="Top"
+                            Style="{StaticResource AccentButtonStyle}" />
+                    </Grid>
+                </Border>
+
+                <Grid
+                    x:Name="MetricsGrid"
+                    ColumnSpacing="16"
+                    RowSpacing="16">
+                    <Grid.RowDefinitions>
+                        <RowDefinition x:Name="MetricsFirstRow" Height="Auto" />
+                        <RowDefinition x:Name="MetricsSecondRow" Height="0" />
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition x:Name="MetricsFirstColumn" Width="*" />
+                        <ColumnDefinition x:Name="MetricsSecondColumn" Width="*" />
+                        <ColumnDefinition x:Name="MetricsThirdColumn" Width="*" />
+                        <ColumnDefinition x:Name="MetricsFourthColumn" Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Border
+                        x:Name="TargetsMetricBorder"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <StackPanel Spacing="8">
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Targets" />
+                            <TextBlock
+                                x:Name="TargetsMetricValueText"
+                                FontSize="28"
+                                FontWeight="SemiBold"
+                                Text="0" />
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Catálogo visual pronto para novas buscas." />
+                        </StackPanel>
+                    </Border>
+
+                    <Border
+                        x:Name="ActiveSearchesMetricBorder"
+                        Grid.Column="1"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <StackPanel Spacing="8">
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Ativas" />
+                            <TextBlock
+                                x:Name="ActiveSearchesMetricValueText"
+                                FontSize="28"
+                                FontWeight="SemiBold"
+                                Text="0" />
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Buscas em fila, dispatch ou execução." />
+                        </StackPanel>
+                    </Border>
+
+                    <Border
+                        x:Name="HitsMetricBorder"
+                        Grid.Column="2"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <StackPanel Spacing="8">
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Hits" />
+                            <TextBlock
+                                x:Name="HitsMetricValueText"
+                                FontSize="28"
+                                FontWeight="SemiBold"
+                                Text="0" />
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Matches recebidos do runtime distribuído." />
+                        </StackPanel>
+                    </Border>
+
+                    <Border
+                        x:Name="ScopeMetricBorder"
+                        Grid.Column="3"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <StackPanel Spacing="8">
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Escopo" />
+                            <TextBlock
+                                x:Name="ScopeMetricValueText"
+                                FontSize="28"
+                                FontWeight="SemiBold"
+                                Text="0" />
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Câmeras públicas ativas no preview do escopo." />
+                        </StackPanel>
+                    </Border>
+                </Grid>
+
+                <Grid
+                    x:Name="TopPrimaryGrid"
+                    ColumnSpacing="16"
+                    RowSpacing="16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition x:Name="TopPrimaryFirstColumn" Width="*" />
+                        <ColumnDefinition x:Name="TopPrimarySecondColumn" Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Border
+                        x:Name="CreateTargetBorder"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock
+                                Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                Text="Cadastro do target" />
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Texto operacional e características do alvo. O upload visual será religado no próximo slice." />
+
+                            <ComboBox
+                                x:Name="EntityTypeComboBox"
+                                PlaceholderText="Entity type" />
+                            <TextBox
+                                x:Name="TargetNameTextBox"
+                                PlaceholderText="Ex.: moto com duas pessoas" />
+                            <TextBox
+                                x:Name="TargetDescriptionTextBox"
+                                AcceptsReturn="True"
+                                MinHeight="120"
+                                PlaceholderText="Descreva aparência, sinais visuais, contexto e padrões do alvo..."
+                                TextWrapping="Wrap" />
+                            <TextBox
+                                x:Name="TargetTraitsTextBox"
+                                PlaceholderText="capacete branco, mochila preta, adesivo lateral..." />
+                            <Button
+                                x:Name="CreateTargetButton"
+                                Content="Registrar target"
+                                Style="{StaticResource AccentButtonStyle}" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border
+                        x:Name="CatalogBorder"
+                        Grid.Column="1"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <Grid RowSpacing="12">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="Catálogo" />
+                                <TextBlock
+                                    x:Name="TargetCatalogSummaryText"
+                                    Style="{StaticResource DrakonCaptionTextStyle}"
+                                    Text="0 target(s) carregados." />
+                            </StackPanel>
+
+                            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                                <StackPanel
+                                    x:Name="TargetCatalogItemsHost"
+                                    Spacing="12" />
+                            </ScrollViewer>
+                        </Grid>
+                    </Border>
+                </Grid>
+
+                <Border Style="{StaticResource DrakonPanelStyle}">
+                    <Grid RowSpacing="16">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Spacing="8">
+                            <TextBlock
+                                Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                Text="Composer da busca" />
+                            <TextBlock
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="Target selecionado, geofence por UF, preview do escopo e disparo da operação." />
+                        </StackPanel>
+
+                        <Grid
+                            x:Name="ComposerGrid"
+                            Grid.Row="1"
+                            ColumnSpacing="16"
+                            RowSpacing="16">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition x:Name="ComposerFirstColumn" Width="1.1*" />
+                                <ColumnDefinition x:Name="ComposerSecondColumn" Width="0.9*" />
+                            </Grid.ColumnDefinitions>
+
+                            <Border
+                                x:Name="SelectedTargetBorder"
+                                Style="{StaticResource DrakonInsetPanelStyle}">
+                                <StackPanel Spacing="12">
+                                    <Grid ColumnSpacing="12">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+
+                                        <StackPanel Spacing="4">
+                                            <TextBlock
+                                                x:Name="SelectedTargetTitleText"
+                                                Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                                Text="Nenhum target selecionado" />
+                                            <TextBlock
+                                                x:Name="SelectedTargetDescriptionText"
+                                                Style="{StaticResource DrakonBodyTextStyle}"
+                                                Text="Selecione um alvo no catálogo para montar a próxima busca."
+                                                TextWrapping="WrapWholeWords" />
+                                            <TextBlock
+                                                x:Name="SelectedTargetMetaText"
+                                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                                Text="0 imagens • 0 buscas vinculadas" />
+                                        </StackPanel>
+
+                                        <Button
+                                            x:Name="DeleteSelectedTargetButton"
+                                            Grid.Column="1"
+                                            Content="Excluir target" />
+                                    </Grid>
+
+                                    <TextBlock
+                                        Style="{StaticResource DrakonCaptionTextStyle}"
+                                        Text="Estados separados por vírgula. Ex.: AM,PA,SP"
+                                        TextWrapping="WrapWholeWords" />
+                                    <TextBox
+                                        x:Name="StateSelectionTextBox"
+                                        PlaceholderText="AM,PA,SP" />
+
+                                    <Grid ColumnSpacing="10" RowSpacing="10">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+
+                                        <ComboBox
+                                            x:Name="SearchDurationComboBox"
+                                            PlaceholderText="Duração" />
+                                        <TextBlock
+                                            x:Name="ScopeSummaryText"
+                                            Grid.Column="1"
+                                            Style="{StaticResource DrakonCaptionTextStyle}"
+                                            Text="Escopo ainda não resolvido."
+                                            TextWrapping="WrapWholeWords"
+                                            VerticalAlignment="Center" />
+                                        <Button
+                                            x:Name="ResolveScopeButton"
+                                            Grid.Column="2"
+                                            Content="Resolver escopo" />
+                                        <Button
+                                            x:Name="CreateSearchButton"
+                                            Grid.Column="3"
+                                            Content="Iniciar busca"
+                                            Style="{StaticResource AccentButtonStyle}" />
+                                    </Grid>
+
+                                    <TextBlock
+                                        Style="{StaticResource DrakonCaptionTextStyle}"
+                                        Text="Referências ativas do target"
+                                        TextWrapping="WrapWholeWords" />
+                                    <StackPanel
+                                        x:Name="SelectedTargetImagesHost"
+                                        Spacing="8" />
+                                </StackPanel>
+                            </Border>
+
+                            <Border
+                                x:Name="ScopePreviewBorder"
+                                Grid.Column="1"
+                                Style="{StaticResource DrakonInsetPanelStyle}">
+                                <Grid RowSpacing="12">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="*" />
+                                    </Grid.RowDefinitions>
+
+                                    <StackPanel Spacing="4">
+                                        <TextBlock
+                                            Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                            Text="Preview do escopo" />
+                                        <TextBlock
+                                            x:Name="ScopePreviewSummaryText"
+                                            Style="{StaticResource DrakonCaptionTextStyle}"
+                                            Text="O preview aparece aqui assim que o escopo for resolvido." />
+                                    </StackPanel>
+
+                                    <ScrollViewer Grid.Row="1" MaxHeight="160" VerticalScrollBarVisibility="Auto">
+                                        <StackPanel
+                                            x:Name="ScopeStateItemsHost"
+                                            Orientation="Horizontal"
+                                            Spacing="8" />
+                                    </ScrollViewer>
+
+                                    <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+                                        <StackPanel
+                                            x:Name="ScopeCameraItemsHost"
+                                            Spacing="10" />
+                                    </ScrollViewer>
+                                </Grid>
+                            </Border>
+                        </Grid>
+
+                        <TextBlock
+                            x:Name="ScopeHintText"
+                            Grid.Row="2"
+                            Style="{StaticResource DrakonCaptionTextStyle}"
+                            Text="O runtime nativo analisará janelas contínuas de vídeo conforme a duração selecionada. Câmeras desmarcadas saem do dispatch."
+                            TextWrapping="WrapWholeWords" />
+                    </Grid>
+                </Border>
+
+                <Grid
+                    x:Name="ResultsGrid"
+                    ColumnSpacing="16"
+                    RowSpacing="16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition x:Name="ResultsFirstColumn" Width="*" />
+                        <ColumnDefinition x:Name="ResultsSecondColumn" Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Border
+                        x:Name="SearchesBorder"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <Grid RowSpacing="12">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="Operações em tempo real" />
+                                <TextBlock
+                                    x:Name="SearchesSummaryText"
+                                    Style="{StaticResource DrakonCaptionTextStyle}"
+                                    Text="0 busca(s)." />
+                            </StackPanel>
+
+                            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                                <StackPanel
+                                    x:Name="SearchItemsHost"
+                                    Spacing="12" />
+                            </ScrollViewer>
+                        </Grid>
+                    </Border>
+
+                    <Border
+                        x:Name="HitsBorder"
+                        Grid.Column="1"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <Grid RowSpacing="12">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="Resultados ao vivo" />
+                                <TextBlock
+                                    x:Name="HitsSummaryText"
+                                    Style="{StaticResource DrakonCaptionTextStyle}"
+                                    Text="0 hit(s)." />
+                            </StackPanel>
+
+                            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                                <StackPanel
+                                    x:Name="HitItemsHost"
+                                    Spacing="12" />
+                            </ScrollViewer>
+                        </Grid>
+                    </Border>
+                </Grid>
+
+                <Border Style="{StaticResource DrakonPanelStyle}">
+                    <Grid RowSpacing="12">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock
+                                Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                Text="Trilha de auditoria" />
+                            <TextBlock
+                                x:Name="AuditSummaryText"
+                                Style="{StaticResource DrakonCaptionTextStyle}"
+                                Text="0 evento(s)." />
+                        </StackPanel>
+
+                        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                            <StackPanel
+                                x:Name="AuditItemsHost"
+                                Spacing="12" />
+                        </ScrollViewer>
+                    </Grid>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</Page>

@@ -1,0 +1,288 @@
+PROMPT 4 — PREPARAR HEADLESSSERVICE REAL PARA LINUX SEM QUEBRAR WINDOWS/MACOS
+
+Atue como engenheiro sênior de C++23, CMake, Linux/Ubuntu, runtime headless, arquitetura multiplataforma, isolamento de código Win32, segurança de runtime local e refatoração segura.
+
+Contexto:
+Estou no Ubuntu, no projeto:
+
+/home/marcello-guimaraes/dev/perceptrum_desktop_aspp
+
+As Fases 1, 2 e 3 já foram executadas.
+
+Fase 1:
+- Restaurou a base Linux CMake reprodutível.
+- Criou Perceptrum/CMakeLists.txt.
+- Criou Perceptrum/linux/main.cpp.
+- Criou Perceptrum/linux-desktop/main.cpp.
+- Criou Perceptrum/linux-desktop/XdgPaths.h/.cpp.
+- Validou CMake, build e comandos básicos.
+
+Fase 2:
+- Implementou APP_RUNTIME_DATA_ROOT.
+- Implementou APP_RUNTIME_CONFIG_ROOT.
+- Implementou APP_RUNTIME_CACHE_ROOT.
+- Implementou APP_RUNTIME_STATE_ROOT.
+- Implementou APP_RUNTIME_LOG_ROOT.
+- Implementou fallback XDG.
+- Criou logs e agent_health.json.
+- Fez secure store Linux fail-closed por padrão.
+- Adicionou 7 testes CTest.
+
+Fase 3:
+- Implementou comandos de pairing/provisioning/config no agente Linux mínimo.
+- Ampliou run/status/healthcheck.
+- Adicionou testes CTest.
+- Resultado: 15/15 testes passando.
+- Não fez commit.
+- Não fez push.
+- Não alterou AppHost, .vcxproj ou .sln.
+- Manteve HeadlessService real fora do build Linux porque ele ainda arrasta Logging/AgentCore/acoplamentos Windows.
+
+Relatórios obrigatórios já existentes:
+- .archon/plans/plano-recalibrado-pos-reset-github.md
+- .archon/plans/relatorio-fase1-base-linux-reprodutivel.md
+- .archon/plans/relatorio-fase2-runtime-xdg-secrets-linux.md
+- .archon/plans/relatorio-fase3-pairing-headless-linux.md
+- .archon/plans/anchor-riscos-multiplataforma.md
+- .archon/plans/anchor-comandos-validacao.md
+
+Objetivo desta Fase 4:
+Preparar a integração segura do HeadlessService real no Linux, sem ainda puxar de forma completa AgentCore, CameraSession, FrameDiskWriter, JobRuntime ou captura RTSP.
+
+A Fase 4 deve aproximar o agente Linux do runtime real, mas de forma controlada, criando/adaptando uma camada mínima que permita evoluir para HeadlessService real sem quebrar Windows/macOS.
+
+Esta fase NÃO deve:
+- converter interface completa;
+- implementar telas do Perceptrum;
+- ligar câmera real;
+- executar RTSP;
+- executar jobs reais pesados;
+- integrar AgentCore completo se ele ainda arrastar Win32;
+- alterar AppHost;
+- alterar .vcxproj;
+- alterar .sln;
+- fazer commit;
+- fazer push.
+
+Arquivos a ler antes de alterar:
+- .archon/plans/relatorio-fase3-pairing-headless-linux.md
+- .archon/plans/relatorio-fase2-runtime-xdg-secrets-linux.md
+- .archon/plans/relatorio-fase1-base-linux-reprodutivel.md
+- .archon/plans/anchor-riscos-multiplataforma.md
+- Perceptrum/CMakeLists.txt
+- Perceptrum/linux/main.cpp
+- Perceptrum/linux/RuntimePaths.h
+- Perceptrum/linux/RuntimePaths.cpp
+- Perceptrum/linux-desktop/main.cpp
+- Perceptrum/Perceptrum/runtime/HeadlessService.cpp
+- Perceptrum/Perceptrum/runtime/HeadlessService.h
+- Perceptrum/Perceptrum/runtime/BrandingRuntime.cpp
+- Perceptrum/Perceptrum/runtime/BrandingRuntime.h
+- Perceptrum/Perceptrum/logging/Logging.cpp
+- Perceptrum/Perceptrum/logging/Logging.h
+- Perceptrum/Perceptrum/core/AgentCore.cpp
+- Perceptrum/Perceptrum/core/AgentCore.h
+- Perceptrum/Perceptrum/camera/CameraSession.cpp
+- Perceptrum/Perceptrum/camera/CameraSession.h
+- Perceptrum/Perceptrum/camera/FrameDiskWriter.cpp
+- Perceptrum/Perceptrum/camera/FrameDiskWriter.h
+- Perceptrum/Perceptrum/jobs/JobRuntime.cpp
+- Perceptrum/Perceptrum/jobs/JobRuntime.h
+- Perceptrum/Perceptrum/platform/platform_common.cpp
+- Perceptrum/Perceptrum/platform/platform_common.h
+- Perceptrum/Perceptrum/platform/platform_process.cpp
+- Perceptrum/Perceptrum/platform/platform_process.h
+- Perceptrum/Perceptrum/platform/platform_shutdown.cpp
+- Perceptrum/Perceptrum/platform/platform_shutdown.h
+- Perceptrum/Perceptrum/platform/platform_secure_store.cpp
+- Perceptrum/Perceptrum/platform/platform_secure_store.h
+
+Regras absolutas:
+1. Não fazer commit.
+2. Não fazer push.
+3. Não executar git reset --hard.
+4. Não apagar código.
+5. Não alterar AppHost.
+6. Não alterar .vcxproj.
+7. Não alterar .sln.
+8. Não quebrar Windows.
+9. Não quebrar macOS.
+10. Não copiar código de Perceptrum/out como fonte.
+11. Perceptrum/out é artefato histórico, não fonte canônica.
+12. Não transformar o Linux em site externo.
+13. Não implementar interface completa nesta fase.
+14. Não integrar câmera/RTSP real nesta fase.
+15. Não ativar jobs reais pesados nesta fase.
+16. Não expor tokens/secrets em log, terminal ou health JSON.
+17. Usar somente Codex/gpt-5.5.
+18. Não usar Claude, opus, sonnet ou haiku.
+19. Se precisar de apt install, parar e informar exatamente o comando antes de continuar.
+
+Implementar nesta fase:
+
+A. Auditoria dos bloqueios do HeadlessService
+1. Identificar exatamente quais includes, classes e funções impedem HeadlessService.cpp de compilar no Linux.
+2. Separar bloqueios em:
+   - Logging;
+   - AgentCore;
+   - CameraSession;
+   - FrameDiskWriter;
+   - JobRuntime;
+   - Win32 APIs;
+   - caminhos hardcoded;
+   - processos;
+   - shutdown/signals;
+   - filesystem;
+   - secure store;
+   - outros.
+3. Documentar quais bloqueios podem ser corrigidos agora e quais devem ficar para fase posterior.
+
+B. Criar adaptador Linux mínimo para HeadlessService
+Criar, se necessário, uma camada de runtime Linux mínimo, por exemplo:
+
+- Perceptrum/linux/LinuxHeadlessRuntime.h
+- Perceptrum/linux/LinuxHeadlessRuntime.cpp
+
+ou nome equivalente, com responsabilidade clara:
+
+1. Carregar config persistida da Fase 3.
+2. Carregar runtime roots.
+3. Criar diretórios.
+4. Criar logs.
+5. Atualizar agent_health.json.
+6. Refletir paired/provisioned.
+7. Executar loop controlado.
+8. Tratar shutdown por SIGINT/SIGTERM.
+9. Não iniciar AgentCore completo ainda se não for seguro.
+10. Não iniciar câmera, RTSP ou jobs reais ainda.
+11. Preparar ponto único para futura substituição pelo HeadlessService real.
+
+C. Preparar HeadlessService real sem forçar integração completa
+1. Se for possível incluir HeadlessService.h no build Linux sem puxar acoplamentos Win32, fazer isso.
+2. Se for possível compilar parte de HeadlessService.cpp com #ifdef __linux__ sem puxar AgentCore, implementar no menor escopo.
+3. Se HeadlessService.cpp ainda não puder entrar no build Linux sem grande refatoração, não forçar.
+4. Nesse caso, gerar uma ponte/adaptador documentado e relatório claro do que impede a integração real.
+5. Não fazer refatoração massiva de AgentCore nesta fase.
+
+D. Logging Linux mínimo
+1. Garantir que o runtime Linux mínimo escreva logs em APP_RUNTIME_LOG_ROOT.
+2. Não usar Logging.cpp se ele ainda estiver acoplado ao Windows, salvo se corrigir no menor escopo.
+3. Se Logging.cpp puder ser tornado portável com baixo risco, isolar Win32 com #ifdef _WIN32 e Linux com __linux__.
+4. Não alterar comportamento Windows.
+
+E. Shutdown Linux
+1. Garantir que run responda a SIGINT/SIGTERM.
+2. Garantir que timeout nos testes não deixe arquivos corrompidos.
+3. Garantir que agent_health.json termine em estado stopped ou equivalente quando o run for encerrado de modo controlado, se viável.
+
+F. Health/status mais realista
+Atualizar status/healthcheck para diferenciar:
+1. not_paired;
+2. provisioned;
+3. running;
+4. stopped;
+5. stale_heartbeat;
+6. missing_snapshot;
+7. config_invalid;
+8. secure_store_unavailable;
+9. runtime_stub;
+10. headless_ready;
+11. headless_blocked_by_platform_coupling, se aplicável.
+
+G. CMake
+Atualizar Perceptrum/CMakeLists.txt apenas se necessário.
+
+Regras:
+1. Manter lista explícita de fontes.
+2. Não globar a árvore.
+3. Não incluir AppHost.
+4. Não incluir .vcxproj.
+5. Não incluir .sln.
+6. Não incluir arquivos *_old.cpp.
+7. Não incluir UI Windows-only.
+8. Não puxar AgentCore/CameraSession/JobRuntime completos se ainda quebrarem Linux.
+9. Se criar LinuxHeadlessRuntime, adicioná-lo ao alvo perceptrum-agent.
+
+H. Testes CTest
+Adicionar ou atualizar testes para:
+1. run cria health snapshot.
+2. run reflete provisioned quando config não sensível existe.
+3. run termina/controla estado stopped quando possível.
+4. healthcheck diferencia runtime_stub/headless_ready.
+5. status mostra runtime roots.
+6. status não expõe secrets.
+7. logs são criados em APP_RUNTIME_LOG_ROOT.
+8. SIGTERM/timeout não causa crash.
+9. AppHost/.vcxproj/.sln não são tocados indiretamente.
+10. Se HeadlessService real não entrar no build, deve existir teste/relatório confirmando por quê.
+
+I. Validação manual
+Após implementar, executar:
+
+cd Perceptrum
+cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build out/build/linux-debug -j$(nproc)
+ctest --test-dir out/build/linux-debug --output-on-failure
+
+Depois, com runtime isolado:
+
+export APP_RUNTIME_DATA_ROOT=/tmp/perceptrum-runtime-test/data
+export APP_RUNTIME_CONFIG_ROOT=/tmp/perceptrum-runtime-test/config
+export APP_RUNTIME_CACHE_ROOT=/tmp/perceptrum-runtime-test/cache
+export APP_RUNTIME_STATE_ROOT=/tmp/perceptrum-runtime-test/state
+export APP_RUNTIME_LOG_ROOT=/tmp/perceptrum-runtime-test/state/logs
+
+rm -rf /tmp/perceptrum-runtime-test
+mkdir -p "$APP_RUNTIME_DATA_ROOT" "$APP_RUNTIME_CONFIG_ROOT" "$APP_RUNTIME_CACHE_ROOT" "$APP_RUNTIME_STATE_ROOT" "$APP_RUNTIME_LOG_ROOT"
+
+./out/build/linux-debug/perceptrum-agent --help
+./out/build/linux-debug/perceptrum-agent version
+./out/build/linux-debug/perceptrum-agent validate-config
+./out/build/linux-debug/perceptrum-agent check-deps
+./out/build/linux-debug/perceptrum-agent status || true
+./out/build/linux-debug/perceptrum-agent healthcheck || true
+
+APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 ./out/build/linux-debug/perceptrum-agent provision --base-url http://localhost:4000 --exe-token TEST_TOKEN --client-id test-client --timezone America/Manaus || true
+
+timeout 10s ./out/build/linux-debug/perceptrum-agent run || true
+./out/build/linux-debug/perceptrum-agent status || true
+./out/build/linux-debug/perceptrum-agent healthcheck || true
+find /tmp/perceptrum-runtime-test -maxdepth 5 -type f -print
+
+Saída obrigatória:
+Gerar relatório em:
+
+.archon/plans/relatorio-fase4-headlessservice-linux-safe.md
+
+O relatório deve conter:
+1. Arquivos lidos.
+2. Arquivos criados.
+3. Arquivos alterados.
+4. Bloqueios reais encontrados no HeadlessService.
+5. Se HeadlessService real entrou ou não entrou no build Linux.
+6. Se não entrou, explicar exatamente por quê.
+7. Adaptador Linux criado ou ajustado.
+8. Como run/status/healthcheck mudaram.
+9. Como logs e health snapshot se comportam.
+10. Como shutdown/SIGTERM foi tratado.
+11. Quais testes CTest foram adicionados.
+12. Resultado do CMake.
+13. Resultado do build.
+14. Resultado do ctest.
+15. Resultado dos comandos manuais.
+16. Confirmação de que AppHost não foi alterado.
+17. Confirmação de que .vcxproj e .sln não foram alterados.
+18. Confirmação de que nenhum commit foi feito.
+19. Riscos pendentes.
+20. Próxima fase recomendada.
+
+Critério de sucesso:
+A Fase 4 só é considerada concluída se:
+- build Linux continuar reprodutível;
+- ctest passar;
+- run/status/healthcheck ficarem mais próximos de um runtime real;
+- logs e health funcionarem com APP_RUNTIME_* em /tmp;
+- HeadlessService real for integrado OU houver relatório preciso do que ainda bloqueia;
+- AgentCore/câmera/jobs pesados não forem integrados indevidamente;
+- AppHost/.vcxproj/.sln não forem alterados;
+- nenhum commit for feito.

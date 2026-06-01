@@ -1,0 +1,49 @@
+# Prompt 23 - Jobs, comandos e inferencia LLM no Linux
+
+Objetivo:
+Portar `JobRuntime`, comandos de start/stop camera/job e inferencias LLM para Linux, integrando com AgentCore, camera capture e backend local.
+
+Contexto obrigatorio:
+- Leia `.archon/plans/relatorio-fase22-linux-camera-capture-framewriter-recordings.md`.
+- Inspecione:
+  - `Perceptrum/Perceptrum/jobs/JobRuntime.cpp`
+  - `Perceptrum/Perceptrum/jobs/JobPayloadParser.cpp`
+  - `Perceptrum/Perceptrum/orchestrator/LocalLlmClient.cpp`
+  - `Perceptrum/Perceptrum/orchestrator/ChatModelConfig.cpp`
+  - `DrakonSite/src/worker/jobScheduler.ts`
+  - tabelas `commands`, `jobs`, `job_steps`, `openai_settings`, `zai_settings`, `model_api_keys`
+
+Restricoes:
+- Nao fazer push.
+- Nao fazer chamada real paga a OpenAI/Z.ai sem chave explicitamente configurada no ambiente/banco.
+- Nunca imprimir chaves ou tokens.
+- Testes automatizados devem usar provedor fake/local para inferencia.
+- Manter compatibilidade Windows.
+
+Tarefas:
+1. Portar `JobRuntime` para compilar e rodar no Linux atras de `PERCEPTRUM_ENABLE_JOB_RUNTIME=ON`.
+2. Conectar polling/execucao de comandos:
+   - `start_camera`
+   - `stop_camera`
+   - `job_start`
+   - `job_stop`
+   - refresh thumbnail quando aplicavel.
+3. Integrar com diretorios de clips/inference temp definidos no Prompt 22.
+4. Criar provedor LLM fake/local para testes, com a mesma interface de OpenAI/Z.ai, sem rede externa.
+5. Criar caminho real opcional:
+   - se `OPENAI_API_KEY`/`ZAI_API_KEY` ou settings locais existirem, permitir teste manual controlado;
+   - caso contrario retornar erro funcional claro `missing_openai_api_key`/`missing_zai_api_key`.
+6. Validar que resultados de job/inferencia sao gravados nas tabelas corretas e aparecem na UI.
+
+Validacao obrigatoria:
+```bash
+cd Perceptrum
+cmake -S . -B out/build/linux-jobs -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPERCEPTRUM_ENABLE_AGENT_CORE=ON -DPERCEPTRUM_ENABLE_CAMERA_CAPTURE=ON -DPERCEPTRUM_ENABLE_RTSP_CAPTURE=ON -DPERCEPTRUM_ENABLE_FRAME_WRITER=ON -DPERCEPTRUM_ENABLE_JOB_RUNTIME=ON
+cmake --build out/build/linux-jobs -j$(nproc)
+ctest --test-dir out/build/linux-jobs --output-on-failure
+cd ../DrakonSite && npm run test:local-sqlite-bootstrap && npm run build
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase23-linux-jobs-llm-inference-runtime.md`.
+- O relatorio deve listar comandos suportados, tabelas afetadas, provider fake, teste real opcional e pendencias.
