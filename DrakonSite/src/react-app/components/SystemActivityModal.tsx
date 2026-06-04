@@ -96,6 +96,10 @@ type OpenMonitorProcess = {
 type OpenMonitorCamera = {
   camera_id?: number;
   camera_name?: string | null;
+  connection_method?: string | null;
+  active_source?: string | null;
+  thumbnail_path?: string | null;
+  clip_directory?: string | null;
   actual_fps?: number | null;
   expected_fps?: number | null;
   last_frame_age_ms?: number | null;
@@ -107,6 +111,8 @@ type OpenMonitorCamera = {
   height?: number | null;
   use_gpu?: boolean | null;
   stream_online?: boolean | null;
+  input_rate?: number | null;
+  processing_rate?: number | null;
   capture_read_latency_ms?: number | null;
   decode_latency_ms?: number | null;
   disk_read_bytes_per_sec?: number | null;
@@ -484,6 +490,8 @@ export default function SystemActivityModal({
       const preferredName =
         typeof camera?.name === "string" && camera.name.trim()
           ? camera.name.trim()
+          : typeof openMonitorCamera?.camera_name === "string" && openMonitorCamera.camera_name.trim()
+          ? openMonitorCamera.camera_name.trim()
           : typeof latestSample?.camera_name === "string" && latestSample.camera_name.trim()
           ? latestSample.camera_name.trim()
           : `Camera #${cameraId}`;
@@ -758,11 +766,41 @@ export default function SystemActivityModal({
                                 : "--"}
                             </div>
                             <div className="rounded border border-gray-700/60 bg-gray-900/45 px-2 py-1.5 text-gray-200">
+                              Method {entry.openMonitorCamera.connection_method || "--"}
+                            </div>
+                            <div className="rounded border border-gray-700/60 bg-gray-900/45 px-2 py-1.5 text-gray-200">
+                              Stream {entry.openMonitorCamera.stream_online === false ? "offline" : "online"}
+                            </div>
+                            <div className="rounded border border-gray-700/60 bg-gray-900/45 px-2 py-1.5 text-gray-200">
                               Overwrites {Number(entry.openMonitorCamera.overwritten_frames || 0)}
                             </div>
                             <div className="rounded border border-gray-700/60 bg-gray-900/45 px-2 py-1.5 text-gray-200">
                               Consumers {Number(entry.openMonitorCamera.consumer_count || 0)}
                             </div>
+                            {entry.openMonitorCamera.active_source ? (
+                              <div className="rounded border border-gray-700/60 bg-gray-900/45 px-2 py-1.5 text-gray-200 md:col-span-2 xl:col-span-4">
+                                Source{" "}
+                                <span className="break-all font-mono text-[11px] text-gray-300">
+                                  {entry.openMonitorCamera.active_source}
+                                </span>
+                              </div>
+                            ) : null}
+                            {entry.openMonitorCamera.thumbnail_path ? (
+                              <div className="rounded border border-gray-700/60 bg-gray-900/45 px-2 py-1.5 text-gray-200 md:col-span-2">
+                                Thumbnail{" "}
+                                <span className="break-all font-mono text-[11px] text-gray-300">
+                                  {entry.openMonitorCamera.thumbnail_path}
+                                </span>
+                              </div>
+                            ) : null}
+                            {entry.openMonitorCamera.clip_directory ? (
+                              <div className="rounded border border-gray-700/60 bg-gray-900/45 px-2 py-1.5 text-gray-200 md:col-span-2">
+                                Clips{" "}
+                                <span className="break-all font-mono text-[11px] text-gray-300">
+                                  {entry.openMonitorCamera.clip_directory}
+                                </span>
+                              </div>
+                            ) : null}
                             <div className="rounded border border-gray-700/60 bg-gray-900/45 px-2 py-1.5 text-gray-200">
                               Capture Read {formatLatency(entry.openMonitorCamera.capture_read_latency_ms)}
                             </div>
@@ -780,6 +818,10 @@ export default function SystemActivityModal({
                             </div>
                             <div className="rounded border border-gray-700/60 bg-gray-900/45 px-2 py-1.5 text-gray-200">
                               Read Latency {formatLatency(entry.openMonitorCamera.disk_read_latency_ms)}
+                            </div>
+                            <div className="rounded border border-gray-700/60 bg-gray-900/45 px-2 py-1.5 text-gray-200">
+                              Capture In {formatRate(entry.openMonitorCamera.input_rate)} | Out{" "}
+                              {formatRate(entry.openMonitorCamera.processing_rate)}
                             </div>
                             <div className="rounded border border-gray-700/60 bg-gray-900/45 px-2 py-1.5 text-gray-200">
                               In Rate {formatRate(entry.openMonitorCamera.inference_input_rate)} | Out Rate{" "}

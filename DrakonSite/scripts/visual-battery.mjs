@@ -104,6 +104,9 @@ async function startChrome(debugPort, width, height) {
     [
       "--headless=new",
       "--disable-gpu",
+      "--disable-background-networking",
+      "--disable-component-extensions-with-background-pages",
+      "--disable-extensions",
       "--no-sandbox",
       "--no-first-run",
       "--no-default-browser-check",
@@ -229,6 +232,123 @@ const fixtureCameras = [
     is_online: 0,
     thumbnail_url: null,
   },
+  {
+    id: 3,
+    name: "Shared Loading Dock",
+    ip_address: "remote-workspace",
+    manufacturer: "Shared Find",
+    description: "Camera shared from another workspace",
+    is_service_running: 0,
+    is_online: 1,
+    thumbnail_url: null,
+    origin_type: "shared_find",
+    shared_status: "accepted",
+    shared_permission_profile: "find_only",
+    shared_owner_display_label: "North Plant",
+    shared_owner_handle: "north-plant",
+    shared_owner_email: "owner@example.test",
+    shared_origin_brand_id: "perceptrum",
+  },
+];
+
+const fixtureResourceCatalog = {
+  cameras: fixtureCameras.map((camera) => ({
+    id: camera.id,
+    name: camera.name,
+    description: camera.description,
+    is_service_running: Boolean(camera.is_service_running),
+    is_online: Boolean(camera.is_online),
+    updated_at: now,
+  })),
+  jobs: [
+    {
+      id: 11,
+      name: "After-hours guard",
+      status: "running",
+      schedule_mode: "nightly",
+      step_count: 2,
+      updated_at: now,
+    },
+  ],
+  agents: [
+    {
+      key: "camera_algorithm:1",
+      agent_kind: "camera_algorithm",
+      agent_id: 1,
+      display_name: "Person detection",
+      summary: "Detects people near entry zones",
+      parent_camera_id: 1,
+      parent_camera_name: "Front Gate",
+      is_active: true,
+      updated_at: now,
+    },
+  ],
+};
+
+const fixtureWorkspacePermissions = {
+  view_cameras: true,
+  execute_cameras: true,
+  view_tasks: true,
+  execute_tasks: false,
+  view_agents: true,
+  execute_agents: false,
+};
+
+const fixtureWorkspaceResourceScopes = {
+  cameras: { view: "all", execute: "selected" },
+  jobs: { view: "all", execute: "selected" },
+  agents: { view: "all", execute: "selected" },
+};
+
+const fixtureWorkspaceResourceGrants = {
+  cameras: { viewIds: [], executeIds: [1] },
+  jobs: { viewIds: [], executeIds: [] },
+  agents: { viewIds: [], executeIds: [] },
+};
+
+const fixtureAccountUsers = [
+  {
+    member_user_id: "visual-user",
+    account_user_id: "account-owner",
+    email: "visual@example.test",
+    role: "owner",
+    status: "active",
+    password_management_mode: "self_service",
+    is_owner: true,
+    is_admin: true,
+    can_manage_settings: true,
+    full_access: true,
+    permissions: {
+      ...fixtureWorkspacePermissions,
+      execute_tasks: true,
+      execute_agents: true,
+      chat: true,
+    },
+    resource_scopes: fixtureWorkspaceResourceScopes,
+    resource_grants: fixtureWorkspaceResourceGrants,
+    created_at: now,
+    updated_at: now,
+  },
+  {
+    member_user_id: "visual-member",
+    account_user_id: "account-member",
+    email: "operator@example.test",
+    role: "member",
+    status: "active",
+    password_management_mode: "admin_managed",
+    is_owner: false,
+    is_admin: false,
+    can_manage_settings: false,
+    full_access: false,
+    permissions: {
+      ...fixtureWorkspacePermissions,
+      chat: true,
+    },
+    resource_scopes: fixtureWorkspaceResourceScopes,
+    resource_grants: fixtureWorkspaceResourceGrants,
+    created_at: now,
+    updated_at: now,
+  },
 ];
 
 function dashboardFixture() {
@@ -255,7 +375,7 @@ function dashboardFixture() {
     },
     dashboard: {
       stats: {
-        cameras_total: 2,
+        cameras_total: 3,
         cameras_running: 1,
         cameras_online: 1,
         agents_enabled_total: 3,
@@ -321,7 +441,7 @@ function dashboardFixture() {
       },
       etagHints: {
         camerasUpdatedAtMax: 1,
-        camerasCount: 2,
+        camerasCount: 3,
         camerasDigest: "visual",
         lastEventId: 10,
         lastDetectionId: 5,
@@ -351,6 +471,23 @@ function jsonForApi(pathname, theme) {
         auth_provider: "local",
         requires_secret_recovery_setup: false,
         secret_recovery_configured: true,
+        account_access: {
+          account_user_id: "account-owner",
+          actor_user_id: "visual-user",
+          role: "owner",
+          status: "active",
+          is_owner: true,
+          is_admin: true,
+          can_manage_settings: true,
+          full_access: true,
+          permissions: {
+            ...fixtureWorkspacePermissions,
+            execute_tasks: true,
+            execute_agents: true,
+            chat: true,
+          },
+          resource_scopes: fixtureWorkspaceResourceScopes,
+        },
       },
     };
   }
@@ -409,6 +546,109 @@ function jsonForApi(pathname, theme) {
   if (pathname === "/api/drakon-find/audit") return { audit: [] };
   if (pathname === "/api/drakon-find/hits") return { hits: [] };
   if (pathname === "/api/shared-find/sync") return { ok: true };
+  if (pathname === "/api/shared-find/incoming") {
+    return {
+      invitations: [
+        {
+          id: 21,
+          camera_id: 3,
+          camera_name: "Shared Loading Dock",
+          owner_handle: "north-plant",
+          owner_email: "owner@example.test",
+          status: "accepted",
+          permission_profile: "find_only",
+          created_at: now,
+          updated_at: now,
+        },
+      ],
+    };
+  }
+  if (pathname === "/api/shared-find/outgoing") return { invitations: [] };
+  if (pathname === "/api/shared-find/cameras") return { cameras: [fixtureCameras[2]] };
+  if (pathname === "/api/account-users") {
+    return {
+      success: true,
+      actor_user_id: "visual-user",
+      account_user_id: "account-owner",
+      role: "owner",
+      users: fixtureAccountUsers,
+      can_assign_admin: true,
+      resource_catalog: fixtureResourceCatalog,
+    };
+  }
+  if (pathname === "/api/desktop-workspace-access/settings") {
+    return { settings: { connection_policy: "allow_while_open" } };
+  }
+  if (pathname === "/api/desktop-workspace-access/invites/incoming") {
+    return {
+      invites: [
+        {
+          id: 101,
+          permission_profile: "shared_job_execution",
+          full_access: false,
+          permissions: fixtureWorkspacePermissions,
+          resource_scopes: fixtureWorkspaceResourceScopes,
+          resource_grants: fixtureWorkspaceResourceGrants,
+          status: "pending",
+          owner_handle: "north-plant",
+          owner_email: "owner@example.test",
+          invitee_handle: "visual",
+          invitee_email: "visual@example.test",
+          created_at: now,
+          updated_at: now,
+        },
+      ],
+    };
+  }
+  if (pathname === "/api/desktop-workspace-access/invites/outgoing") {
+    return {
+      invites: [
+        {
+          id: 102,
+          permission_profile: "find_only",
+          full_access: false,
+          permissions: fixtureWorkspacePermissions,
+          resource_scopes: fixtureWorkspaceResourceScopes,
+          resource_grants: fixtureWorkspaceResourceGrants,
+          status: "accepted",
+          owner_handle: "visual",
+          owner_email: "visual@example.test",
+          invitee_handle: "remote-operator",
+          invitee_email: "operator@example.test",
+          created_at: now,
+          updated_at: now,
+        },
+      ],
+    };
+  }
+  if (pathname === "/api/desktop-workspace-access/available") {
+    return {
+      accesses: [
+        {
+          id: 103,
+          permission_profile: "shared_job_execution",
+          full_access: false,
+          permissions: fixtureWorkspacePermissions,
+          resource_scopes: fixtureWorkspaceResourceScopes,
+          resource_grants: fixtureWorkspaceResourceGrants,
+          status: "accepted",
+          owner_handle: "north-plant",
+          owner_email: "owner@example.test",
+          invitee_handle: "visual",
+          invitee_email: "visual@example.test",
+          owner_online: true,
+          owner_last_seen_at: now,
+          owner_connection_policy: "allow_while_open",
+          display_label: "North Plant",
+          created_at: now,
+          updated_at: now,
+        },
+      ],
+    };
+  }
+  if (pathname === "/api/desktop-workspace-access/resource-catalog") {
+    return { resource_catalog: fixtureResourceCatalog };
+  }
   if (pathname === "/api/hub/cache/items") return { items: [] };
   if (pathname === "/api/hub/cache/sync") return { ok: true };
   if (pathname === "/api/face-targets") return { targets: [] };
@@ -578,13 +818,22 @@ async function captureRoute({ baseUrl, debugPort, target, theme, route, width, h
     await loadEvent;
     await delay(1800);
 
-    const screenshot = await cdp.send("Page.captureScreenshot", {
-      format: "png",
-      captureBeyondViewport: false,
-      fromSurface: true,
-    });
-    const image = Buffer.from(screenshot.data, "base64");
-    const stats = parsePngStats(image);
+    let image = null;
+    let stats = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const screenshot = await cdp.send("Page.captureScreenshot", {
+        format: "png",
+        captureBeyondViewport: false,
+        fromSurface: true,
+      });
+      image = Buffer.from(screenshot.data, "base64");
+      stats = parsePngStats(image);
+      if (stats.width >= width && stats.height >= height && stats.distinctColors >= 4) {
+        break;
+      }
+      await delay(900);
+    }
+
     if (stats.width < width || stats.height < height || stats.distinctColors < 4) {
       throw new Error(
         `Screenshot check failed for ${target}/${theme}${route}: ${JSON.stringify(stats)}`
@@ -604,6 +853,11 @@ async function captureRoute({ baseUrl, debugPort, target, theme, route, width, h
       exceptions,
     };
   } finally {
+    try {
+      await cdp.send("Page.close");
+    } catch {
+      // The target may already be gone after navigation failures.
+    }
     cdp.close();
   }
 }
@@ -659,8 +913,11 @@ async function main() {
     "/cameras",
     "/ai-agents",
     "/jobs",
+    "/drakon-find",
     "/chat",
     "/settings",
+    "/settings?tab=users",
+    "/settings?tab=workspace-access",
     "/events",
     "/billing",
   ]);

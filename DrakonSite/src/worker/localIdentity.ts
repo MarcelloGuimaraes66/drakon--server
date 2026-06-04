@@ -45,6 +45,18 @@ function normalizeBoolean(value: unknown, fallback: boolean): boolean {
   return fallback;
 }
 
+function normalizeTimestamp(value: unknown, fallback: string | null = null): string | null {
+  const normalized = normalizeText(value);
+  if (!normalized) {
+    return fallback;
+  }
+  const parsed = Date.parse(normalized);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return new Date(parsed).toISOString();
+}
+
 function isPgLikeDatabase(db: D1Database): boolean {
   return String((db as any)?.constructor?.name || "")
     .toLowerCase()
@@ -52,6 +64,10 @@ function isPgLikeDatabase(db: D1Database): boolean {
 }
 
 function quoteSqliteIdentifier(value: string): string {
+  return `"${String(value || "").replace(/"/g, "\"\"")}"`;
+}
+
+function quoteSqlIdentifier(value: string): string {
   return `"${String(value || "").replace(/"/g, "\"\"")}"`;
 }
 
@@ -107,6 +123,111 @@ async function listSqliteIdentityColumns(
   return matches;
 }
 
+async function listPgIdentityColumns(
+  db: D1Database
+): Promise<Array<{ tableName: string; columnName: string }>> {
+  const { results } = await db
+    .prepare(
+      `SELECT table_name, column_name
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name <> 'app_users'
+         AND (column_name = 'user_id' OR column_name LIKE '%_user_id')
+         AND data_type IN ('text', 'character varying')
+       ORDER BY table_name ASC, column_name ASC`
+    )
+    .all();
+
+  return ((results || []) as Array<{ table_name?: unknown; column_name?: unknown }>)
+    .map((row) => ({
+      tableName: normalizeText(row?.table_name),
+      columnName: normalizeText(row?.column_name),
+    }))
+    .filter((row) => row.tableName && row.columnName);
+}
+
+type MergedAppUserRowValues = {
+  email: string | null;
+  authProvider: string;
+  countryCode: string | null;
+  locale: string | null;
+  handle: string | null;
+  timezoneIana: string;
+  timezoneUpdatedAt: string | null;
+  timezoneSource: string | null;
+  centralPublicId: string | null;
+  centralGrantToken: string | null;
+  centralGrantExpiresAt: string | null;
+  centralDeviceSessionId: string | null;
+  centralDeviceSessionToken: string | null;
+  centralDeviceSessionExpiresAt: string | null;
+  centralLastRefreshAt: string | null;
+  centralLastGrantSyncAt: string | null;
+  centralAuthProvider: string | null;
+  createdAt: string;
+};
+
+function buildMergedAppUserRowValues(
+  oldRow: LocalIdentityRow | null,
+  newRow: LocalIdentityRow | null,
+  nowIso: string
+): MergedAppUserRowValues {
+  return {
+    email: normalizeText(newRow?.email) || normalizeText(oldRow?.email) || null,
+    authProvider:
+      normalizeText(newRow?.auth_provider) || normalizeText(oldRow?.auth_provider) || "local",
+    countryCode: normalizeText(newRow?.country_code) || normalizeText(oldRow?.country_code) || null,
+    locale: normalizeText(newRow?.locale) || normalizeText(oldRow?.locale) || null,
+    handle: normalizeText(newRow?.handle) || normalizeText(oldRow?.handle) || null,
+    timezoneIana:
+      normalizeText(newRow?.timezone_iana) || normalizeText(oldRow?.timezone_iana) || "UTC",
+    timezoneUpdatedAt:
+      normalizeTimestamp(newRow?.timezone_updated_at) ||
+      normalizeTimestamp(oldRow?.timezone_updated_at) ||
+      null,
+    timezoneSource:
+      normalizeText(newRow?.timezone_source) || normalizeText(oldRow?.timezone_source) || null,
+    centralPublicId:
+      normalizeText(newRow?.central_public_id) || normalizeText(oldRow?.central_public_id) || null,
+    centralGrantToken:
+      normalizeText(newRow?.central_grant_token) ||
+      normalizeText(oldRow?.central_grant_token) ||
+      null,
+    centralGrantExpiresAt:
+      normalizeTimestamp(newRow?.central_grant_expires_at) ||
+      normalizeTimestamp(oldRow?.central_grant_expires_at) ||
+      null,
+    centralDeviceSessionId:
+      normalizeText(newRow?.central_device_session_id) ||
+      normalizeText(oldRow?.central_device_session_id) ||
+      null,
+    centralDeviceSessionToken:
+      normalizeText(newRow?.central_device_session_token) ||
+      normalizeText(oldRow?.central_device_session_token) ||
+      null,
+    centralDeviceSessionExpiresAt:
+      normalizeTimestamp(newRow?.central_device_session_expires_at) ||
+      normalizeTimestamp(oldRow?.central_device_session_expires_at) ||
+      null,
+    centralLastRefreshAt:
+      normalizeTimestamp(newRow?.central_last_refresh_at) ||
+      normalizeTimestamp(oldRow?.central_last_refresh_at) ||
+      null,
+    centralLastGrantSyncAt:
+      normalizeTimestamp(newRow?.central_last_grant_sync_at) ||
+      normalizeTimestamp(oldRow?.central_last_grant_sync_at) ||
+      null,
+    centralAuthProvider:
+      normalizeText(newRow?.central_auth_provider) ||
+      normalizeText(oldRow?.central_auth_provider) ||
+      null,
+    createdAt:
+      normalizeTimestamp(newRow?.created_at) ||
+      normalizeTimestamp(oldRow?.created_at) ||
+      nowIso,
+  };
+}
+
 async function mergeAppUserRowsForCanonicalId(
   db: D1Database,
   oldUserId: string,
@@ -142,53 +263,7 @@ async function mergeAppUserRowsForCanonicalId(
     return;
   }
 
-  const merged = {
-    email: normalizeText(newRow.email) || normalizeText(oldRow.email) || null,
-    authProvider:
-      normalizeText(newRow.auth_provider) || normalizeText(oldRow.auth_provider) || "local",
-    countryCode: normalizeText(newRow.country_code) || normalizeText(oldRow.country_code) || null,
-    locale: normalizeText(newRow.locale) || normalizeText(oldRow.locale) || null,
-    handle: normalizeText(newRow.handle) || normalizeText(oldRow.handle) || null,
-    timezoneIana:
-      normalizeText(newRow.timezone_iana) || normalizeText(oldRow.timezone_iana) || "UTC",
-    timezoneUpdatedAt:
-      normalizeText(newRow.timezone_updated_at) || normalizeText(oldRow.timezone_updated_at) || null,
-    timezoneSource:
-      normalizeText(newRow.timezone_source) || normalizeText(oldRow.timezone_source) || null,
-    centralPublicId:
-      normalizeText(newRow.central_public_id) || normalizeText(oldRow.central_public_id) || null,
-    centralGrantToken:
-      normalizeText(newRow.central_grant_token) || normalizeText(oldRow.central_grant_token) || null,
-    centralGrantExpiresAt:
-      normalizeText(newRow.central_grant_expires_at) ||
-      normalizeText(oldRow.central_grant_expires_at) ||
-      null,
-    centralDeviceSessionId:
-      normalizeText(newRow.central_device_session_id) ||
-      normalizeText(oldRow.central_device_session_id) ||
-      null,
-    centralDeviceSessionToken:
-      normalizeText(newRow.central_device_session_token) ||
-      normalizeText(oldRow.central_device_session_token) ||
-      null,
-    centralDeviceSessionExpiresAt:
-      normalizeText(newRow.central_device_session_expires_at) ||
-      normalizeText(oldRow.central_device_session_expires_at) ||
-      null,
-    centralLastRefreshAt:
-      normalizeText(newRow.central_last_refresh_at) ||
-      normalizeText(oldRow.central_last_refresh_at) ||
-      null,
-    centralLastGrantSyncAt:
-      normalizeText(newRow.central_last_grant_sync_at) ||
-      normalizeText(oldRow.central_last_grant_sync_at) ||
-      null,
-    centralAuthProvider:
-      normalizeText(newRow.central_auth_provider) ||
-      normalizeText(oldRow.central_auth_provider) ||
-      null,
-    createdAt: normalizeText(newRow.created_at) || normalizeText(oldRow.created_at) || nowIso,
-  };
+  const merged = buildMergedAppUserRowValues(oldRow, newRow, nowIso);
 
   await db
     .prepare(
@@ -242,6 +317,175 @@ async function mergeAppUserRowsForCanonicalId(
     .prepare(`DELETE FROM app_users WHERE id = ?`)
     .bind(oldUserId)
     .run();
+}
+
+async function ensurePgCanonicalAppUserRow(
+  db: D1Database,
+  oldUserId: string,
+  newUserId: string,
+  nowIso: string
+): Promise<{ oldRow: LocalIdentityRow | null; newRow: LocalIdentityRow | null }> {
+  const oldRow = (await db
+    .prepare(`SELECT * FROM app_users WHERE id = ? LIMIT 1`)
+    .bind(oldUserId)
+    .first()) as LocalIdentityRow | null;
+  const newRow = (await db
+    .prepare(`SELECT * FROM app_users WHERE id = ? LIMIT 1`)
+    .bind(newUserId)
+    .first()) as LocalIdentityRow | null;
+
+  if (!oldRow && !newRow) {
+    return { oldRow: null, newRow: null };
+  }
+
+  const merged = buildMergedAppUserRowValues(oldRow, newRow, nowIso);
+
+  if (newRow) {
+    await db
+      .prepare(
+        `UPDATE app_users
+         SET email = ?,
+             auth_provider = ?,
+             country_code = ?,
+             locale = ?,
+             handle = ?,
+             timezone_iana = ?,
+             timezone_updated_at = ?,
+             timezone_source = ?,
+             central_public_id = ?,
+             central_grant_token = ?,
+             central_grant_expires_at = ?,
+             central_device_session_id = ?,
+             central_device_session_token = ?,
+             central_device_session_expires_at = ?,
+             central_last_refresh_at = ?,
+             central_last_grant_sync_at = ?,
+             central_auth_provider = ?,
+             created_at = ?,
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .bind(
+        merged.email,
+        merged.authProvider,
+        merged.countryCode,
+        merged.locale,
+        merged.handle,
+        merged.timezoneIana,
+        merged.timezoneUpdatedAt,
+        merged.timezoneSource,
+        merged.centralPublicId,
+        merged.centralGrantToken,
+        merged.centralGrantExpiresAt,
+        merged.centralDeviceSessionId,
+        merged.centralDeviceSessionToken,
+        merged.centralDeviceSessionExpiresAt,
+        merged.centralLastRefreshAt,
+        merged.centralLastGrantSyncAt,
+        merged.centralAuthProvider,
+        merged.createdAt,
+        nowIso,
+        newUserId
+      )
+      .run();
+    return { oldRow, newRow };
+  }
+
+  if (!oldRow) {
+    return { oldRow: null, newRow: null };
+  }
+
+  await db
+    .prepare(
+      `INSERT INTO app_users (
+         id,
+         email,
+         auth_provider,
+         country_code,
+         locale,
+         created_at,
+         updated_at,
+         timezone_iana,
+         timezone_updated_at,
+         timezone_source,
+         handle,
+         central_public_id,
+         central_grant_token,
+         central_grant_expires_at,
+         central_device_session_id,
+         central_device_session_token,
+         central_device_session_expires_at,
+         central_last_refresh_at,
+         central_last_grant_sync_at,
+         central_auth_provider
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      newUserId,
+      merged.email,
+      merged.authProvider,
+      merged.countryCode,
+      merged.locale,
+      merged.createdAt,
+      nowIso,
+      merged.timezoneIana,
+      merged.timezoneUpdatedAt,
+      merged.timezoneSource,
+      merged.handle,
+      merged.centralPublicId,
+      merged.centralGrantToken,
+      merged.centralGrantExpiresAt,
+      merged.centralDeviceSessionId,
+      merged.centralDeviceSessionToken,
+      merged.centralDeviceSessionExpiresAt,
+      merged.centralLastRefreshAt,
+      merged.centralLastGrantSyncAt,
+      merged.centralAuthProvider
+    )
+    .run();
+
+  return { oldRow, newRow: oldRow };
+}
+
+async function migrateIdentityReferencesForPg(
+  db: D1Database,
+  oldUserId: string,
+  newUserId: string,
+  nowIso: string
+): Promise<Array<{ tableName: string; columnName: string; changes: number }>> {
+  const { oldRow, newRow } = await ensurePgCanonicalAppUserRow(db, oldUserId, newUserId, nowIso);
+  if (!oldRow && !newRow) {
+    return [];
+  }
+
+  const updatedColumns: Array<{ tableName: string; columnName: string; changes: number }> = [];
+  const identityColumns = await listPgIdentityColumns(db);
+  for (const ref of identityColumns) {
+    const updateResult = await db
+      .prepare(
+        `UPDATE ${quoteSqlIdentifier(ref.tableName)}
+         SET ${quoteSqlIdentifier(ref.columnName)} = ?
+         WHERE ${quoteSqlIdentifier(ref.columnName)} = ?`
+      )
+      .bind(newUserId, oldUserId)
+      .run();
+
+    updatedColumns.push({
+      tableName: ref.tableName,
+      columnName: ref.columnName,
+      changes: Number(updateResult.meta?.changes || 0),
+    });
+  }
+
+  if (oldRow && oldUserId !== newUserId) {
+    await db
+      .prepare(`DELETE FROM app_users WHERE id = ?`)
+      .bind(oldUserId)
+      .run();
+  }
+
+  return updatedColumns;
 }
 
 async function insertMigrationAuditRow(
@@ -426,14 +670,32 @@ export async function migrateAppUserIdReferences(
     };
   }
 
-  if (isPgLikeDatabase(db)) {
-    throw new Error(
-      "Generic app user identity migration is only supported on the SQLite desktop runtime."
-    );
-  }
-
   const nowIso = new Date().toISOString();
   const updatedColumns: Array<{ tableName: string; columnName: string; changes: number }> = [];
+
+  if (isPgLikeDatabase(db)) {
+    try {
+      await db.prepare("BEGIN").run();
+      updatedColumns.push(
+        ...(await migrateIdentityReferencesForPg(db, oldUserId, newUserId, nowIso))
+      );
+      await db.prepare("COMMIT").run();
+    } catch (error) {
+      try {
+        await db.prepare("ROLLBACK").run();
+      } catch {
+        // Ignore rollback failures and preserve the original error.
+      }
+      throw error;
+    }
+
+    return {
+      oldUserId,
+      newUserId,
+      migrated: true,
+      updatedColumns,
+    };
+  }
 
   try {
     await db.prepare("BEGIN IMMEDIATE").run();
@@ -504,14 +766,61 @@ export async function migrateLegacyLocalUserIdToCanonicalId(
     };
   }
 
-  if (isPgLikeDatabase(db)) {
-    throw new Error(
-      "Local identity migration is only supported on the SQLite desktop runtime."
-    );
-  }
-
   const nowIso = new Date().toISOString();
   const updatedColumns: Array<{ tableName: string; columnName: string; changes: number }> = [];
+
+  if (isPgLikeDatabase(db)) {
+    try {
+      await db.prepare("BEGIN").run();
+      updatedColumns.push(
+        ...(await migrateIdentityReferencesForPg(db, oldUserId, newUserId, nowIso))
+      );
+
+      await db
+        .prepare(
+          `UPDATE local_users
+           SET identity_migrated_at = COALESCE(identity_migrated_at, ?),
+               updated_at = ?
+           WHERE id = ?`
+        )
+        .bind(nowIso, nowIso, localUserIdNumber)
+        .run();
+
+      await db.prepare("COMMIT").run();
+    } catch (error) {
+      try {
+        await db.prepare("ROLLBACK").run();
+      } catch {
+        // Ignore rollback failures and preserve the original error.
+      }
+
+      await insertMigrationAuditRow(db, {
+        localUserId: localUserIdNumber,
+        oldUserId,
+        newUserId,
+        migratedAt: nowIso,
+        status: "failed",
+        error: error instanceof Error ? error.message : String(error || "Unknown migration error"),
+      });
+      throw error;
+    }
+
+    await insertMigrationAuditRow(db, {
+      localUserId: localUserIdNumber,
+      oldUserId,
+      newUserId,
+      migratedAt: nowIso,
+      status: "completed",
+      error: null,
+    });
+
+    return {
+      oldUserId,
+      newUserId,
+      migrated: true,
+      updatedColumns,
+    };
+  }
 
   try {
     await db.prepare("BEGIN IMMEDIATE").run();

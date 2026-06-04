@@ -1,5 +1,8 @@
 #include "LinuxRtspThumbnailProbe.h"
 
+#include "LinuxFrameDiskWriter.h"
+#include "LinuxRtspCandidateBuilder.h"
+
 #include "../Perceptrum/platform/platform_common.h"
 #include "../Perceptrum/platform/platform_process.h"
 
@@ -19,6 +22,15 @@ std::string Trim(std::string value)
     return perceptrum::platform::TrimAscii(std::move(value));
 }
 
+std::string Lower(std::string value)
+{
+    value = Trim(std::move(value));
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
 std::string ReadString(const nlohmann::json& value, const char* key)
 {
     const auto it = value.find(key);
@@ -28,9 +40,32 @@ std::string ReadString(const nlohmann::json& value, const char* key)
     return Trim(it->get<std::string>());
 }
 
+int ReadInt(const nlohmann::json& value, const char* key, int fallback = -1)
+{
+    const auto it = value.find(key);
+    if (it == value.end() || it->is_null()) {
+        return fallback;
+    }
+    if (it->is_number_integer()) {
+        return it->get<int>();
+    }
+    if (it->is_string()) {
+        try {
+            return std::stoi(Trim(it->get<std::string>()));
+        } catch (...) {
+        }
+    }
+    return fallback;
+}
+
 bool LooksLikeRtsp(std::string_view value)
 {
     return value.rfind("rtsp://", 0) == 0 || value.rfind("rtsps://", 0) == 0;
+}
+
+bool LooksLikeWebcam(std::string_view value)
+{
+    return value.rfind("v4l2:", 0) == 0 || value.rfind("/dev/video", 0) == 0;
 }
 
 bool IsAllowedSyntheticSource(std::string_view value)
@@ -43,32 +78,54 @@ bool IsAllowedSyntheticSource(std::string_view value)
     return value.rfind("lavfi:", 0) == 0 || value.rfind("file:", 0) == 0;
 }
 
-std::string MaskCredentials(std::string value)
+bool LooksLikeSupportedCameraSource(std::string_view value)
 {
-    const std::size_t scheme = value.find("://");
-    if (scheme == std::string::npos) {
-        return value;
+    return LooksLikeRtsp(value) || LooksLikeWebcam(value) || IsAllowedSyntheticSource(value);
+}
+
+std::string ResolveWebcamSource(int webcamIndex)
+{
+    const std::string testSource =
+        Trim(perceptrum::platform::ReadEnvVar("APP_AGENT_WEBCAM_TEST_SOURCE"));
+    if (!testSource.empty() && IsAllowedSyntheticSource(testSource)) {
+        return testSource;
     }
 
-    const std::size_t authorityStart = scheme + 3;
-    const std::size_t authorityEnd = value.find_first_of("/?#", authorityStart);
-    const std::size_t at = value.find('@', authorityStart);
-    if (at == std::string::npos || (authorityEnd != std::string::npos && at > authorityEnd)) {
-        return value;
+    const std::string device =
+        Trim(perceptrum::platform::ReadEnvVar("APP_AGENT_WEBCAM_DEVICE"));
+    if (!device.empty()) {
+        return device.rfind("v4l2:", 0) == 0 ? device : "v4l2:" + device;
     }
 
-    value.replace(authorityStart, at - authorityStart, "***:***");
-    return value;
+    if (webcamIndex < 0) {
+        webcamIndex = 0;
+    }
+    return "v4l2:/dev/video" + std::to_string(webcamIndex);
+}
+
+std::string ResolveWebcamFrameRate()
+{
+    const std::string raw = Trim(perceptrum::platform::ReadEnvVar("APP_AGENT_WEBCAM_FRAMERATE"));
+    if (!raw.empty()) {
+        try {
+            const int parsed = std::stoi(raw);
+            if (parsed > 0 && parsed <= 60) {
+                return std::to_string(parsed);
+            }
+        } catch (...) {
+        }
+    }
+    return "15";
 }
 
 std::filesystem::path ThumbnailRoot(const perceptrum::linux_runtime::RuntimePaths& paths)
 {
-    return paths.cacheRoot / "agentcore" / "rtsp-thumbnails";
+    return perceptrum::linux_runtime::LinuxCameraThumbnailRoot(paths);
 }
 
 std::filesystem::path EventPath(const perceptrum::linux_runtime::RuntimePaths& paths)
 {
-    return paths.dataRoot / "agent_events.jsonl";
+    return paths.stateRoot / "events" / "agent_events.jsonl";
 }
 
 std::optional<perceptrum::linux_runtime::LinuxRtspCameraConfig> ConfigFromCameraJson(
@@ -78,22 +135,32 @@ std::optional<perceptrum::linux_runtime::LinuxRtspCameraConfig> ConfigFromCamera
         return std::nullopt;
     }
 
-    std::string rtspUrl = ReadString(camera, "rtsp_url");
-    if (rtspUrl.empty()) {
-        rtspUrl = ReadString(camera, "rtspUrl");
+    std::vector<std::string> rtspCandidates =
+        perceptrum::linux_runtime::BuildLinuxRtspCandidatesFromCameraJson(camera);
+    std::string rtspUrl = rtspCandidates.empty() ? std::string() : rtspCandidates.front();
+
+    perceptrum::linux_runtime::LinuxRtspCameraConfig config;
+    config.connectionMethod = ReadString(camera, "connection_method");
+    if (config.connectionMethod.empty()) {
+        config.connectionMethod = ReadString(camera, "connectionMethod");
     }
-    if (rtspUrl.empty()) {
-        rtspUrl = ReadString(camera, "stream_url");
+    if (config.connectionMethod.empty()) {
+        config.connectionMethod = rtspUrl.empty() ? "WEBCAM" : "RTSP";
     }
-    if (rtspUrl.empty()) {
-        rtspUrl = ReadString(camera, "streamUrl");
+    config.webcamIndex = ReadInt(camera, "webcam_index", ReadInt(camera, "webcamIndex", -1));
+    const std::string normalizedMethod = Lower(config.connectionMethod);
+    if (rtspUrl.empty() && (normalizedMethod == "webcam" || config.webcamIndex >= 0)) {
+        rtspUrl = ResolveWebcamSource(config.webcamIndex);
+        config.connectionMethod = "WEBCAM";
+        if (config.webcamIndex < 0) {
+            config.webcamIndex = 0;
+        }
     }
     if (rtspUrl.empty()) {
         return std::nullopt;
     }
-
-    perceptrum::linux_runtime::LinuxRtspCameraConfig config;
     config.rtspUrl = std::move(rtspUrl);
+    config.rtspCandidates = std::move(rtspCandidates);
     config.cameraId = ReadString(camera, "camera_id");
     if (config.cameraId.empty()) {
         config.cameraId = ReadString(camera, "id");
@@ -110,7 +177,9 @@ std::optional<perceptrum::linux_runtime::LinuxRtspCameraConfig> ConfigFromCamera
         config.cameraName = ReadString(camera, "name");
     }
     if (config.cameraName.empty()) {
-        config.cameraName = "Linux RTSP camera";
+        config.cameraName = Lower(config.connectionMethod) == "webcam"
+            ? "Linux webcam"
+            : "Linux RTSP camera";
     }
 
     return config;
@@ -124,7 +193,7 @@ std::vector<std::string> BuildFfmpegArgs(
         "-y",
         "-hide_banner",
         "-loglevel",
-        "error",
+        "quiet",
         "-nostdin",
     };
 
@@ -136,10 +205,20 @@ std::vector<std::string> BuildFfmpegArgs(
     } else if (config.rtspUrl.rfind("file:", 0) == 0) {
         args.push_back("-i");
         args.push_back(config.rtspUrl.substr(5));
+    } else if (config.rtspUrl.rfind("v4l2:", 0) == 0 ||
+               config.rtspUrl.rfind("/dev/video", 0) == 0) {
+        args.push_back("-f");
+        args.push_back("v4l2");
+        args.push_back("-framerate");
+        args.push_back(ResolveWebcamFrameRate());
+        args.push_back("-i");
+        args.push_back(config.rtspUrl.rfind("v4l2:", 0) == 0
+            ? config.rtspUrl.substr(5)
+            : config.rtspUrl);
     } else {
         args.push_back("-rtsp_transport");
         args.push_back("tcp");
-        args.push_back("-stimeout");
+        args.push_back("-timeout");
         args.push_back("3000000");
         args.push_back("-i");
         args.push_back(config.rtspUrl);
@@ -174,9 +253,15 @@ bool WriteEvent(
         { "type", "linux_rtsp_thumbnail" },
         { "camera_id", config.cameraId },
         { "camera_name", config.cameraName },
-        { "rtsp_url_masked", MaskCredentials(config.rtspUrl) },
+        { "connection_method", config.connectionMethod },
+        { "webcam_index", config.webcamIndex >= 0 ? nlohmann::json(config.webcamIndex) : nlohmann::json(nullptr) },
+        { "rtsp_url_masked", perceptrum::linux_runtime::MaskLinuxRtspCredentials(config.rtspUrl) },
         { "thumbnail_generated", result.thumbnailGenerated },
         { "thumbnail_path", result.thumbnailPath },
+        { "recording_clip_generated", result.recordingClipGenerated },
+        { "recordings_root", result.recordingsRoot },
+        { "clip_paths", result.clipPaths },
+        { "recording_profiles", result.recordingProfiles },
         { "error", result.error },
     };
     stream << event.dump() << '\n';
@@ -197,7 +282,13 @@ std::optional<LinuxRtspCameraConfig> ResolveLinuxRtspCameraConfig(
 
     LinuxRtspCameraConfig envConfig;
     envConfig.rtspUrl = Trim(perceptrum::platform::ReadEnvVar("APP_AGENT_RTSP_URL"));
+    envConfig.connectionMethod = "RTSP";
     if (!envConfig.rtspUrl.empty()) {
+        envConfig.rtspCandidates =
+            SplitLinuxRtspCandidateList(envConfig.rtspUrl);
+        if (!envConfig.rtspCandidates.empty()) {
+            envConfig.rtspUrl = envConfig.rtspCandidates.front();
+        }
         const std::string cameraId = Trim(perceptrum::platform::ReadEnvVar("APP_AGENT_CAMERA_ID"));
         const std::string cameraName = Trim(perceptrum::platform::ReadEnvVar("APP_AGENT_CAMERA_NAME"));
         if (!cameraId.empty()) {
@@ -206,6 +297,28 @@ std::optional<LinuxRtspCameraConfig> ResolveLinuxRtspCameraConfig(
         if (!cameraName.empty()) {
             envConfig.cameraName = cameraName;
         }
+        return envConfig;
+    }
+
+    const std::string webcamIndexRaw = Trim(perceptrum::platform::ReadEnvVar("APP_AGENT_WEBCAM_INDEX"));
+    const std::string webcamDevice = Trim(perceptrum::platform::ReadEnvVar("APP_AGENT_WEBCAM_DEVICE"));
+    const std::string webcamTestSource = Trim(perceptrum::platform::ReadEnvVar("APP_AGENT_WEBCAM_TEST_SOURCE"));
+    if (!webcamIndexRaw.empty() || !webcamDevice.empty() || !webcamTestSource.empty()) {
+        int webcamIndex = 0;
+        if (!webcamIndexRaw.empty()) {
+            try {
+                webcamIndex = std::max(0, std::stoi(webcamIndexRaw));
+            } catch (...) {
+                webcamIndex = 0;
+            }
+        }
+        envConfig.connectionMethod = "WEBCAM";
+        envConfig.webcamIndex = webcamIndex;
+        envConfig.rtspUrl = ResolveWebcamSource(webcamIndex);
+        const std::string cameraId = Trim(perceptrum::platform::ReadEnvVar("APP_AGENT_CAMERA_ID"));
+        const std::string cameraName = Trim(perceptrum::platform::ReadEnvVar("APP_AGENT_CAMERA_NAME"));
+        envConfig.cameraId = cameraId.empty() ? "linux-webcam-" + std::to_string(webcamIndex) : cameraId;
+        envConfig.cameraName = cameraName.empty() ? "Linux webcam " + std::to_string(webcamIndex) : cameraName;
         return envConfig;
     }
 
@@ -251,9 +364,14 @@ LinuxRtspThumbnailResult RunLinuxRtspThumbnailProbe(
     result.configured = true;
     result.cameraId = config.cameraId;
     result.cameraName = config.cameraName;
+    result.thumbnailRoot = LinuxCameraThumbnailRoot(paths).string();
+    result.recordingsRoot = LinuxCameraRecordingsRoot(paths).string();
+    result.inferenceTempRoot = LinuxInferenceTempRoot(paths).string();
+    result.jobsInferenceTempRoot = LinuxJobsInferenceTempRoot(paths).string();
+    result.recordingProfiles = ResolveLinuxRecordingProfiles();
 
-    if (!LooksLikeRtsp(config.rtspUrl) && !IsAllowedSyntheticSource(config.rtspUrl)) {
-        result.error = "rtsp_config_invalid: APP_AGENT_RTSP_URL or camera config must start with rtsp://";
+    if (!LooksLikeSupportedCameraSource(config.rtspUrl)) {
+        result.error = "camera_config_invalid: camera config must be rtsp://, WEBCAM/webcam_index, /dev/videoN, or an allowed test source";
         result.eventPath = EventPath(paths).string();
         result.eventPublished = WriteEvent(paths, config, result);
         return result;
@@ -301,6 +419,18 @@ LinuxRtspThumbnailResult RunLinuxRtspThumbnailProbe(
         std::filesystem::file_size(thumbnailPath, errorCode) > 0;
     if (!result.thumbnailGenerated && result.error.empty()) {
         result.error = "rtsp_thumbnail_failed: ffmpeg did not write a thumbnail";
+    }
+
+    const std::vector<LinuxFrameDiskWriterClipResult> clips = WriteLinuxCameraClips(paths, config);
+    for (const auto& clip : clips) {
+        if (clip.generated) {
+            result.recordingClipGenerated = true;
+            result.clipPaths.push_back(clip.path.string());
+        } else if (result.error.empty()) {
+            result.error = clip.error.empty()
+                ? "recording_clip_failed"
+                : clip.error;
+        }
     }
 
     result.eventPath = EventPath(paths).string();

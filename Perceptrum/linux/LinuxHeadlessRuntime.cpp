@@ -1,5 +1,6 @@
 #include "LinuxHeadlessRuntime.h"
 
+#include "LinuxFrameDiskWriter.h"
 #include "LinuxRuntimeAdapters.h"
 
 #include "../Perceptrum/core/AgentCoreStatus.h"
@@ -17,6 +18,22 @@
 
 #ifndef PERCEPTRUM_VERSION
 #define PERCEPTRUM_VERSION "1.0.0"
+#endif
+
+#ifndef PERCEPTRUM_AGENT_CORE_PORTABLE_AVAILABLE
+#define PERCEPTRUM_AGENT_CORE_PORTABLE_AVAILABLE 0
+#endif
+#ifndef PERCEPTRUM_ENABLE_CAMERA_CAPTURE
+#define PERCEPTRUM_ENABLE_CAMERA_CAPTURE 0
+#endif
+#ifndef PERCEPTRUM_ENABLE_RTSP_CAPTURE
+#define PERCEPTRUM_ENABLE_RTSP_CAPTURE 0
+#endif
+#ifndef PERCEPTRUM_ENABLE_FRAME_WRITER
+#define PERCEPTRUM_ENABLE_FRAME_WRITER 0
+#endif
+#ifndef PERCEPTRUM_ENABLE_JOB_RUNTIME
+#define PERCEPTRUM_ENABLE_JOB_RUNTIME 0
 #endif
 
 namespace {
@@ -41,7 +58,17 @@ bool HasReadableExeToken(const perceptrum::runtime::ITokenStore& tokenStore)
 
 bool RtspThumbnailGateSet(const perceptrum::linux_runtime::LinuxFeatureGates& gates)
 {
-    return gates.cameraCapture && gates.rtspCapture && gates.frameWriter;
+    return gates.cameraCapture &&
+        gates.rtspCapture &&
+        gates.frameWriter &&
+        PERCEPTRUM_ENABLE_CAMERA_CAPTURE != 0 &&
+        PERCEPTRUM_ENABLE_RTSP_CAPTURE != 0 &&
+        PERCEPTRUM_ENABLE_FRAME_WRITER != 0;
+}
+
+bool LinuxJobRuntimeGateSet(const perceptrum::linux_runtime::LinuxFeatureGates& gates)
+{
+    return gates.jobRuntime && PERCEPTRUM_ENABLE_JOB_RUNTIME != 0;
 }
 
 void MarkCapabilityAvailable(
@@ -127,7 +154,12 @@ perceptrum::runtime::AgentRuntimeStatus BuildDefaultLinuxMinimalStatus()
     status.runtimeName = "linux_minimal_agent_runtime";
     status.integrationStatus = "linux_minimal_runtime_ready";
     status.agentCoreStatus = perceptrum::core::BuildLinuxMinimalAgentCoreStatus();
+    status.agentCorePathAdapter = "linux_runtime_paths_adapter";
+    status.agentCoreHttpClient = "not_loaded";
+    status.agentCoreClock = "linux_runtime_clock_adapter";
+    status.agentCoreLifecycle = "linux_process_lifecycle_adapter";
     const bool rtspThumbnailEnabled = RtspThumbnailGateSet(gates);
+    const bool linuxJobRuntimeEnabled = LinuxJobRuntimeGateSet(gates);
     if (rtspThumbnailEnabled) {
         status.cameraCaptureEnabled = true;
         status.rtspCaptureEnabled = true;
@@ -139,13 +171,21 @@ perceptrum::runtime::AgentRuntimeStatus BuildDefaultLinuxMinimalStatus()
         MarkCapabilityAvailable(status, "rtsp_capture");
         MarkCapabilityAvailable(status, "frame_writer");
     }
-    if (gates.agentCore) {
+    if (linuxJobRuntimeEnabled) {
+        const auto paths = perceptrum::linux_runtime::ResolveRuntimePaths();
+        status.jobRuntimeEnabled = true;
+        status.inferenceTempRoot = perceptrum::linux_runtime::LinuxInferenceTempRoot(paths).string();
+        status.jobsInferenceTempRoot = perceptrum::linux_runtime::LinuxJobsInferenceTempRoot(paths).string();
+        status.integrationStatus = "linux_job_runtime_ready";
+        MarkCapabilityAvailable(status, "job_runtime");
+    }
+    if (gates.agentCore && !PERCEPTRUM_AGENT_CORE_PORTABLE_AVAILABLE) {
         status.unsupportedFeatureGate = "PERCEPTRUM_ENABLE_AGENT_CORE";
     } else if (gates.cameraCapture && !rtspThumbnailEnabled) {
         status.unsupportedFeatureGate = "PERCEPTRUM_ENABLE_CAMERA_CAPTURE";
     } else if (gates.rtspCapture && !rtspThumbnailEnabled) {
         status.unsupportedFeatureGate = "PERCEPTRUM_ENABLE_RTSP_CAPTURE";
-    } else if (gates.jobRuntime) {
+    } else if (gates.jobRuntime && PERCEPTRUM_ENABLE_JOB_RUNTIME == 0) {
         status.unsupportedFeatureGate = "PERCEPTRUM_ENABLE_JOB_RUNTIME";
     } else if (gates.frameWriter && !rtspThumbnailEnabled) {
         status.unsupportedFeatureGate = "PERCEPTRUM_ENABLE_FRAME_WRITER";
@@ -169,6 +209,23 @@ nlohmann::json BuildFeatureGateSnapshot()
         { "PERCEPTRUM_ENABLE_JOB_RUNTIME", gates.jobRuntime },
         { "PERCEPTRUM_ENABLE_FRAME_WRITER", gates.frameWriter },
     };
+}
+
+nlohmann::json ParseCameraSessionStatus(std::string_view raw)
+{
+    if (raw.empty()) {
+        return {
+            { "active_count", 0 },
+            { "active_camera_ids", nlohmann::json::array() },
+            { "last_errors_by_camera", nlohmann::json::object() },
+            { "last_thumbnail_by_camera", nlohmann::json::object() },
+            { "clip_directories_by_camera", nlohmann::json::object() },
+            { "ffmpeg_child_pids_by_camera", nlohmann::json::object() },
+        };
+    }
+
+    nlohmann::json parsed = nlohmann::json::parse(raw, nullptr, false);
+    return parsed.is_object() ? parsed : nlohmann::json::object();
 }
 
 } // namespace
@@ -217,6 +274,7 @@ nlohmann::json BuildHeadlessHealthSnapshotWithTokenStore(
 {
     const auto defaultStatus = BuildDefaultLinuxMinimalStatus();
     const auto& agentStatus = runtimeStatus != nullptr ? *runtimeStatus : defaultStatus;
+    const nlohmann::json cameraSessions = ParseCameraSessionStatus(agentStatus.cameraSessionStatusJson);
     std::string configError;
     const auto config = ReadAgentConfig(paths, &configError);
     const bool configInvalid = !configError.empty();
@@ -240,7 +298,7 @@ nlohmann::json BuildHeadlessHealthSnapshotWithTokenStore(
         { "status", status },
         { "paired", config.has_value() && config->paired },
         { "provisioned", config.has_value() && config->provisioned },
-        { "base_url", ResolveSnapshotBaseUrl(paths, config) },
+        { "base_url", RedactSensitiveRuntimeText(ResolveSnapshotBaseUrl(paths, config)) },
         { "client_id", config.has_value() ? config->clientId : "" },
         { "exe_id", config.has_value() ? config->exeId : "" },
         { "pid", CurrentProcessId() },
@@ -261,30 +319,53 @@ nlohmann::json BuildHeadlessHealthSnapshotWithTokenStore(
         { "token_store", "linux_token_store_adapter" },
         { "agent_runtime", agentStatus.runtimeName },
         { "headless_ready", agentStatus.running && agentStatus.error.empty() },
-        { "headless_integration_status", agentStatus.integrationStatus.empty() ? HeadlessIntegrationStatus() : agentStatus.integrationStatus },
+        { "headless_integration_status", RedactSensitiveRuntimeText(agentStatus.integrationStatus.empty() ? HeadlessIntegrationStatus() : agentStatus.integrationStatus) },
         { "agent_runtime_enabled", agentStatus.enabled },
         { "agent_runtime_running", agentStatus.running },
         { "agent_core_enabled", agentStatus.agentCoreEnabled },
         { "agent_core_partial", agentStatus.agentCorePartial },
         { "agent_core_status_provider", agentStatus.agentCoreStatus.providerName },
         { "agent_core_contract_version", agentStatus.agentCoreStatus.contractVersion },
-        { "agent_core_blocked_reason", agentStatus.agentCoreStatus.blockedReason },
+        { "agent_core_blocked_reason", RedactSensitiveRuntimeText(agentStatus.agentCoreStatus.blockedReason) },
         { "agent_core_config_source", agentStatus.agentCoreStatus.configSource },
         { "agent_core_config_loaded", agentStatus.agentCoreStatus.configLoaded },
         { "agent_core_config_valid", agentStatus.agentCoreStatus.configValid },
+        { "agent_core_path_adapter", agentStatus.agentCorePathAdapter },
+        { "agent_core_http_client", agentStatus.agentCoreHttpClient },
+        { "agent_core_clock", agentStatus.agentCoreClock },
+        { "agent_core_lifecycle", agentStatus.agentCoreLifecycle },
         { "agent_core_capabilities", BuildAgentCoreCapabilitiesSnapshot(agentStatus.agentCoreStatus) },
         { "camera_capture_enabled", agentStatus.cameraCaptureEnabled },
         { "rtsp_capture_enabled", agentStatus.rtspCaptureEnabled },
         { "rtsp_camera_configured", agentStatus.rtspCameraConfigured },
         { "rtsp_camera_started", agentStatus.rtspCameraStarted },
-        { "rtsp_camera_id", agentStatus.rtspCameraId },
-        { "rtsp_camera_name", agentStatus.rtspCameraName },
+        { "rtsp_camera_id", RedactSensitiveRuntimeText(agentStatus.rtspCameraId) },
+        { "rtsp_camera_name", RedactSensitiveRuntimeText(agentStatus.rtspCameraName) },
         { "rtsp_thumbnail_generated", agentStatus.rtspThumbnailGenerated },
         { "rtsp_thumbnail_path", agentStatus.rtspThumbnailPath },
         { "rtsp_event_published", agentStatus.rtspEventPublished },
         { "rtsp_event_path", agentStatus.rtspEventPath },
-        { "rtsp_last_error", agentStatus.rtspLastError },
+        { "rtsp_last_error", RedactSensitiveRuntimeText(agentStatus.rtspLastError) },
+        { "camera_thumbnail_root", agentStatus.cameraThumbnailRoot },
+        { "camera_recordings_root", agentStatus.cameraRecordingsRoot },
+        { "camera_recording_clip_generated", agentStatus.cameraRecordingClipGenerated },
+        { "camera_recording_clip_paths", agentStatus.cameraRecordingClipPaths },
+        { "camera_recording_profiles", agentStatus.cameraRecordingProfiles },
+        { "linux_camera_sessions", cameraSessions },
+        { "active_camera_sessions", cameraSessions.value("active_camera_ids", nlohmann::json::array()) },
+        { "camera_session_last_errors", cameraSessions.value("last_errors_by_camera", nlohmann::json::object()) },
+        { "camera_session_last_thumbnails", cameraSessions.value("last_thumbnail_by_camera", nlohmann::json::object()) },
+        { "camera_session_clip_directories", cameraSessions.value("clip_directories_by_camera", nlohmann::json::object()) },
+        { "camera_session_ffmpeg_child_pids", cameraSessions.value("ffmpeg_child_pids_by_camera", nlohmann::json::object()) },
+        { "inference_temp_root", agentStatus.inferenceTempRoot },
+        { "jobs_inference_temp_root", agentStatus.jobsInferenceTempRoot },
         { "job_runtime_enabled", agentStatus.jobRuntimeEnabled },
+        { "job_runtime_last_command_type", agentStatus.jobRuntimeLastCommandType },
+        { "job_runtime_last_error", RedactSensitiveRuntimeText(agentStatus.jobRuntimeLastError) },
+        { "job_runtime_llm_provider", agentStatus.jobRuntimeLlmProvider },
+        { "job_runtime_commands_polled", agentStatus.jobRuntimeCommandsPolled },
+        { "job_runtime_commands_completed", agentStatus.jobRuntimeCommandsCompleted },
+        { "job_runtime_commands_failed", agentStatus.jobRuntimeCommandsFailed },
         { "frame_writer_enabled", agentStatus.frameWriterEnabled },
         { "runtime_roots_valid", agentStatus.rootsValid },
         { "branding_valid", agentStatus.brandingValid },
@@ -292,7 +373,7 @@ nlohmann::json BuildHeadlessHealthSnapshotWithTokenStore(
         { "lightweight_dependencies_available", agentStatus.lightweightDependenciesAvailable },
         { "feature_gates", BuildFeatureGateSnapshot() },
         { "unsupported_feature_gate", agentStatus.unsupportedFeatureGate },
-        { "runtime_error", agentStatus.error },
+        { "runtime_error", RedactSensitiveRuntimeText(agentStatus.error) },
     };
 }
 

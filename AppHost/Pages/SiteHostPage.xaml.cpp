@@ -820,6 +820,29 @@ namespace winrt::DrakonDesktop::implementation
             return;
         }
 
+        if (messageType == "open-external-url-window")
+        {
+            auto const navigationUrl = CleanBridgeSessionValue(payload.value("url", std::string{}));
+            auto const requestedTitle = CleanBridgeSessionValue(payload.value("title", std::string{}));
+            if (navigationUrl.empty())
+            {
+                return;
+            }
+
+            auto const result = ::DrakonDesktop::platform::OpenExternalUrlWindowFromWeb(
+                winrt::to_hstring(navigationUrl),
+                winrt::to_hstring(requestedTitle));
+            if (!result.succeeded)
+            {
+                AppendBootstrapTrace("site-host: failed to open external URL window");
+                if (!result.message.empty())
+                {
+                    AppendBootstrapTrace(winrt::to_string(result.message));
+                }
+            }
+            return;
+        }
+
         if (messageType != "resident-runtime-session" || m_pairingRequested || m_pairingCompleted)
         {
             return;

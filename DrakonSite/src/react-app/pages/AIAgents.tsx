@@ -58,6 +58,7 @@ import {
 } from "@/react-app/utils/cameraCaptureAcceleration";
 import {
   describeCameraStartBlockedError,
+  describeCameraStartFailureError,
   toggleCameraService,
 } from "@/react-app/utils/cameraService";
 import {
@@ -395,6 +396,25 @@ function AIAgentsContent({
           title: blockedToast.title,
           message: blockedToast.message,
           type: "camera_start_blocked",
+        });
+      } else if (!isRunning) {
+        const failureToast = describeCameraStartFailureError(
+          error,
+          typeof camera.name === "string" ? camera.name : `Camera #${cameraId}`
+        );
+        pushToast({
+          cameraId,
+          cameraName:
+            typeof camera.name === "string" && camera.name.trim()
+              ? camera.name.trim()
+              : `Camera #${cameraId}`,
+          title: failureToast.title,
+          message: failureToast.message,
+          type: "agent_api_error",
+        });
+        patchAgentCameraLocal(cameraId, {
+          is_service_running: 0,
+          is_online: 0,
         });
       }
       console.error("Failed to toggle service:", error);

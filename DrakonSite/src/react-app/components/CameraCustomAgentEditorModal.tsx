@@ -2403,6 +2403,7 @@ export default function CameraCustomAgentEditorModal({
             prompt_template: normalized.prompt_template,
             alert_condition: normalized.alert_condition,
             negative_condition: normalized.negative_condition,
+            language: "match_input_language",
             analysis_regions: normalizeRegionsForPayload(
               polygonRegions,
               normalized,
@@ -3197,7 +3198,7 @@ export default function CameraCustomAgentEditorModal({
           onClick={() => {
             if (!saving && !enhancingPrompt) onClose();
           }}
-          aria-label="Close agent editor"
+          aria-label={t("jobs.promptEditor.closePromptEditorAria")}
         />
 
         <div
@@ -3206,8 +3207,12 @@ export default function CameraCustomAgentEditorModal({
         >
           <div className="flex items-center justify-between gap-4 px-6 py-4 border-b border-gray-700">
             <div className="min-w-0">
-              <h4 className="text-lg font-semibold leading-tight">Agent Editor</h4>
-              <p className="text-xs text-gray-400 mt-1">Define the full agent context.</p>
+              <h4 className="text-lg font-semibold leading-tight">
+                {t("jobs.promptEditor.title")}
+              </h4>
+              <p className="text-xs text-gray-400 mt-1">
+                {t("jobs.promptEditor.subtitle")}
+              </p>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-2">
               <div className="flex items-center gap-2 rounded border border-gray-700 bg-gray-900/80 px-2 py-1.5">
@@ -4065,7 +4070,7 @@ export default function CameraCustomAgentEditorModal({
                     <div className="flex flex-col items-center gap-3 text-gray-100">
                       <div className="h-10 w-10 rounded-full border-2 border-white/25 border-t-white animate-spin" />
                       <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-white/90">
-                        Enhancing...
+                        {t("jobs.promptEditor.enhancing")}
                       </span>
                     </div>
                   </div>
@@ -4075,15 +4080,17 @@ export default function CameraCustomAgentEditorModal({
           </div>
 
           <div className="px-8 py-4 border-t border-gray-700 bg-gray-800/70 flex justify-end gap-2">
-            <button type="button" onClick={onClose} disabled={enhancingPrompt || saving} className="px-3 py-1.5 rounded bg-gray-700 text-gray-100 text-sm">Cancel</button>
+            <button type="button" onClick={onClose} disabled={enhancingPrompt || saving} className="px-3 py-1.5 rounded bg-gray-700 text-gray-100 text-sm">{t("jobs.cancel")}</button>
             {!isPortalCounterActive ? (
               <button type="button" onClick={() => void onEnhancePrompt()} disabled={enhancingPrompt || saving} data-onboarding-target={isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorEnhance : undefined} className="px-3 py-1.5 rounded bg-gray-700 border border-white/85 hover:border-white disabled:border-white/35 text-white text-sm inline-flex items-center gap-1.5 shadow-[0_0_0_1px_rgba(255,255,255,0.12)]">
                 <Sparkles className="w-3.5 h-3.5" />
-                {enhancingPrompt ? "Enhancing..." : "Enhance Prompt with AI"}
+                {enhancingPrompt
+                  ? t("jobs.promptEditor.enhancing")
+                  : t("jobs.promptEditor.enhanceWithAI")}
               </button>
             ) : null}
             <button type="button" onClick={() => void onApplyAndSave()} disabled={enhancingPrompt || saving} data-onboarding-target={isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorSave : undefined} className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm">
-              {saving ? "Saving..." : "Apply & Save"}
+              {saving ? t("jobs.promptEditor.saving") : t("jobs.promptEditor.applyAndSave")}
             </button>
           </div>
 
@@ -4091,8 +4098,12 @@ export default function CameraCustomAgentEditorModal({
             <div className="absolute inset-0 z-20 bg-gray-950/65 backdrop-blur-sm flex items-center justify-center p-6">
               <div className="w-full max-w-3xl max-h-[85vh] bg-gray-800 border border-gray-700 rounded-lg shadow-xl overflow-hidden flex flex-col">
                 <div className="px-6 py-4 border-b border-gray-700">
-                  <h5 className="text-base font-semibold text-gray-100">AI suggestion ready</h5>
-                  <p className="text-xs text-gray-400 mt-1">Review and apply suggested prompt improvements.</p>
+                  <h5 className="text-base font-semibold text-gray-100">
+                    {t("jobs.promptEditor.aiSuggestionReadyTitle")}
+                  </h5>
+                  <p className="text-xs text-gray-400 mt-1">
+                    {t("jobs.promptEditor.aiSuggestionReadyDescription")}
+                  </p>
                 </div>
                 <div className="px-6 py-4 overflow-y-auto">
                   <div className={PROMPT_DOCUMENT_BLOCK_CLASS}>

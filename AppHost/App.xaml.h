@@ -30,6 +30,9 @@ namespace DrakonDesktop::platform
         winrt::hstring const& exeToken,
         winrt::hstring const& timezoneIana);
     DesktopShellRequestResult ScheduleLocalAppDataCleanupAfterAccountDeletionFromWeb(bool clearStorageRoot);
+    DesktopShellRequestResult OpenExternalUrlWindowFromWeb(
+        winrt::hstring const& navigationUrl,
+        winrt::hstring const& requestedTitle);
     DesktopShellRequestResult OpenRemoteWorkspaceWindowFromWeb(
         winrt::hstring const& sessionId,
         winrt::hstring const& ownerDisplayLabel,
@@ -50,6 +53,9 @@ namespace winrt::DrakonDesktop::implementation
         winrt::Microsoft::UI::Xaml::Markup::IXamlType GetXamlType(winrt::hstring const& fullName);
         winrt::com_array<winrt::Microsoft::UI::Xaml::Markup::XmlnsDefinition> GetXmlnsDefinitions();
         void OnLaunched(Microsoft::UI::Xaml::LaunchActivatedEventArgs const&);
+        ::DrakonDesktop::platform::DesktopShellRequestResult OpenExternalUrlWindow(
+            winrt::hstring const& navigationUrl,
+            winrt::hstring const& requestedTitle);
         ::DrakonDesktop::platform::DesktopShellRequestResult OpenRemoteWorkspaceWindow(
             winrt::hstring const& sessionId,
             winrt::hstring const& ownerDisplayLabel,

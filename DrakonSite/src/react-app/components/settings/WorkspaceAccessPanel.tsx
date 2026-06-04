@@ -403,7 +403,7 @@ function ScopeSelector({
   onToggle,
 }: ScopeSelectorProps) {
   return (
-    <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+    <div className="fluent-card rounded-lg border p-3">
       <div className="mb-3 flex items-center justify-between gap-3">
         <span className="text-xs font-semibold uppercase tracking-[0.18em] text-gray-400">
           {title}
@@ -423,7 +423,7 @@ function ScopeSelector({
           type="button"
           onClick={() => onModeChange("all")}
           disabled={disabled}
-          className={`rounded-xl px-3 py-2 text-sm font-semibold transition-colors ${
+          className={`rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
             mode === "all"
               ? "bg-cyan-500 text-slate-950"
               : "border border-white/10 bg-white/[0.04] text-gray-200 hover:bg-white/[0.08]"
@@ -435,7 +435,7 @@ function ScopeSelector({
           type="button"
           onClick={() => onModeChange("selected")}
           disabled={disabled}
-          className={`rounded-xl px-3 py-2 text-sm font-semibold transition-colors ${
+          className={`rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
             mode === "selected"
               ? "bg-cyan-500 text-slate-950"
               : "border border-white/10 bg-white/[0.04] text-gray-200 hover:bg-white/[0.08]"
@@ -448,14 +448,14 @@ function ScopeSelector({
       {mode === "selected" ? (
         <div className="mt-3 max-h-44 space-y-2 overflow-y-auto pr-1">
           {items.length === 0 ? (
-            <div className="rounded-xl border border-dashed border-white/10 px-3 py-3 text-sm text-gray-500">
+            <div className="fluent-card rounded-lg border border-dashed px-3 py-3 text-sm text-gray-500">
               {t("settings.usersRights.scope.noneAvailable")}
             </div>
           ) : null}
           {items.map((item) => (
             <label
               key={String(item.id)}
-              className="flex items-start gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5"
+              className="fluent-card flex items-start gap-3 rounded-lg border px-3 py-2.5"
             >
               <input
                 type="checkbox"
@@ -1117,7 +1117,7 @@ export default function WorkspaceAccessPanel() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded-2xl border border-cyan-500/20 bg-gradient-to-br from-cyan-500/10 via-slate-900/50 to-blue-500/10 p-5">
+      <div className="fluent-card rounded-lg border p-5">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div className="space-y-2">
             <div className="inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-500/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-cyan-100">
@@ -1134,7 +1134,7 @@ export default function WorkspaceAccessPanel() {
           <button
             type="button"
             onClick={() => void loadWorkspaceAccessState(true)}
-            className="inline-flex items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-semibold text-gray-100 transition-colors hover:bg-white/[0.08]"
+            className="fluent-toolbar-button inline-flex items-center justify-center gap-2 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors"
           >
             {refreshing ? (
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -1147,11 +1147,11 @@ export default function WorkspaceAccessPanel() {
       </div>
 
       {message ? (
-        <div className={`rounded-2xl border px-4 py-3 text-sm ${messageClassName}`}>{message}</div>
+        <div className={`rounded-lg border px-4 py-3 text-sm ${messageClassName}`}>{message}</div>
       ) : null}
 
       <div className="grid gap-4 xl:grid-cols-2">
-        <section className="rounded-2xl border border-gray-800/60 bg-gray-900/50 p-5">
+        <section className="fluent-card rounded-lg border p-5">
           <div className="mb-4 flex items-center gap-3">
             <ShieldCheck className="h-5 w-5 text-cyan-200" />
             <div>
@@ -1165,7 +1165,7 @@ export default function WorkspaceAccessPanel() {
           </div>
 
           <div className="space-y-3">
-            <label className="flex items-start gap-3 rounded-2xl border border-white/10 bg-white/[0.03] p-3">
+            <label className="fluent-card flex items-start gap-3 rounded-lg border p-3">
               <input
                 type="radio"
                 name="workspace-access-policy"
@@ -1184,7 +1184,7 @@ export default function WorkspaceAccessPanel() {
               </span>
             </label>
 
-            <label className="flex items-start gap-3 rounded-2xl border border-white/10 bg-white/[0.03] p-3">
+            <label className="fluent-card flex items-start gap-3 rounded-lg border p-3">
               <input
                 type="radio"
                 name="workspace-access-policy"
@@ -1205,7 +1205,7 @@ export default function WorkspaceAccessPanel() {
           </div>
         </section>
 
-        <section className="rounded-2xl border border-gray-800/60 bg-gray-900/50 p-5">
+        <section className="fluent-card rounded-lg border p-5">
           <div className="mb-4 flex items-center gap-3">
             <Send className="h-5 w-5 text-cyan-200" />
             <div>
@@ -1223,13 +1223,13 @@ export default function WorkspaceAccessPanel() {
               value={inviteQuery}
               onChange={(event) => setInviteQuery(event.target.value)}
               placeholder={t("settings.workspaceAccess.share.placeholder")}
-              className="min-h-[44px] flex-1 rounded-2xl border border-white/10 bg-black/20 px-4 text-sm text-gray-100 outline-none transition-colors focus:border-cyan-400/40"
+              className="fluent-input min-h-[44px] flex-1 rounded-lg border px-4 text-sm outline-none transition-colors"
             />
             <button
               type="button"
               onClick={() => void handleInvitePrepare()}
               disabled={inviteSending || inviteResolving}
-              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-2xl bg-cyan-500 px-4 text-sm font-semibold text-slate-950 transition-colors hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-70"
+              className="fluent-primary-button inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border px-4 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-70"
             >
               {inviteResolving || inviteSending ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -1243,13 +1243,13 @@ export default function WorkspaceAccessPanel() {
       </div>
 
       <div className="grid gap-4 xl:grid-cols-3">
-        <section className="rounded-2xl border border-gray-800/60 bg-gray-900/50 p-5 xl:col-span-1">
+        <section className="fluent-card rounded-lg border p-5 xl:col-span-1">
           <h3 className="text-base font-semibold text-gray-100">
             {t("settings.workspaceAccess.sections.incoming")}
           </h3>
           <div className="mt-4 space-y-3">
             {!loading && incomingInvites.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-white/10 px-4 py-5 text-sm text-gray-500">
+              <div className="fluent-card rounded-lg border border-dashed px-4 py-5 text-sm text-gray-500">
                 {t("settings.workspaceAccess.empty.incoming")}
               </div>
             ) : null}
@@ -1260,7 +1260,7 @@ export default function WorkspaceAccessPanel() {
               return (
                 <div
                   key={invite.id}
-                  className="rounded-2xl border border-white/10 bg-white/[0.03] p-4"
+                  className="fluent-card rounded-lg border p-4"
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div>
@@ -1290,7 +1290,7 @@ export default function WorkspaceAccessPanel() {
                         type="button"
                         onClick={() => void handleInviteAction(invite.id, "accept")}
                         disabled={busy}
-                        className="inline-flex min-h-[40px] flex-1 items-center justify-center gap-2 rounded-xl bg-emerald-500 px-3 text-sm font-semibold text-white transition-colors hover:bg-emerald-400 disabled:opacity-70"
+                        className="inline-flex min-h-[40px] flex-1 items-center justify-center gap-2 rounded-lg border px-3 text-sm font-semibold transition-colors disabled:opacity-70 fluent-status-success"
                       >
                         {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
                         {t("settings.workspaceAccess.actions.accept")}
@@ -1299,7 +1299,7 @@ export default function WorkspaceAccessPanel() {
                         type="button"
                         onClick={() => void handleInviteAction(invite.id, "deny")}
                         disabled={busy}
-                        className="inline-flex min-h-[40px] flex-1 items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3 text-sm font-semibold text-gray-100 transition-colors hover:bg-white/[0.08] disabled:opacity-70"
+                        className="fluent-toolbar-button inline-flex min-h-[40px] flex-1 items-center justify-center gap-2 rounded-lg border px-3 text-sm font-semibold transition-colors disabled:opacity-70"
                       >
                         <XCircle className="h-4 w-4" />
                         {t("settings.workspaceAccess.actions.deny")}
@@ -1312,13 +1312,13 @@ export default function WorkspaceAccessPanel() {
           </div>
         </section>
 
-        <section className="rounded-2xl border border-gray-800/60 bg-gray-900/50 p-5 xl:col-span-1">
+        <section className="fluent-card rounded-lg border p-5 xl:col-span-1">
           <h3 className="text-base font-semibold text-gray-100">
             {t("settings.workspaceAccess.sections.outgoing")}
           </h3>
           <div className="mt-4 space-y-3">
             {!loading && outgoingInvites.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-white/10 px-4 py-5 text-sm text-gray-500">
+              <div className="fluent-card rounded-lg border border-dashed px-4 py-5 text-sm text-gray-500">
                 {t("settings.workspaceAccess.empty.outgoing")}
               </div>
             ) : null}
@@ -1329,7 +1329,7 @@ export default function WorkspaceAccessPanel() {
               return (
                 <div
                   key={invite.id}
-                  className="rounded-2xl border border-white/10 bg-white/[0.03] p-4"
+                  className="fluent-card rounded-lg border p-4"
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div>
@@ -1345,7 +1345,7 @@ export default function WorkspaceAccessPanel() {
                       type="button"
                       onClick={() => void handleInviteAction(invite.id, "revoke")}
                       disabled={busy}
-                      className="inline-flex min-h-[36px] items-center justify-center rounded-xl border border-white/10 bg-white/[0.04] px-3 text-sm font-semibold text-gray-100 transition-colors hover:bg-white/[0.08] disabled:opacity-70"
+                      className="fluent-toolbar-button inline-flex min-h-[36px] items-center justify-center rounded-lg border px-3 text-sm font-semibold transition-colors disabled:opacity-70"
                     >
                       {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : t("settings.workspaceAccess.actions.revoke")}
                     </button>
@@ -1356,13 +1356,13 @@ export default function WorkspaceAccessPanel() {
           </div>
         </section>
 
-        <section className="rounded-2xl border border-gray-800/60 bg-gray-900/50 p-5 xl:col-span-1">
+        <section className="fluent-card rounded-lg border p-5 xl:col-span-1">
           <h3 className="text-base font-semibold text-gray-100">
             {t("settings.workspaceAccess.sections.available")}
           </h3>
           <div className="mt-4 space-y-3">
             {!loading && availableAccesses.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-white/10 px-4 py-5 text-sm text-gray-500">
+              <div className="fluent-card rounded-lg border border-dashed px-4 py-5 text-sm text-gray-500">
                 {t("settings.workspaceAccess.empty.available")}
               </div>
             ) : null}
@@ -1379,7 +1379,7 @@ export default function WorkspaceAccessPanel() {
               return (
                 <div
                   key={access.id}
-                  className="rounded-2xl border border-white/10 bg-white/[0.03] p-4"
+                  className="fluent-card rounded-lg border p-4"
                 >
                   <div className="flex flex-col gap-3">
                     <div className="min-w-0 flex-1">
@@ -1409,7 +1409,7 @@ export default function WorkspaceAccessPanel() {
                       type="button"
                       onClick={() => void handleOpenWorkspace(access)}
                       disabled={!access.owner_online || busy || waiting}
-                      className="inline-flex min-h-[40px] w-full max-w-full flex-none items-center justify-center gap-2 self-start rounded-xl bg-cyan-500 px-4 py-2 text-center text-sm font-semibold leading-5 text-slate-950 transition-colors hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto sm:min-w-[11.5rem]"
+                      className="fluent-primary-button inline-flex min-h-[40px] w-full max-w-full flex-none items-center justify-center gap-2 self-start rounded-lg border px-4 py-2 text-center text-sm font-semibold leading-5 transition-colors disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto sm:min-w-[11.5rem]"
                     >
                       {busy || waiting ? (
                         <Loader2 className="h-4 w-4 flex-shrink-0 animate-spin" />
@@ -1431,7 +1431,7 @@ export default function WorkspaceAccessPanel() {
       {inviteDialogOpen ? (
         <div className="fixed inset-0 z-[140]">
           <div
-            className="absolute inset-0 bg-black/75 backdrop-blur-sm"
+            className="fluent-modal-backdrop absolute inset-0"
             onClick={() => {
               if (!inviteSending) {
                 resetInviteDialog();
@@ -1439,7 +1439,7 @@ export default function WorkspaceAccessPanel() {
             }}
           />
           <div className="relative flex min-h-full items-center justify-center px-4 py-6">
-            <div className="w-full max-w-5xl rounded-[28px] border border-white/10 bg-[#06080d] shadow-[0_48px_120px_-48px_rgba(0,0,0,0.95)]">
+            <div className="fluent-modal-panel w-full max-w-5xl rounded-lg border">
               <div className="flex items-start justify-between gap-4 border-b border-white/10 px-6 py-5">
                 <div>
                   <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-200/80">
@@ -1464,7 +1464,7 @@ export default function WorkspaceAccessPanel() {
                   type="button"
                   onClick={() => resetInviteDialog()}
                   disabled={inviteSending}
-                  className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-white/[0.03] text-gray-300 transition-colors hover:bg-white/[0.08] hover:text-white disabled:opacity-60"
+                  className="fluent-toolbar-button inline-flex h-10 w-10 items-center justify-center rounded-lg border transition-colors disabled:opacity-60"
                 >
                   <X className="h-4 w-4" />
                 </button>
@@ -1479,7 +1479,7 @@ export default function WorkspaceAccessPanel() {
                       setInviteDialogError("");
                     }}
                     disabled={inviteSending}
-                    className={`rounded-2xl border p-4 text-left transition-colors ${
+                    className={`rounded-lg border p-4 text-left transition-colors ${
                       inviteDraft.fullAccess
                         ? "border-cyan-400/40 bg-cyan-500/10"
                         : "border-white/10 bg-white/[0.03] hover:bg-white/[0.05]"
@@ -1500,7 +1500,7 @@ export default function WorkspaceAccessPanel() {
                       setInviteDialogError("");
                     }}
                     disabled={inviteSending}
-                    className={`rounded-2xl border p-4 text-left transition-colors ${
+                    className={`rounded-lg border p-4 text-left transition-colors ${
                       !inviteDraft.fullAccess
                         ? "border-cyan-400/40 bg-cyan-500/10"
                         : "border-white/10 bg-white/[0.03] hover:bg-white/[0.05]"
@@ -1536,11 +1536,11 @@ export default function WorkspaceAccessPanel() {
                       return (
                         <div
                           key={entry.key}
-                          className="rounded-2xl border border-white/10 bg-white/[0.03] p-4"
+                          className="fluent-card rounded-lg border p-4"
                         >
                           <p className="text-base font-semibold text-gray-100">{entry.label}</p>
                           <div className="mt-4 space-y-4">
-                            <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                            <div className="fluent-card rounded-lg border p-3">
                               <label className="flex items-center gap-3 text-sm text-gray-100">
                                 <input
                                   type="checkbox"
@@ -1572,7 +1572,7 @@ export default function WorkspaceAccessPanel() {
                               ) : null}
                             </div>
 
-                            <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                            <div className="fluent-card rounded-lg border p-3">
                               <label className="flex items-center gap-3 text-sm text-gray-100">
                                 <input
                                   type="checkbox"
@@ -1609,13 +1609,13 @@ export default function WorkspaceAccessPanel() {
                     })}
                   </div>
                 ) : (
-                  <div className="rounded-2xl border border-cyan-500/20 bg-cyan-500/10 px-4 py-3 text-sm text-cyan-100">
+                  <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-4 py-3 text-sm text-cyan-100">
                     {t("settings.workspaceAccess.inviteDialog.fullAccessNotice")}
                   </div>
                 )}
 
                 {inviteDialogError ? (
-                  <div className="rounded-2xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-100">
+                  <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-100">
                     <div className="inline-flex items-start gap-2">
                       <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" />
                       <span>{inviteDialogError}</span>
@@ -1629,7 +1629,7 @@ export default function WorkspaceAccessPanel() {
                   type="button"
                   onClick={() => resetInviteDialog()}
                   disabled={inviteSending}
-                  className="inline-flex min-h-[44px] items-center justify-center rounded-2xl border border-white/10 bg-white/[0.03] px-4 text-sm font-semibold text-gray-200 transition-colors hover:bg-white/[0.08] disabled:opacity-60"
+                  className="fluent-toolbar-button inline-flex min-h-[44px] items-center justify-center rounded-lg border px-4 text-sm font-semibold transition-colors disabled:opacity-60"
                 >
                   {t("settings.workspaceAccess.actions.cancel")}
                 </button>
@@ -1637,7 +1637,7 @@ export default function WorkspaceAccessPanel() {
                   type="button"
                   onClick={() => void handleInviteSubmit()}
                   disabled={inviteSending || inviteResolving}
-                  className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-2xl bg-cyan-500 px-4 text-sm font-semibold text-slate-950 transition-colors hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-70"
+                  className="fluent-primary-button inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border px-4 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-70"
                 >
                   {inviteSending ? (
                     <Loader2 className="h-4 w-4 animate-spin" />
@@ -1653,7 +1653,7 @@ export default function WorkspaceAccessPanel() {
       ) : null}
 
       {loading ? (
-        <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-5 text-sm text-gray-300">
+        <div className="fluent-card rounded-lg border px-4 py-5 text-sm text-gray-300">
           <div className="inline-flex items-center gap-2">
             <Loader2 className="h-4 w-4 animate-spin" />
             {t("settings.workspaceAccess.loading")}
@@ -1662,7 +1662,7 @@ export default function WorkspaceAccessPanel() {
       ) : null}
 
       {!isDesktopShell() ? (
-        <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+        <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
           {t("settings.workspaceAccess.browserNotice")}
         </div>
       ) : null}

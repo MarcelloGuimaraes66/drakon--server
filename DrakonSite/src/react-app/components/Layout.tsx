@@ -12,6 +12,7 @@ import SystemActivityModal from "@/react-app/components/SystemActivityModal";
 import TutorialOverlay from "@/react-app/components/TutorialOverlay";
 import { useRemoteWorkspace } from "@/react-app/contexts/RemoteWorkspaceContext";
 import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
+import { dashboardSummaryStore } from "@/react-app/lib/DashboardSummaryStore";
 import { useEffectiveUser } from "@/react-app/hooks/useEffectiveUser";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { useTheme } from "@/react-app/hooks/useTheme";
@@ -90,6 +91,8 @@ const CHAT_AUTO_COLLAPSE_DELAY_MS = 260;
 const CHAT_AUTO_EXPAND_DELAY_MS = 1000;
 const SIDEBAR_DESCRIPTION_HOVER_DELAY_MS = 2000;
 const LOCAL_WORKSPACE_ACCESS_API_PREFIX = "/api/desktop-workspace-access";
+const SHARED_FIND_NOTIFICATION_SYNC_INTERVAL_MS = 60_000;
+const SHARED_FIND_NOTIFICATION_SYNC_MIN_INTERVAL_MS = 15_000;
 
 function getSidebarSectionLabels(language: string) {
   if (language.startsWith("pt") || language.startsWith("es")) {
@@ -283,6 +286,10 @@ export default function Layout({ children }: LayoutProps) {
   const expandTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sidebarHoverHintTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousUnreadCountRef = useRef(0);
+  const sharedFindNotificationSyncRef = useRef({
+    inFlight: false,
+    lastStartedAt: 0,
+  });
   const workspaceHeartbeatInstanceIdRef = useRef(
     `desktop_${Math.random().toString(36).slice(2, 10)}`
   );
@@ -294,6 +301,7 @@ export default function Layout({ children }: LayoutProps) {
   const currentBrandId = brand.id.toLowerCase();
   const isPerceptrumBrand = currentBrandId === "perceptrum";
   const isDrakonBrand = currentBrandId === "drakon";
+  const hasEffectiveUser = Boolean(effectiveUser);
   const billingEnabled = brand.features.billingEnabled;
   const drakonFindEnabled = brand.features.drakonFindEnabled;
   const canOpenDashboard = canViewDashboard(effectiveUser);
@@ -504,6 +512,72 @@ export default function Layout({ children }: LayoutProps) {
     }
     previousUnreadCountRef.current = unreadCount;
   }, [unreadCount]);
+
+  useEffect(() => {
+    if (
+      !user ||
+      !hasEffectiveUser ||
+      !canOpenEvents ||
+      isRemoteWorkspace ||
+      typeof window === "undefined"
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const runSharedFindNotificationSync = async (force = false) => {
+      const syncState = sharedFindNotificationSyncRef.current;
+      const now = Date.now();
+      if (syncState.inFlight) {
+        return;
+      }
+      if (!force && now - syncState.lastStartedAt < SHARED_FIND_NOTIFICATION_SYNC_MIN_INTERVAL_MS) {
+        return;
+      }
+
+      syncState.inFlight = true;
+      syncState.lastStartedAt = now;
+      try {
+        await fetch("/api/shared-find/sync", { method: "POST" });
+      } catch (error) {
+        console.error("Failed to sync shared access notifications:", error);
+      } finally {
+        syncState.inFlight = false;
+        if (!cancelled) {
+          dashboardSummaryStore.refresh();
+        }
+      }
+    };
+
+    void runSharedFindNotificationSync(true);
+
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void runSharedFindNotificationSync();
+      }
+    }, SHARED_FIND_NOTIFICATION_SYNC_INTERVAL_MS);
+
+    const handleFocus = () => {
+      void runSharedFindNotificationSync();
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void runSharedFindNotificationSync();
+      }
+    };
+
+    window.addEventListener("focus", handleFocus);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", handleFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [canOpenEvents, hasEffectiveUser, isRemoteWorkspace, user?.id]);
 
   useEffect(() => {
     if (!isNotificationsOpen) return;
@@ -1821,6 +1895,7 @@ export default function Layout({ children }: LayoutProps) {
                   isOpen={isNotificationsOpen}
                   onClose={handleNotificationsClose}
                   anchorRef={notificationsContainerRef}
+                  onNotificationsChanged={() => dashboardSummaryStore.refresh()}
                 />
               </div>
             ) : null}

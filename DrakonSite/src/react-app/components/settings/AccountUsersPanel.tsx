@@ -633,7 +633,7 @@ function ScopeSelector({
   const selectedSet = new Set(selectedIds);
 
   return (
-    <div className="mt-3 rounded-xl border border-gray-800/80 bg-black/20 p-3">
+    <div className="fluent-card mt-3 rounded-lg border p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-gray-400">
           {title}
@@ -647,7 +647,7 @@ function ScopeSelector({
         ) : null}
       </div>
 
-      <div className="mt-3 inline-flex rounded-xl border border-gray-800 bg-gray-950/60 p-1">
+      <div className="fluent-segmented mt-3 inline-flex rounded-lg border p-1">
         <button
           type="button"
           onClick={() => onModeChange("all")}
@@ -675,7 +675,7 @@ function ScopeSelector({
       </div>
 
       {mode === "selected" ? (
-        <div className="mt-3 rounded-xl border border-gray-800/70 bg-gray-950/70">
+        <div className="fluent-card mt-3 rounded-lg border">
           {items.length === 0 ? (
             <p className="px-3 py-3 text-sm text-gray-500">
               {t("settings.usersRights.scope.noneAvailable")}
@@ -756,7 +756,7 @@ function PermissionModuleCard({
   const grantSet = resourceGrants[entry.key];
 
   return (
-    <div className="rounded-xl border border-gray-800/80 bg-gray-900/60 p-3">
+    <div className="fluent-card rounded-lg border p-3">
       <p className="text-sm font-semibold text-gray-100">{entry.label}</p>
       <div className="mt-3 space-y-3 text-sm text-gray-300">
         <div>
@@ -1255,7 +1255,7 @@ export default function AccountUsersPanel() {
 
   return (
     <div className="space-y-6">
-      <div className="rounded-2xl border border-gray-800/60 bg-gray-900/50 p-4 md:p-6">
+      <div className="fluent-card rounded-lg border p-4 md:p-6">
         <div className="flex items-start gap-3">
           <div className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-blue-400/20 bg-blue-500/10 text-blue-200">
             <Users className="h-5 w-5" />
@@ -1273,7 +1273,7 @@ export default function AccountUsersPanel() {
 
       <form
         onSubmit={handleCreateUser}
-        className="rounded-2xl border border-gray-800/60 bg-gray-900/50 p-4 md:p-6"
+        className="fluent-card rounded-lg border p-4 md:p-6"
       >
         <div className="mb-5 flex items-start gap-3">
           <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-emerald-400/20 bg-emerald-500/10 text-emerald-200">
@@ -1303,7 +1303,7 @@ export default function AccountUsersPanel() {
                 updateCreateForm({ email: event.target.value });
               }}
               disabled={isCreating}
-              className="w-full rounded-xl border border-gray-700 bg-gray-800 px-4 py-2.5 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
+              className="fluent-input w-full rounded-lg border px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
             />
           </div>
           <div>
@@ -1319,7 +1319,7 @@ export default function AccountUsersPanel() {
                 updateCreateForm({ password: event.target.value });
               }}
               disabled={isCreating}
-              className="w-full rounded-xl border border-gray-700 bg-gray-800 px-4 py-2.5 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
+              className="fluent-input w-full rounded-lg border px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
             />
           </div>
         </div>
@@ -1337,7 +1337,7 @@ export default function AccountUsersPanel() {
                 })
               }
               disabled={isCreating}
-              className="w-full rounded-xl border border-gray-700 bg-gray-800 px-4 py-2.5 text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
+              className="fluent-input w-full rounded-lg border px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
             >
               <option value="member">{t("settings.usersRights.role.member")}</option>
               {canAssignAdmin ? (
@@ -1349,7 +1349,7 @@ export default function AccountUsersPanel() {
             </p>
           </div>
 
-          <div className="rounded-2xl border border-gray-800/80 bg-gray-900/60 p-4">
+          <div className="fluent-card rounded-lg border p-4">
             <label className="inline-flex items-center gap-3 text-sm font-medium text-gray-200">
               <input
                 type="checkbox"
@@ -1384,7 +1384,7 @@ export default function AccountUsersPanel() {
             />
           ))}
 
-          <div className="rounded-xl border border-gray-800/80 bg-gray-900/60 p-3">
+          <div className="fluent-card rounded-lg border p-3">
             <p className="text-sm font-semibold text-gray-100">
               {t("settings.usersRights.permissions.chat")}
             </p>
@@ -1419,7 +1419,7 @@ export default function AccountUsersPanel() {
           <button
             type="submit"
             disabled={isCreating}
-            className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-gray-700 disabled:text-gray-500"
+            className="fluent-primary-button inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border px-5 py-2.5 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-60"
           >
             {isCreating ? <Loader2 className="h-4 w-4 animate-spin" /> : <UserPlus className="h-4 w-4" />}
             {t("settings.usersRights.actions.create")}
@@ -1427,7 +1427,7 @@ export default function AccountUsersPanel() {
         </div>
       </form>
 
-      <div className="rounded-2xl border border-gray-800/60 bg-gray-900/50 p-4 md:p-6">
+      <div className="fluent-card rounded-lg border p-4 md:p-6">
         <div className="mb-5 flex items-start justify-between gap-4">
           <div>
             <h3 className="text-base font-semibold text-gray-100">
@@ -1441,7 +1441,7 @@ export default function AccountUsersPanel() {
             type="button"
             onClick={() => void loadUsers()}
             disabled={isLoading}
-            className="inline-flex min-h-[40px] items-center justify-center gap-2 rounded-xl border border-gray-700 bg-gray-900 px-4 py-2 text-sm font-medium text-gray-200 transition-colors hover:bg-gray-800 disabled:opacity-60"
+            className="fluent-toolbar-button inline-flex min-h-[40px] items-center justify-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-colors disabled:opacity-60"
           >
             {isLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
             {t("settings.usersRights.actions.refresh")}
@@ -1455,14 +1455,14 @@ export default function AccountUsersPanel() {
         ) : null}
 
         {isLoading ? (
-          <div className="flex items-center gap-3 rounded-xl border border-white/8 bg-white/[0.03] px-4 py-4 text-sm text-gray-300">
+          <div className="fluent-card flex items-center gap-3 rounded-lg border px-4 py-4 text-sm text-gray-300">
             <Loader2 className="h-4 w-4 animate-spin" />
             {t("settings.usersRights.loading")}
           </div>
         ) : null}
 
         {!isLoading && sortedUsers.length === 0 ? (
-          <div className="rounded-xl border border-white/8 bg-white/[0.03] px-4 py-4 text-sm text-gray-400">
+          <div className="fluent-card rounded-lg border px-4 py-4 text-sm text-gray-400">
             {t("settings.usersRights.empty")}
           </div>
         ) : null}
@@ -1483,7 +1483,7 @@ export default function AccountUsersPanel() {
             return (
               <div
                 key={user.member_user_id}
-                className="rounded-2xl border border-gray-800/70 bg-black/20 p-4"
+                className="fluent-card rounded-lg border p-4"
               >
                 <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                   <div className="min-w-0">
@@ -1534,7 +1534,7 @@ export default function AccountUsersPanel() {
                 </div>
 
                 {!user.is_owner ? (
-                  <div className="mt-5 overflow-hidden rounded-2xl border border-gray-800/80 bg-gray-950/40">
+                  <div className="fluent-card mt-5 overflow-hidden rounded-lg border">
                     <button
                       type="button"
                       onClick={() => toggleExpandedUser(user.member_user_id)}
@@ -1570,7 +1570,7 @@ export default function AccountUsersPanel() {
                                 })
                               }
                               disabled={roleLocked || editor.isSaving}
-                              className="w-full rounded-xl border border-gray-700 bg-gray-800 px-4 py-2.5 text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
+                              className="fluent-input w-full rounded-lg border px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
                             >
                               <option value="member">{t("settings.usersRights.role.member")}</option>
                               {canAssignAdmin ? (
@@ -1592,7 +1592,7 @@ export default function AccountUsersPanel() {
                                 })
                               }
                               disabled={editor.isSaving}
-                              className="w-full rounded-xl border border-gray-700 bg-gray-800 px-4 py-2.5 text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
+                              className="fluent-input w-full rounded-lg border px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
                             >
                               <option value="active">{t("settings.usersRights.status.active")}</option>
                               <option value="disabled">
@@ -1601,7 +1601,7 @@ export default function AccountUsersPanel() {
                             </select>
                           </div>
 
-                          <div className="rounded-2xl border border-gray-800/80 bg-gray-900/60 p-4">
+                          <div className="fluent-card rounded-lg border p-4">
                             <label className="inline-flex items-center gap-3 text-sm font-medium text-gray-200">
                               <input
                                 type="checkbox"
@@ -1642,7 +1642,7 @@ export default function AccountUsersPanel() {
                             />
                           ))}
 
-                          <div className="rounded-xl border border-gray-800/80 bg-gray-900/60 p-3">
+                          <div className="fluent-card rounded-lg border p-3">
                             <p className="text-sm font-semibold text-gray-100">
                               {t("settings.usersRights.permissions.chat")}
                             </p>
@@ -1684,14 +1684,14 @@ export default function AccountUsersPanel() {
                             type="button"
                             onClick={() => void handleSaveUser(user)}
                             disabled={editor.isSaving}
-                            className="inline-flex min-h-[42px] items-center justify-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-gray-700 disabled:text-gray-500"
+                            className="fluent-primary-button inline-flex min-h-[42px] items-center justify-center gap-2 rounded-lg border px-4 py-2 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-60"
                           >
                             {editor.isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
                             {t("settings.usersRights.actions.saveChanges")}
                           </button>
                         </div>
 
-                        <div className="rounded-2xl border border-gray-800/80 bg-gray-900/60 p-4">
+                        <div className="fluent-card rounded-lg border p-4">
                           <div className="flex items-start gap-3">
                             <AlertCircle className="mt-0.5 h-4 w-4 text-gray-500" />
                             <div className="min-w-0 flex-1">
@@ -1717,13 +1717,13 @@ export default function AccountUsersPanel() {
                               }
                               disabled={passwordLocked || editor.isResettingPassword}
                               placeholder={t("settings.usersRights.password.placeholder")}
-                              className="w-full rounded-xl border border-gray-700 bg-gray-800 px-4 py-2.5 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
+                              className="fluent-input w-full rounded-lg border px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
                             />
                             <button
                               type="button"
                               onClick={() => void handleResetPassword(user)}
                               disabled={passwordLocked || editor.isResettingPassword}
-                              className="inline-flex min-h-[42px] items-center justify-center gap-2 rounded-xl border border-gray-700 bg-gray-900 px-4 py-2 text-sm font-medium text-gray-200 transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-60"
+                              className="fluent-toolbar-button inline-flex min-h-[42px] items-center justify-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60"
                             >
                               {editor.isResettingPassword ? (
                                 <Loader2 className="h-4 w-4 animate-spin" />

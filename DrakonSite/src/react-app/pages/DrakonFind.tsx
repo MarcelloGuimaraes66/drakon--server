@@ -182,6 +182,7 @@ function normalizeCameraFindShare(value: unknown): CameraFindShare | null {
     id,
     owner_public_id: typeof row.owner_public_id === "string" ? row.owner_public_id : "",
     invitee_public_id: typeof row.invitee_public_id === "string" ? row.invitee_public_id : "",
+    origin_brand_id: typeof row.origin_brand_id === "string" ? row.origin_brand_id : null,
     owner_local_camera_id: Number(row.owner_local_camera_id || 0),
     camera_name: typeof row.camera_name === "string" ? row.camera_name : "",
     city: typeof row.city === "string" ? row.city : null,
@@ -192,7 +193,27 @@ function normalizeCameraFindShare(value: unknown): CameraFindShare | null {
     accepted_at: typeof row.accepted_at === "string" ? row.accepted_at : null,
     revoked_at: typeof row.revoked_at === "string" ? row.revoked_at : null,
     updated_at: typeof row.updated_at === "string" ? row.updated_at : "",
+    owner_handle: typeof row.owner_handle === "string" ? row.owner_handle : null,
+    owner_email: typeof row.owner_email === "string" ? row.owner_email : null,
+    invitee_handle: typeof row.invitee_handle === "string" ? row.invitee_handle : null,
+    invitee_email: typeof row.invitee_email === "string" ? row.invitee_email : null,
   };
+}
+
+function buildSharedAccountLabel(
+  handle?: string | null,
+  email?: string | null,
+  fallback?: string | null
+) {
+  const normalizedHandle = typeof handle === "string" ? handle.trim().replace(/^@+/, "") : "";
+  if (normalizedHandle) {
+    return `@${normalizedHandle}`;
+  }
+  const normalizedEmail = typeof email === "string" ? email.trim() : "";
+  if (normalizedEmail) {
+    return normalizedEmail;
+  }
+  return typeof fallback === "string" ? fallback.trim() : "";
 }
 
 function normalizeDrakonFindTarget(value: unknown): DrakonFindTarget | null {
@@ -849,13 +870,17 @@ export default function DrakonFindPage() {
 
   const handleRespondToIncomingShare = async (shareId: number, action: "accept" | "deny") => {
     setActingShareId(shareId);
+    const fallbackErrorMessage =
+      action === "accept"
+        ? t("drakonFind.sharedAccess.toast.acceptFailed")
+        : t("drakonFind.sharedAccess.toast.denyFailed");
     try {
       const response = await fetch(`/api/shared-find/shares/${shareId}/${action}`, {
         method: "POST",
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(data?.error || `Failed to ${action} the shared camera invitation.`);
+        throw new Error(data?.error || fallbackErrorMessage);
       }
 
       const syncResponse = await fetch("/api/shared-find/sync", { method: "POST" });
@@ -877,16 +902,13 @@ export default function DrakonFindPage() {
       setToast({
         message:
           action === "accept"
-            ? "Shared camera accepted for Drakon Find."
-            : "Shared camera invitation denied.",
+            ? t("drakonFind.sharedAccess.toast.accepted")
+            : t("drakonFind.sharedAccess.toast.denied"),
         type: action === "accept" ? "success" : "info",
       });
     } catch (error) {
       setToast({
-        message:
-          error instanceof Error
-            ? error.message
-            : `Failed to ${action} the shared camera invitation.`,
+        message: error instanceof Error ? error.message : fallbackErrorMessage,
         type: "error",
       });
     } finally {
@@ -1175,22 +1197,26 @@ export default function DrakonFindPage() {
 
         {sharedFindSyncError ? (
           <section className="rounded-[24px] border border-amber-500/20 bg-amber-500/10 px-5 py-4">
-            <p className="text-sm font-semibold text-amber-100">Shared camera sync warning</p>
+            <p className="text-sm font-semibold text-amber-100">
+              {t("drakonFind.sharedAccess.syncWarningTitle")}
+            </p>
             <p className="mt-1 text-sm text-amber-200/90">{sharedFindSyncError}</p>
           </section>
         ) : null}
 
         {incomingShares.length ? (
-          <section className="rounded-[28px] border border-amber-500/20 bg-gradient-to-br from-amber-500/10 to-gray-950 p-6">
+          <section className="fluent-panel rounded-lg border p-6">
             <div className="mb-4 flex items-center justify-between gap-3">
               <div>
-                <p className="text-sm font-semibold text-gray-100">Pending Shared Camera Invitations</p>
+                <p className="text-sm font-semibold text-gray-100">
+                  {t("drakonFind.sharedAccess.pending.title")}
+                </p>
                 <p className="text-sm text-gray-400">
-                  Accept a camera to make it available in your Drakon Find scope.
+                  {t("drakonFind.sharedAccess.pending.description")}
                 </p>
               </div>
               <div className="inline-flex items-center gap-2 rounded-full border border-amber-400/20 bg-amber-500/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-amber-200">
-                {incomingShares.length} pending
+                {t("drakonFind.sharedAccess.pending.count", { count: incomingShares.length })}
               </div>
             </div>
             <div className="grid gap-3">
@@ -1200,11 +1226,22 @@ export default function DrakonFindPage() {
                   className="flex flex-col gap-4 rounded-[22px] border border-gray-800 bg-gray-950/70 p-4 md:flex-row md:items-center md:justify-between"
                 >
                   <div>
-                    <p className="text-sm font-medium text-gray-100">{share.camera_name || `Camera #${share.owner_local_camera_id}`}</p>
-                    <p className="mt-1 text-xs text-gray-400">
-                      {share.city ? `${share.city}${share.state_code ? `, ${share.state_code}` : ""}` : "Location unavailable"}
+                    <p className="text-sm font-medium text-gray-100">
+                      {share.camera_name || t("drakonFind.generic.unnamedCamera")}
                     </p>
-                    <p className="mt-1 text-xs text-gray-500 break-all">Owner: {share.owner_public_id}</p>
+                    <p className="mt-1 text-xs text-gray-400">
+                      {share.city
+                        ? `${share.city}${share.state_code ? `, ${share.state_code}` : ""}`
+                        : t("drakonFind.sharedAccess.fields.locationUnavailable")}
+                    </p>
+                    <p className="mt-1 text-xs text-gray-500 break-all">
+                      {t("drakonFind.sharedAccess.fields.sharedBy")}{" "}
+                      {buildSharedAccountLabel(
+                        share.owner_handle,
+                        share.owner_email,
+                        share.owner_public_id
+                      )}
+                    </p>
                   </div>
                   <div className="flex flex-wrap gap-2">
                     <button
@@ -1213,7 +1250,9 @@ export default function DrakonFindPage() {
                       onClick={() => void handleRespondToIncomingShare(share.id, "deny")}
                       className="rounded-xl border border-gray-700 bg-gray-900 px-4 py-2 text-sm text-gray-200 transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-60"
                     >
-                      {actingShareId === share.id ? "Working..." : "Deny"}
+                      {actingShareId === share.id
+                        ? t("drakonFind.sharedAccess.actions.working")
+                        : t("drakonFind.sharedAccess.actions.deny")}
                     </button>
                     <button
                       type="button"
@@ -1221,7 +1260,9 @@ export default function DrakonFindPage() {
                       onClick={() => void handleRespondToIncomingShare(share.id, "accept")}
                       className="rounded-xl bg-emerald-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-600 disabled:cursor-not-allowed disabled:bg-gray-700"
                     >
-                      {actingShareId === share.id ? "Working..." : "Accept for Find"}
+                      {actingShareId === share.id
+                        ? t("drakonFind.sharedAccess.actions.working")
+                        : t("drakonFind.sharedAccess.actions.accept")}
                     </button>
                   </div>
                 </div>
@@ -1598,9 +1639,6 @@ export default function DrakonFindPage() {
     </Layout>
   );
 }
-
-
-
 
 
 

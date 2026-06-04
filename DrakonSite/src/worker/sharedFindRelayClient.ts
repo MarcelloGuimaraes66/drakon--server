@@ -34,6 +34,14 @@ function normalizeText(value: unknown): string {
   return value.trim();
 }
 
+function buildRedactedRelayErrorSummary(message: Record<string, unknown>) {
+  return {
+    type: normalizeText(message.type) || "relay_error",
+    code: normalizeText(message.code) || null,
+    error: normalizeText(message.error) || normalizeText(message.message) || "relay_error",
+  };
+}
+
 function getSharedFindRelayConnectionMap() {
   const globalKey = "__sharedFindRelayConnectionMap";
   const root = globalThis as any;
@@ -144,7 +152,10 @@ async function openSharedFindRelaySocket(state: SharedFindRelayConnectionState) 
       try {
         const message = JSON.parse(String(event.data || "{}")) as Record<string, unknown>;
         if (normalizeText(message.type) === "relay_error") {
-          console.error("[SHARED FIND RELAY] Central relay error:", message);
+          console.error(
+            "[SHARED FIND RELAY] Central relay error:",
+            buildRedactedRelayErrorSummary(message)
+          );
         }
         void state.onMessage(
           {

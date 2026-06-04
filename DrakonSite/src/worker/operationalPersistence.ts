@@ -1784,7 +1784,11 @@ export async function persistStructuredAgentEvent(
   await insertStepRunResult(input.db, context, input.eventType, input.nowIso);
   await insertCameraAgentRunResult(input.db, context, input.userId, input.eventType, input.nowIso);
 
-  if (input.eventType === "job_alert_triggered") {
+  const shouldPersistJobRunAlert =
+    input.eventType === "job_alert_triggered" ||
+    (input.eventType === "job_agent_completed" && context.alertConditionTrue === true);
+
+  if (shouldPersistJobRunAlert) {
     await insertJobRunAlert(
       input.db,
       context,

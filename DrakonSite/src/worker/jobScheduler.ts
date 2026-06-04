@@ -372,6 +372,7 @@ async function upsertSharedJobSegmentForOperator(
        current_camera_ids_json,
        remote_camera_ids_json,
        camera_id_map_json,
+       allow_event_media,
        status,
        trigger_type,
        trigger_json,
@@ -382,12 +383,13 @@ async function upsertSharedJobSegmentForOperator(
        created_at,
        updated_at,
        started_at
-     ) VALUES (?, 'operator', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ) VALUES (?, 'operator', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(segment_id) DO UPDATE SET
        status = excluded.status,
        request_id = COALESCE(excluded.request_id, shared_job_segments.request_id),
        source_command_id = COALESCE(excluded.source_command_id, shared_job_segments.source_command_id),
        last_error = COALESCE(excluded.last_error, shared_job_segments.last_error),
+       allow_event_media = COALESCE(excluded.allow_event_media, shared_job_segments.allow_event_media),
        trigger_type = COALESCE(excluded.trigger_type, shared_job_segments.trigger_type),
        trigger_json = COALESCE(excluded.trigger_json, shared_job_segments.trigger_json),
        cross_camera_federation_required = COALESCE(
@@ -407,6 +409,7 @@ async function upsertSharedJobSegmentForOperator(
       JSON.stringify(input.segment.operator_camera_ids),
       JSON.stringify(input.segment.owner_camera_ids),
       JSON.stringify(input.segment.camera_id_map),
+      input.segment.allow_event_media ? 1 : 0,
       input.status,
       input.triggerType,
       safeJsonStringify(input.trigger),
@@ -478,7 +481,7 @@ function computeExecutionDomainForPlan(segments: JobExecutionSegmentPlan[]): str
   return normalizeText(segments[0]?.execution_domain) || "local";
 }
 
-async function buildLocalSegmentStartCameraPayloads(
+export async function buildLocalSegmentStartCameraPayloads(
   env: Env,
   userId: string,
   cameraIds: number[],

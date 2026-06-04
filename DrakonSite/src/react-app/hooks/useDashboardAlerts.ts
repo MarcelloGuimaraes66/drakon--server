@@ -109,6 +109,7 @@ export function useDashboardAlerts({
   const isMountedRef = useRef(true);
   const queryVersionRef = useRef(0);
   const lastSeenLatestAlertIdRef = useRef(0);
+  const pendingLatestAlertIdRef = useRef<number | null>(null);
   const alertsRef = useRef<DashboardAlertItem[]>([]);
   const nextCursorRef = useRef<number | null>(null);
   const hasMoreRef = useRef(false);
@@ -371,6 +372,28 @@ export function useDashboardAlerts({
     }
   };
 
+  const syncLatestAlertSignal = (normalizedLatestAlertId: number) => {
+    pendingLatestAlertIdRef.current = normalizedLatestAlertId;
+
+    if (
+      isInitialLoadingRef.current ||
+      isLoadingMoreRef.current ||
+      isRefreshingNewerRef.current
+    ) {
+      return;
+    }
+
+    pendingLatestAlertIdRef.current = null;
+    lastSeenLatestAlertIdRef.current = normalizedLatestAlertId;
+
+    if (alertsRef.current.length === 0) {
+      void fetchAlerts("reset", queryVersionRef.current);
+      return;
+    }
+
+    void fetchAlerts("newer", queryVersionRef.current);
+  };
+
   useEffect(() => {
     queryVersionRef.current += 1;
     const version = queryVersionRef.current;
@@ -385,12 +408,20 @@ export function useDashboardAlerts({
     if (normalizedLatestAlertId <= lastSeenLatestAlertIdRef.current) {
       return;
     }
-    lastSeenLatestAlertIdRef.current = normalizedLatestAlertId;
-    if (alertsRef.current.length === 0 || isInitialLoadingRef.current) {
+    syncLatestAlertSignal(normalizedLatestAlertId);
+  }, [latestAlertId]);
+
+  useEffect(() => {
+    const pendingLatestAlertId = pendingLatestAlertIdRef.current;
+    if (!pendingLatestAlertId) {
       return;
     }
-    void fetchAlerts("newer", queryVersionRef.current);
-  }, [latestAlertId]);
+    if (pendingLatestAlertId <= lastSeenLatestAlertIdRef.current) {
+      pendingLatestAlertIdRef.current = null;
+      return;
+    }
+    syncLatestAlertSignal(pendingLatestAlertId);
+  }, [alerts.length, isInitialLoading, isLoadingMore, isRefreshingNewer]);
 
   return {
     alerts,

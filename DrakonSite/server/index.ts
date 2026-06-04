@@ -51,6 +51,9 @@ const serverRole = String(process.env.APP_SERVER_ROLE || "ui").trim().toLowerCas
 const isAgentServer = serverRole === "agent";
 const activeBrand = resolveActiveBrandRuntime();
 const databaseBackend = resolveDatabaseBackend(activeBrand);
+const runtimeHealthRoute = "/api/runtime/health";
+const runtimeAgentHealthRoute = "/api/runtime/agent-health";
+const legacyHealthRoute = "/__perceptrum/health";
 
 function resolveSecretValue(
   inlineValue: string | undefined,
@@ -223,6 +226,7 @@ async function startServer() {
   }
   const relayWss = new WebSocketServer({ noServer: true });
   const workspaceRelayWss = new WebSocketServer({ noServer: true });
+  const chatWss = new WebSocketServer({ noServer: true });
 
   const server = createServer(async (req, res) => {
     if (!req.url) {
@@ -233,7 +237,7 @@ async function startServer() {
 
     const url = new URL(req.url, resolveRequestBaseUrl(req));
 
-    if (url.pathname === "/__perceptrum/health") {
+    if (url.pathname === legacyHealthRoute) {
       res.setHeader("content-type", "application/json; charset=utf-8");
       res.end(
         JSON.stringify({
@@ -242,6 +246,43 @@ async function startServer() {
           backend: databaseBackend,
           staticRoot: staticRoot || null,
           staticReady: Boolean(staticRoot && fs.existsSync(path.join(staticRoot, "index.html"))),
+        })
+      );
+      return;
+    }
+
+    if (url.pathname === runtimeHealthRoute) {
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      res.end(
+        JSON.stringify({
+          ready: true,
+          fatal: false,
+          summary: "Backend warm-up completed successfully.",
+          details: {
+            backend: databaseBackend,
+            brand: activeBrand.id,
+            port,
+            staticRoot: staticRoot || null,
+            staticReady: Boolean(staticRoot && fs.existsSync(path.join(staticRoot, "index.html"))),
+            serverRole,
+            agentProxyEnabled: Boolean(!isAgentServer && agentBaseUrl),
+          },
+        })
+      );
+      return;
+    }
+
+    if (url.pathname === runtimeAgentHealthRoute) {
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      res.end(JSON.stringify(await buildRuntimeAgentHealthPayload(env)));
+      return;
+    }
+
+    if (url.pathname === "/api/auth/country" && req.method === "GET") {
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      res.end(
+        JSON.stringify({
+          detectedCountryCode: detectCountryFromHeaders(req),
         })
       );
       return;
@@ -439,6 +480,54 @@ async function startServer() {
     });
   });
 
+  chatWss.on("connection", (ws, request) => {
+    const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    const rawSessionId = requestUrl.pathname.replace(/^\/ws\/chat\//, "").split("/")[0] || "";
+    const sessionId = Number.parseInt(rawSessionId, 10);
+    if (!Number.isInteger(sessionId) || sessionId <= 0) {
+      ws.close(1008, "invalid_session");
+      return;
+    }
+
+    let closed = false;
+    let lastSignature = "";
+    const sendCurrentMessages = async () => {
+      if (closed) return;
+      try {
+        const { results } = await (env.DB as any)
+          .prepare("SELECT * FROM chat_messages WHERE session_id = ? ORDER BY id ASC")
+          .bind(sessionId)
+          .all();
+        const messages = results || [];
+        const signature = JSON.stringify(
+          messages.map((message: any) => [
+            message.id,
+            message.updated_at,
+            message.is_pending,
+            message.content,
+          ])
+        );
+        if (signature === lastSignature) {
+          return;
+        }
+        lastSignature = signature;
+        ws.send(JSON.stringify({ type: "message_update", messages }));
+      } catch (error) {
+        console.error("[local-server] chat websocket poll failed", error);
+      }
+    };
+
+    const timer = setInterval(() => {
+      void sendCurrentMessages();
+    }, 1000);
+    void sendCurrentMessages();
+
+    ws.on("close", () => {
+      closed = true;
+      clearInterval(timer);
+    });
+  });
+
   server.on("upgrade", (req, socket, head) => {
     if (!req.url) {
       socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
@@ -461,11 +550,15 @@ async function startServer() {
       return;
     }
 
-    if (requestUrl.pathname !== "/ws/find-relay") {
-      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
-      socket.destroy();
+    if (requestUrl.pathname.startsWith("/ws/chat/")) {
+      chatWss.handleUpgrade(req, socket, head, (ws) => {
+        chatWss.emit("connection", ws, req);
+      });
       return;
     }
+
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
   });
 
   server.listen(port, () => {
@@ -535,6 +628,181 @@ function buildForwardHeaders(req: any, extra: Record<string, string> = {}) {
     headers.set(key, value);
   }
   return headers;
+}
+
+function detectCountryFromHeaders(req: any) {
+  const value = String(
+    req.headers["cf-ipcountry"] ||
+      req.headers["x-country-code"] ||
+      req.headers["x-app-country-code"] ||
+      ""
+  )
+    .trim()
+    .toUpperCase();
+
+  if (!value || value === "XX") {
+    return null;
+  }
+
+  return value;
+}
+
+function selectedRuntimeEnvironment() {
+  return {
+    SQLITE_DB_PATH: process.env.SQLITE_DB_PATH
+      ? path.resolve(process.env.SQLITE_DB_PATH)
+      : null,
+    STORAGE_ROOT: storageRoot,
+    APP_RUNTIME_DATA_ROOT: process.env.APP_RUNTIME_DATA_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_DATA_ROOT)
+      : null,
+    APP_RUNTIME_CONFIG_ROOT: process.env.APP_RUNTIME_CONFIG_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_CONFIG_ROOT)
+      : null,
+    APP_RUNTIME_CACHE_ROOT: process.env.APP_RUNTIME_CACHE_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_CACHE_ROOT)
+      : null,
+    APP_RUNTIME_STATE_ROOT: process.env.APP_RUNTIME_STATE_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_STATE_ROOT)
+      : null,
+    APP_RUNTIME_LOG_ROOT: process.env.APP_RUNTIME_LOG_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_LOG_ROOT)
+      : null,
+    APP_BASE_URL: appBaseUrl,
+    APP_SERVER_ROLE: serverRole,
+    PORT: port,
+  };
+}
+
+function readAgentHealthSnapshot() {
+  const dataRoot = process.env.APP_RUNTIME_DATA_ROOT
+    ? path.resolve(process.env.APP_RUNTIME_DATA_ROOT)
+    : storageRoot;
+  const snapshotPath = path.join(dataRoot, "agent_health.json");
+  try {
+    const snapshot = JSON.parse(fs.readFileSync(snapshotPath, "utf8"));
+    const heartbeatMs = Number(snapshot?.heartbeat_unix_ms || 0);
+    const ageMs = heartbeatMs > 0 ? Math.max(0, Date.now() - heartbeatMs) : null;
+    const staleAfterMs = Number(process.env.PERCEPTRUM_AGENT_HEALTH_STALE_SECONDS || 30) * 1000;
+    return {
+      path: snapshotPath,
+      exists: true,
+      stale: ageMs === null || ageMs > staleAfterMs,
+      heartbeat_age_seconds: ageMs === null ? null : Math.floor(ageMs / 1000),
+      status: typeof snapshot?.status === "string" ? snapshot.status : null,
+      pid: Number.isFinite(Number(snapshot?.pid)) ? Number(snapshot.pid) : null,
+      client_id: typeof snapshot?.client_id === "string" ? snapshot.client_id : "",
+      exe_id: typeof snapshot?.exe_id === "string" ? snapshot.exe_id : "",
+      agent_runtime: typeof snapshot?.agent_runtime === "string" ? snapshot.agent_runtime : "",
+      runtime_mode: typeof snapshot?.runtime_mode === "string" ? snapshot.runtime_mode : "",
+      job_runtime_enabled: Boolean(snapshot?.job_runtime_enabled),
+      job_runtime_commands_polled: Number(snapshot?.job_runtime_commands_polled || 0),
+      job_runtime_commands_completed: Number(snapshot?.job_runtime_commands_completed || 0),
+      job_runtime_commands_failed: Number(snapshot?.job_runtime_commands_failed || 0),
+      last_command_type:
+        typeof snapshot?.job_runtime_last_command_type === "string"
+          ? snapshot.job_runtime_last_command_type
+          : "",
+      last_error:
+        typeof snapshot?.job_runtime_last_error === "string"
+          ? snapshot.job_runtime_last_error
+          : "",
+      active_camera_sessions: Array.isArray(snapshot?.active_camera_sessions)
+        ? snapshot.active_camera_sessions
+        : [],
+      camera_session_last_errors:
+        snapshot?.camera_session_last_errors &&
+        typeof snapshot.camera_session_last_errors === "object"
+          ? snapshot.camera_session_last_errors
+          : {},
+      camera_session_last_thumbnails:
+        snapshot?.camera_session_last_thumbnails &&
+        typeof snapshot.camera_session_last_thumbnails === "object"
+          ? snapshot.camera_session_last_thumbnails
+          : {},
+      camera_session_clip_directories:
+        snapshot?.camera_session_clip_directories &&
+        typeof snapshot.camera_session_clip_directories === "object"
+          ? snapshot.camera_session_clip_directories
+          : {},
+      camera_session_ffmpeg_child_pids:
+        snapshot?.camera_session_ffmpeg_child_pids &&
+        typeof snapshot.camera_session_ffmpeg_child_pids === "object"
+          ? snapshot.camera_session_ffmpeg_child_pids
+          : {},
+    };
+  } catch (error) {
+    return {
+      path: snapshotPath,
+      exists: false,
+      stale: true,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function readAgentCommandCounts(env: unknown) {
+  const db = (env as any)?.DB;
+  if (!db || typeof db.prepare !== "function") {
+    return {
+      pending: 0,
+      sent: 0,
+      failed: 0,
+      completed: 0,
+    };
+  }
+
+  try {
+    const { results } = await db
+      .prepare(
+        `SELECT COALESCE(status, 'pending') AS status, COUNT(*) AS count
+         FROM commands
+         WHERE command_type IN ('start_camera', 'stop_camera')
+         GROUP BY COALESCE(status, 'pending')`
+      )
+      .all();
+    const counts = {
+      pending: 0,
+      sent: 0,
+      failed: 0,
+      completed: 0,
+    };
+    for (const row of results || []) {
+      const status = String((row as any)?.status || "pending").trim().toLowerCase();
+      const count = Number((row as any)?.count || 0);
+      if (status === "pending" || status === "sent" || status === "failed" || status === "completed") {
+        (counts as Record<string, number>)[status] = count;
+      }
+    }
+    return counts;
+  } catch {
+    return {
+      pending: 0,
+      sent: 0,
+      failed: 0,
+      completed: 0,
+    };
+  }
+}
+
+async function buildRuntimeAgentHealthPayload(envInput?: unknown) {
+  const env = selectedRuntimeEnvironment();
+  const sqlitePath =
+    env.SQLITE_DB_PATH || resolveDefaultSqlitePath(activeBrand, storageRoot);
+  const snapshot = readAgentHealthSnapshot();
+  const commandCounts = await readAgentCommandCounts(envInput);
+  return {
+    ok: snapshot.exists && !snapshot.stale,
+    backend: {
+      pid: process.pid,
+      sqlite_path: sqlitePath,
+      storage_root: storageRoot,
+      runtime_ready: true,
+    },
+    env,
+    agent: snapshot,
+    commands: commandCounts,
+  };
 }
 
 async function invokeWorkerFetch(

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <sstream>
 #include <utility>
 
@@ -101,6 +102,29 @@ bool shouldUseOpenAIResponsesTransportForModel_(const std::string& modelName)
         normalized.rfind("gpt-5.4-", 0) == 0 ||
         normalized == "gpt-5.4-mini" ||
         normalized.rfind("gpt-5.4-mini-", 0) == 0;
+}
+
+bool isFakeLocalLlmUrl_(const std::string& baseUrl)
+{
+    const std::string normalized = normalizeOpenAIModelName_(baseUrl);
+    return normalized == "fake" ||
+        normalized == "fake://local" ||
+        normalized == "local://fake" ||
+        normalized.rfind("local://fake/", 0) == 0 ||
+        normalized == "perceptrum://fake-llm" ||
+        normalized.rfind("perceptrum://fake-llm/", 0) == 0;
+}
+
+bool isOpenAIUrl_(const std::string& baseUrl)
+{
+    return normalizeOpenAIModelName_(baseUrl).find("api.openai.com") != std::string::npos;
+}
+
+bool isZAiUrl_(const std::string& baseUrl)
+{
+    const std::string normalized = normalizeOpenAIModelName_(baseUrl);
+    return normalized.find("api.z.ai") != std::string::npos ||
+        normalized.find("open.bigmodel.cn") != std::string::npos;
 }
 
 bool usesOpenAIMaxCompletionTokensField_(const std::string& modelName)
@@ -794,6 +818,37 @@ std::string trimLowerCopy_(std::string value)
     return value;
 }
 
+LocalLlmClient::CompletionOutcome fakeLocalCompletionOutcome_(
+    const std::string& operation,
+    const nlohmann::json& body,
+    long timeoutMs)
+{
+    LocalLlmClient::CompletionOutcome outcome;
+    outcome.ok = true;
+    outcome.timeoutMs = timeoutMs;
+    outcome.attemptCount = 1;
+    outcome.statusCode = 200;
+    outcome.finishReason = "stop";
+
+    const bool wantsJson =
+        body.contains("response_format") &&
+        body["response_format"].is_object() &&
+        body["response_format"].value("type", std::string()) == "json_object";
+    if (wantsJson) {
+        outcome.content = nlohmann::json{
+            { "provider", "fake" },
+            { "operation", operation },
+            { "network", false },
+            { "answer", "fake_local_llm_ok" },
+            { "sentiment_positive", false },
+        }.dump();
+    }
+    else {
+        outcome.content = "fake_local_llm_ok";
+    }
+    return outcome;
+}
+
 void parseStringArrayField_(
     const nlohmann::json& source,
     const char* key,
@@ -1025,6 +1080,11 @@ LocalLlmClient::LocalLlmClient()
 {
     config_.baseUrl = normalizeChatCompletionsUrl_(
         loadConfigValue("CHATV2_LLM_BASE_URL", { "chatv2_llm_base_url.txt" }));
+    const std::string provider = trimLowerCopy_(
+        loadConfigValue("CHATV2_LLM_PROVIDER", { "chatv2_llm_provider.txt" }));
+    if (provider == "fake" || provider == "local") {
+        config_.baseUrl = "local://fake";
+    }
     config_.apiKey = loadConfigValue("CHATV2_LLM_API_KEY", { "chatv2_llm_api_key.txt" });
 
     const std::string configuredModel =
@@ -1100,7 +1160,7 @@ void LocalLlmClient::setRequestOverride(const Config& config)
     requestOverride_.model = trimCopy(requestOverride_.model);
     requestOverride_.enabled =
         !requestOverride_.baseUrl.empty() &&
-        !requestOverride_.apiKey.empty() &&
+        (!requestOverride_.apiKey.empty() || isFakeLocalLlmUrl_(requestOverride_.baseUrl)) &&
         !requestOverride_.model.empty();
     requestOverrideActive_ = true;
 }
@@ -1176,6 +1236,21 @@ LocalLlmClient::CompletionOutcome LocalLlmClient::requestCompletion_(
             configuredModel,
             0,
         };
+        return outcome;
+    }
+    if (isFakeLocalLlmUrl_(baseUrl)) {
+        return fakeLocalCompletionOutcome_(operation, body, timeoutMs);
+    }
+    if (trimCopy(configSnapshot.apiKey).empty() && isOpenAIUrl_(baseUrl)) {
+        outcome.error = "missing_openai_api_key";
+        std::lock_guard<std::mutex> lock(mutex_);
+        lastFailureInfo_ = FailureInfo{ true, operation, outcome.error, "", configuredModel, 0 };
+        return outcome;
+    }
+    if (trimCopy(configSnapshot.apiKey).empty() && isZAiUrl_(baseUrl)) {
+        outcome.error = "missing_zai_api_key";
+        std::lock_guard<std::mutex> lock(mutex_);
+        lastFailureInfo_ = FailureInfo{ true, operation, outcome.error, "", configuredModel, 0 };
         return outcome;
     }
 

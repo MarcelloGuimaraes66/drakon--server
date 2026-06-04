@@ -5,6 +5,7 @@ import path from "path";
 import { webcrypto } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Pool } from "../../DrakonSite/node_modules/pg/esm/index.mjs";
+import { WebSocketServer } from "../../DrakonSite/node_modules/ws/wrapper.mjs";
 import { discoverCameraDevices } from "./camera-discovery.mjs";
 
 import {
@@ -25,7 +26,17 @@ import {
   resolveDesktopSqliteEncryptionConfig,
 } from "../../DrakonSite/server/sqlite-encryption.ts";
 import worker from "../../DrakonSite/src/worker/index.ts";
+import {
+  registerSharedFindRelayConnection,
+  routeSharedFindRelayClientMessage,
+  unregisterSharedFindRelayConnection,
+} from "../../DrakonSite/src/worker/sharedFindRelayState.ts";
 import { startLocalAgentIngressPump } from "../../DrakonSite/src/worker/localAgentIngress.ts";
+import {
+  registerWorkspaceRelayConnection,
+  routeWorkspaceRelayClientMessage,
+  unregisterWorkspaceRelayConnection,
+} from "../../DrakonSite/src/worker/workspaceRelayState.ts";
 
 if (!globalThis.crypto) {
   Object.defineProperty(globalThis, "crypto", {
@@ -75,6 +86,7 @@ try {
   sqliteEncryptionConfigError = summarizeError(error);
 }
 const runtimeHealthRoute = "/api/runtime/health";
+const runtimeAgentHealthRoute = "/api/runtime/agent-health";
 const legacyHealthRoute = "/__perceptrum/health";
 const sqliteCriticalTables = [
   "app_users",
@@ -755,6 +767,9 @@ async function startServer() {
     });
   }
 
+  const relayWss = new WebSocketServer({ noServer: true });
+  const workspaceRelayWss = new WebSocketServer({ noServer: true });
+
   const server = createServer(async (req, res) => {
     if (!req.url) {
       res.statusCode = 400;
@@ -782,6 +797,11 @@ async function startServer() {
         summary: runtimeState.summary,
         details: runtimeState.details,
       });
+      return;
+    }
+
+    if (url.pathname === runtimeAgentHealthRoute) {
+      writeJson(res, 200, await buildRuntimeAgentHealthPayload(runtimeState.env));
       return;
     }
 
@@ -849,8 +869,143 @@ async function startServer() {
     await writeWorkerResponse(res, response);
   });
 
-  server.on("upgrade", (_req, socket) => {
-    socket.write("HTTP/1.1 501 Not Implemented\r\n\r\n");
+  relayWss.on("connection", (ws, request) => {
+    const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    const token = requestUrl.searchParams.get("token") || "";
+    const registered = registerSharedFindRelayConnection(token, ws);
+
+    if (!registered) {
+      try {
+        ws.send(JSON.stringify({ type: "relay_error", error: "invalid_or_expired_session" }));
+      } catch {
+        // ignore send errors during close
+      }
+      ws.close(1008, "invalid_or_expired_session");
+      return;
+    }
+
+    const { publicId, expiresAt } = registered;
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "relay_ready",
+          public_id: publicId,
+          expires_at: expiresAt,
+        })
+      );
+    } catch {
+      ws.close(1011, "relay_ready_failed");
+      return;
+    }
+
+    ws.on("message", (rawData) => {
+      let payload = null;
+      try {
+        payload = JSON.parse(String(rawData || "{}"));
+      } catch {
+        try {
+          ws.send(JSON.stringify({ type: "relay_error", error: "invalid_json" }));
+        } catch {
+          // ignore send errors
+        }
+        return;
+      }
+
+      const routed = routeSharedFindRelayClientMessage(publicId, payload);
+      if (!routed.ok && routed.error) {
+        try {
+          ws.send(JSON.stringify({ type: "relay_error", error: routed.error }));
+        } catch {
+          // ignore send errors
+        }
+      }
+    });
+
+    ws.on("close", () => {
+      unregisterSharedFindRelayConnection(publicId, ws);
+    });
+  });
+
+  workspaceRelayWss.on("connection", (ws, request) => {
+    const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    const token = requestUrl.searchParams.get("token") || "";
+    const registered = registerWorkspaceRelayConnection(token, ws);
+
+    if (!registered) {
+      try {
+        ws.send(JSON.stringify({ type: "relay_error", error: "invalid_or_expired_session" }));
+      } catch {
+        // ignore send errors during close
+      }
+      ws.close(1008, "invalid_or_expired_session");
+      return;
+    }
+
+    const { publicId, expiresAt } = registered;
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "relay_ready",
+          public_id: publicId,
+          expires_at: expiresAt,
+        })
+      );
+    } catch {
+      ws.close(1011, "relay_ready_failed");
+      return;
+    }
+
+    ws.on("message", (rawData) => {
+      let payload = null;
+      try {
+        payload = JSON.parse(String(rawData || "{}"));
+      } catch {
+        try {
+          ws.send(JSON.stringify({ type: "relay_error", error: "invalid_json" }));
+        } catch {
+          // ignore send errors
+        }
+        return;
+      }
+
+      const routed = routeWorkspaceRelayClientMessage(publicId, payload);
+      if (!routed.ok && routed.error) {
+        try {
+          ws.send(JSON.stringify({ type: "relay_error", error: routed.error }));
+        } catch {
+          // ignore send errors
+        }
+      }
+    });
+
+    ws.on("close", () => {
+      unregisterWorkspaceRelayConnection(publicId, ws);
+    });
+  });
+
+  server.on("upgrade", (req, socket, head) => {
+    if (!req.url) {
+      socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    const requestUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    if (requestUrl.pathname === "/ws/find-relay") {
+      relayWss.handleUpgrade(req, socket, head, (ws) => {
+        relayWss.emit("connection", ws, req);
+      });
+      return;
+    }
+
+    if (requestUrl.pathname === "/ws/workspace-relay") {
+      workspaceRelayWss.handleUpgrade(req, socket, head, (ws) => {
+        workspaceRelayWss.emit("connection", ws, req);
+      });
+      return;
+    }
+
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
     socket.destroy();
   });
 
@@ -1113,6 +1268,165 @@ function writeJson(res, statusCode, payload) {
   res.statusCode = statusCode;
   res.setHeader("content-type", "application/json; charset=utf-8");
   res.end(JSON.stringify(payload));
+}
+
+function selectedRuntimeEnvironment() {
+  return {
+    SQLITE_DB_PATH: process.env.SQLITE_DB_PATH ? path.resolve(process.env.SQLITE_DB_PATH) : null,
+    STORAGE_ROOT: storageRoot,
+    APP_RUNTIME_DATA_ROOT: process.env.APP_RUNTIME_DATA_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_DATA_ROOT)
+      : null,
+    APP_RUNTIME_CONFIG_ROOT: process.env.APP_RUNTIME_CONFIG_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_CONFIG_ROOT)
+      : null,
+    APP_RUNTIME_CACHE_ROOT: process.env.APP_RUNTIME_CACHE_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_CACHE_ROOT)
+      : null,
+    APP_RUNTIME_STATE_ROOT: process.env.APP_RUNTIME_STATE_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_STATE_ROOT)
+      : null,
+    APP_RUNTIME_LOG_ROOT: process.env.APP_RUNTIME_LOG_ROOT
+      ? path.resolve(process.env.APP_RUNTIME_LOG_ROOT)
+      : null,
+    APP_BASE_URL: appBaseUrl,
+    APP_SERVER_ROLE: serverRole,
+    PORT: port,
+  };
+}
+
+function readAgentHealthSnapshot() {
+  const dataRoot = process.env.APP_RUNTIME_DATA_ROOT
+    ? path.resolve(process.env.APP_RUNTIME_DATA_ROOT)
+    : storageRoot;
+  const snapshotPath = path.join(dataRoot, "agent_health.json");
+  try {
+    const raw = fs.readFileSync(snapshotPath, "utf8");
+    const snapshot = JSON.parse(raw);
+    const heartbeatMs = Number(snapshot?.heartbeat_unix_ms || 0);
+    const ageMs = heartbeatMs > 0 ? Math.max(0, Date.now() - heartbeatMs) : null;
+    const staleAfterMs = Number(process.env.PERCEPTRUM_AGENT_HEALTH_STALE_SECONDS || 30) * 1000;
+    return {
+      path: snapshotPath,
+      exists: true,
+      stale: ageMs === null || ageMs > staleAfterMs,
+      heartbeat_age_seconds: ageMs === null ? null : Math.floor(ageMs / 1000),
+      status: typeof snapshot?.status === "string" ? snapshot.status : null,
+      pid: Number.isFinite(Number(snapshot?.pid)) ? Number(snapshot.pid) : null,
+      client_id: typeof snapshot?.client_id === "string" ? snapshot.client_id : "",
+      exe_id: typeof snapshot?.exe_id === "string" ? snapshot.exe_id : "",
+      agent_runtime: typeof snapshot?.agent_runtime === "string" ? snapshot.agent_runtime : "",
+      runtime_mode: typeof snapshot?.runtime_mode === "string" ? snapshot.runtime_mode : "",
+      job_runtime_enabled: Boolean(snapshot?.job_runtime_enabled),
+      job_runtime_commands_polled: Number(snapshot?.job_runtime_commands_polled || 0),
+      job_runtime_commands_completed: Number(snapshot?.job_runtime_commands_completed || 0),
+      job_runtime_commands_failed: Number(snapshot?.job_runtime_commands_failed || 0),
+      last_command_type:
+        typeof snapshot?.job_runtime_last_command_type === "string"
+          ? snapshot.job_runtime_last_command_type
+          : "",
+      last_error:
+        typeof snapshot?.job_runtime_last_error === "string"
+          ? snapshot.job_runtime_last_error
+          : "",
+      active_camera_sessions: Array.isArray(snapshot?.active_camera_sessions)
+        ? snapshot.active_camera_sessions
+        : [],
+      camera_session_last_errors:
+        snapshot?.camera_session_last_errors &&
+        typeof snapshot.camera_session_last_errors === "object"
+          ? snapshot.camera_session_last_errors
+          : {},
+      camera_session_last_thumbnails:
+        snapshot?.camera_session_last_thumbnails &&
+        typeof snapshot.camera_session_last_thumbnails === "object"
+          ? snapshot.camera_session_last_thumbnails
+          : {},
+      camera_session_clip_directories:
+        snapshot?.camera_session_clip_directories &&
+        typeof snapshot.camera_session_clip_directories === "object"
+          ? snapshot.camera_session_clip_directories
+          : {},
+      camera_session_ffmpeg_child_pids:
+        snapshot?.camera_session_ffmpeg_child_pids &&
+        typeof snapshot.camera_session_ffmpeg_child_pids === "object"
+          ? snapshot.camera_session_ffmpeg_child_pids
+          : {},
+    };
+  } catch (error) {
+    return {
+      path: snapshotPath,
+      exists: false,
+      stale: true,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function readAgentCommandCounts(env) {
+  const db = env?.DB;
+  if (!db || typeof db.prepare !== "function") {
+    return {
+      pending: 0,
+      sent: 0,
+      failed: 0,
+      completed: 0,
+    };
+  }
+
+  try {
+    const { results } = await db
+      .prepare(
+        `SELECT COALESCE(status, 'pending') AS status, COUNT(*) AS count
+         FROM commands
+         WHERE command_type IN ('start_camera', 'stop_camera')
+         GROUP BY COALESCE(status, 'pending')`
+      )
+      .all();
+    const counts = {
+      pending: 0,
+      sent: 0,
+      failed: 0,
+      completed: 0,
+    };
+    for (const row of results || []) {
+      const status = String(row?.status || "pending").trim().toLowerCase();
+      const count = Number(row?.count || 0);
+      if (status === "pending" || status === "sent" || status === "failed" || status === "completed") {
+        counts[status] = count;
+      }
+    }
+    return counts;
+  } catch {
+    return {
+      pending: 0,
+      sent: 0,
+      failed: 0,
+      completed: 0,
+    };
+  }
+}
+
+async function buildRuntimeAgentHealthPayload(envInput) {
+  const env = selectedRuntimeEnvironment();
+  const sqlitePath =
+    runtimeState.details?.sqlitePath ||
+    env.SQLITE_DB_PATH ||
+    resolveDefaultSqlitePath(activeBrand, storageRoot);
+  const snapshot = readAgentHealthSnapshot();
+  const commandCounts = await readAgentCommandCounts(envInput);
+  return {
+    ok: snapshot.exists && !snapshot.stale,
+    backend: {
+      pid: process.pid,
+      sqlite_path: sqlitePath,
+      storage_root: storageRoot,
+      runtime_ready: runtimeState.ready,
+    },
+    env,
+    agent: snapshot,
+    commands: commandCounts,
+  };
 }
 
 function detectCountryFromHeaders(req) {

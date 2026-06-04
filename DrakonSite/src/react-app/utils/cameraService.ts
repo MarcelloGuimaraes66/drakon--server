@@ -2,6 +2,7 @@ import {
   emitOpenAiKeyRequiredPrompt,
   isOpenAiKeyRequiredError,
 } from "@/react-app/utils/openAiKeyGuard";
+import { describeCameraStartFailureDiagnostic } from "@/shared/cameraStartDiagnostics";
 
 type ToggleCameraServiceOptions = {
   cameraId: number;
@@ -127,6 +128,27 @@ export function describeCameraStartBlockedError(
     title: "Camera Start Blocked",
     message,
   };
+}
+
+export function describeCameraStartFailureError(
+  error: unknown,
+  fallbackCameraName: string
+): { title: string; message: string } {
+  const typedError = error as CameraServiceError | null;
+  const payload =
+    typedError?.payload && typeof typedError.payload === "object" && !Array.isArray(typedError.payload)
+      ? typedError.payload
+      : {};
+  const errorCode = String(typedError?.errorCode || payload.error_code || "").trim().toLowerCase();
+  const rawMessage =
+    typedError instanceof Error && typedError.message.trim()
+      ? typedError.message.trim()
+      : getErrorMessage(payload, "Failed to start camera");
+  return describeCameraStartFailureDiagnostic({
+    errorCode,
+    message: rawMessage,
+    cameraName: fallbackCameraName,
+  });
 }
 
 export async function toggleCameraService({

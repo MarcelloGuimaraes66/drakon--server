@@ -13,11 +13,13 @@
 #include "Platform\\PerceptrumRuntimeHost.h"
 #include "Platform\\TrayIconHost.h"
 #include <microsoft.ui.xaml.window.h>
+#include <shellapi.h>
 #include <shobjidl_core.h>
 #include <winrt/Microsoft.UI.Interop.h>
 #include <winrt/Microsoft.UI.Windowing.h>
 
 #include <algorithm>
+#include <cwctype>
 #include <exception>
 #include <string>
 #include <vector>
@@ -245,6 +247,77 @@ namespace
         return winrt::to_hstring(encoded).c_str();
     }
 
+    std::wstring ToLowerCopy(std::wstring value)
+    {
+        std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch)
+        {
+            return static_cast<wchar_t>(std::towlower(ch));
+        });
+        return value;
+    }
+
+    std::wstring CleanAuxWindowTitle(std::wstring value)
+    {
+        value.erase(
+            std::remove_if(value.begin(), value.end(), [](wchar_t ch)
+            {
+                return (ch >= 0 && ch < 0x20) || ch == 0x7F;
+            }),
+            value.end());
+
+        while (!value.empty() && std::iswspace(static_cast<wint_t>(value.front())))
+        {
+            value.erase(value.begin());
+        }
+        while (!value.empty() && std::iswspace(static_cast<wint_t>(value.back())))
+        {
+            value.pop_back();
+        }
+
+        if (value.size() > 120)
+        {
+            value.resize(120);
+        }
+
+        return value;
+    }
+
+    bool TryNormalizeExternalWindowUrl(
+        winrt::hstring const& navigationUrl,
+        std::wstring& normalizedUrl)
+    {
+        normalizedUrl.clear();
+
+        try
+        {
+            Windows::Foundation::Uri const uri{ navigationUrl };
+            auto const scheme = ToLowerCopy(std::wstring(uri.SchemeName().c_str()));
+            if (scheme != L"http" && scheme != L"https")
+            {
+                return false;
+            }
+
+            normalizedUrl = std::wstring(uri.AbsoluteUri().c_str());
+            return !normalizedUrl.empty();
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    void BringAuxWindowToFront(HWND hwnd)
+    {
+        if (hwnd == nullptr)
+        {
+            return;
+        }
+
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+        BringWindowToTop(hwnd);
+        SetForegroundWindow(hwnd);
+    }
+
     std::wstring BuildRemoteWorkspaceUrl(
         winrt::hstring const& sessionId,
         winrt::hstring const& ownerDisplayLabel,
@@ -364,6 +437,18 @@ namespace DrakonDesktop::platform
             sessionId,
             ownerDisplayLabel,
             operatorDisplayLabel);
+    }
+
+    DesktopShellRequestResult OpenExternalUrlWindowFromWeb(
+        winrt::hstring const& navigationUrl,
+        winrt::hstring const& requestedTitle)
+    {
+        if (g_appInstance == nullptr)
+        {
+            return { false, L"Application instance is not available." };
+        }
+
+        return g_appInstance->OpenExternalUrlWindow(navigationUrl, requestedTitle);
     }
 
     void CloseRemoteWorkspaceWindowsForAppExit()
@@ -530,6 +615,7 @@ namespace winrt::DrakonDesktop::implementation
             if (hwnd != nullptr)
             {
                 ApplyMainWindowIcon(hwnd);
+                BringAuxWindowToFront(hwnd);
             }
         }
         catch (...)
@@ -538,6 +624,59 @@ namespace winrt::DrakonDesktop::implementation
         }
 
         return { true, L"Remote workspace window opened." };
+    }
+
+    ::DrakonDesktop::platform::DesktopShellRequestResult App::OpenExternalUrlWindow(
+        winrt::hstring const& navigationUrl,
+        winrt::hstring const& requestedTitle)
+    {
+        std::wstring normalizedUrl;
+        if (!TryNormalizeExternalWindowUrl(navigationUrl, normalizedUrl))
+        {
+            return { false, L"Only absolute HTTP and HTTPS URLs can be opened in a desktop window." };
+        }
+
+        auto windowTitle = CleanAuxWindowTitle(std::wstring(requestedTitle.c_str()));
+        if (!windowTitle.empty())
+        {
+            AppendBootstrapTrace("app: opening external URL via shell - " + winrt::to_string(windowTitle));
+        }
+
+        HWND ownerHwnd{};
+        try
+        {
+            if (m_window)
+            {
+                auto windowNative = m_window.as<IWindowNative>();
+                check_hresult(windowNative->get_WindowHandle(&ownerHwnd));
+            }
+        }
+        catch (...)
+        {
+        }
+
+        AllowSetForegroundWindow(ASFW_ANY);
+
+        SHELLEXECUTEINFOW execInfo{};
+        execInfo.cbSize = sizeof(execInfo);
+        execInfo.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_FLAG_DDEWAIT | SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS;
+        execInfo.hwnd = ownerHwnd;
+        execInfo.lpVerb = L"open";
+        execInfo.lpFile = normalizedUrl.c_str();
+        execInfo.nShow = SW_SHOWNORMAL;
+
+        if (!ShellExecuteExW(&execInfo))
+        {
+            return { false, L"Windows could not open the requested URL." };
+        }
+
+        if (execInfo.hProcess != nullptr)
+        {
+            WaitForInputIdle(execInfo.hProcess, 3000);
+            CloseHandle(execInfo.hProcess);
+        }
+
+        return { true, L"External URL launched." };
     }
 
     void App::CloseRemoteWorkspaceWindows()

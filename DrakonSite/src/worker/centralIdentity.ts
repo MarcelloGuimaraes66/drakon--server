@@ -29,6 +29,7 @@ type CentralIdentityEnvLike = {
 type ServerUserRow = {
   id: unknown;
   public_id: unknown;
+  brand_id?: unknown;
   email: unknown;
   handle?: unknown;
   country_code?: unknown;
@@ -43,6 +44,7 @@ export type CentralIdentityGrantClaims = JWTPayload & {
   payload_version: 1;
   server_id: string;
   public_id: string;
+  brand_id: string;
   email: string;
   is_active: boolean;
   auth_version: number;
@@ -83,6 +85,11 @@ function normalizeText(value: unknown): string {
     return String(value).trim();
   }
   return value.trim();
+}
+
+function normalizeCentralIdentityBrandId(value: unknown): string {
+  const normalized = normalizeText(value).toLowerCase();
+  return normalized === "drakon" || normalized === "perceptrum" ? normalized : "";
 }
 
 function normalizeInteger(value: unknown, fallback = 0): number {
@@ -233,7 +240,7 @@ function isPgLikeDatabase(db: D1Database): boolean {
 async function reconcileServerUserHandles(db: D1Database): Promise<void> {
   const rowsResult = await db
     .prepare(
-      `SELECT id, public_id, email, handle
+      `SELECT id, public_id, brand_id, email, handle
        FROM server_users
        ORDER BY created_at ASC, id ASC`
     )
@@ -241,10 +248,16 @@ async function reconcileServerUserHandles(db: D1Database): Promise<void> {
   const rows = Array.isArray((rowsResult as any)?.results)
     ? ((rowsResult as any).results as Array<Record<string, unknown>>)
     : [];
-  const usedHandles = new Set<string>();
+  const usedHandlesByBrand = new Map<string, Set<string>>();
   const nowIso = new Date().toISOString();
 
   for (const row of rows) {
+    const brandId = normalizeCentralIdentityBrandId(row.brand_id);
+    let usedHandles = usedHandlesByBrand.get(brandId);
+    if (!usedHandles) {
+      usedHandles = new Set<string>();
+      usedHandlesByBrand.set(brandId, usedHandles);
+    }
     const normalizedCurrent = normalizeUserHandleInput(row.handle);
     const baseHandle = normalizedCurrent || deriveHandleFromEmail(normalizeText(row.email)) || "user";
     let candidate = normalizedCurrent;
@@ -267,6 +280,123 @@ async function reconcileServerUserHandles(db: D1Database): Promise<void> {
         .bind(candidate, nowIso, row.id)
         .run();
     }
+  }
+}
+
+async function rebuildSqliteServerUsersTableForBrandRealms(db: D1Database): Promise<void> {
+  const tableInfoResult = await db.prepare(`PRAGMA table_info(server_users)`).all();
+  const tableInfo = Array.isArray((tableInfoResult as any)?.results)
+    ? ((tableInfoResult as any).results as Array<Record<string, unknown>>)
+    : [];
+  const hasBrandId = tableInfo.some(
+    (row) => normalizeText((row as any)?.name).toLowerCase() === "brand_id"
+  );
+
+  const sqliteMasterRow = await db
+    .prepare(
+      `SELECT sql
+       FROM sqlite_master
+       WHERE type = 'table'
+         AND name = 'server_users'
+       LIMIT 1`
+    )
+    .first();
+  const normalizedTableSql = normalizeText((sqliteMasterRow as any)?.sql)
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+  const hasInlineEmailUnique =
+    normalizedTableSql.includes("email text not null unique") ||
+    normalizedTableSql.includes("email text unique not null");
+  const needsRebuild =
+    !hasBrandId || hasInlineEmailUnique;
+
+  if (!needsRebuild) {
+    return;
+  }
+
+  const tempTableName = "server_users__brand_realm_new";
+  const copyBrandIdSql = hasBrandId ? "COALESCE(LOWER(TRIM(brand_id)), '')" : "''";
+
+  try {
+    await db.prepare("BEGIN IMMEDIATE").run();
+    await db.prepare("PRAGMA defer_foreign_keys = ON").run();
+    await db.prepare(`DROP TABLE IF EXISTS ${tempTableName}`).run();
+
+    await db.prepare(
+      `
+      CREATE TABLE ${tempTableName} (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        public_id TEXT NOT NULL UNIQUE,
+        brand_id TEXT NOT NULL DEFAULT '',
+        email TEXT NOT NULL,
+        handle TEXT,
+        country_code TEXT,
+        password_hash TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        auth_version INTEGER NOT NULL DEFAULT 1,
+        last_login_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `
+    ).run();
+
+    await db.prepare(
+      `
+      INSERT INTO ${tempTableName} (
+        id,
+        public_id,
+        brand_id,
+        email,
+        handle,
+        country_code,
+        password_hash,
+        is_active,
+        auth_version,
+        last_login_at,
+        created_at,
+        updated_at
+      )
+      SELECT
+        id,
+        public_id,
+        ${copyBrandIdSql},
+        email,
+        handle,
+        country_code,
+        password_hash,
+        COALESCE(is_active, 1),
+        COALESCE(auth_version, 1),
+        last_login_at,
+        COALESCE(NULLIF(TRIM(created_at), ''), CURRENT_TIMESTAMP),
+        COALESCE(NULLIF(TRIM(updated_at), ''), COALESCE(NULLIF(TRIM(created_at), ''), CURRENT_TIMESTAMP))
+      FROM server_users
+    `
+    ).run();
+
+    await db.prepare(`DROP TABLE server_users`).run();
+    await db.prepare(`ALTER TABLE ${tempTableName} RENAME TO server_users`).run();
+
+    try {
+      await db.prepare(
+        `
+        INSERT INTO sqlite_sequence (name, seq)
+        VALUES ('server_users', COALESCE((SELECT MAX(id) FROM server_users), 0))
+        ON CONFLICT(name) DO UPDATE SET seq = excluded.seq
+      `
+      ).run();
+    } catch {
+      // sqlite_sequence is not guaranteed to exist in every runtime.
+    }
+
+    await db.prepare("COMMIT").run();
+  } catch (error) {
+    try {
+      await db.prepare("ROLLBACK").run();
+    } catch {
+      // Preserve the original migration failure.
+    }
+    throw error;
   }
 }
 
@@ -332,7 +462,8 @@ export async function ensureCentralIdentitySchema(db: D1Database): Promise<void>
       CREATE TABLE IF NOT EXISTS server_users (
         id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
         public_id UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE,
-        email TEXT NOT NULL UNIQUE,
+        brand_id TEXT NOT NULL DEFAULT '',
+        email TEXT NOT NULL,
         handle TEXT,
         country_code TEXT,
         password_hash TEXT NOT NULL,
@@ -347,7 +478,8 @@ export async function ensureCentralIdentitySchema(db: D1Database): Promise<void>
       CREATE TABLE IF NOT EXISTS server_users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         public_id TEXT NOT NULL UNIQUE,
-        email TEXT NOT NULL UNIQUE,
+        brand_id TEXT NOT NULL DEFAULT '',
+        email TEXT NOT NULL,
         handle TEXT,
         country_code TEXT,
         password_hash TEXT NOT NULL,
@@ -638,6 +770,9 @@ export async function ensureCentralIdentitySchema(db: D1Database): Promise<void>
 
     if (isPgLike) {
       await addColumnIfMissing(
+        `ALTER TABLE server_users ADD COLUMN brand_id TEXT NOT NULL DEFAULT ''`
+      );
+      await addColumnIfMissing(
         `ALTER TABLE server_users ADD COLUMN public_id UUID NOT NULL DEFAULT gen_random_uuid()`
       );
       await addColumnIfMissing(`ALTER TABLE server_users ADD COLUMN handle TEXT`);
@@ -657,6 +792,9 @@ export async function ensureCentralIdentitySchema(db: D1Database): Promise<void>
         `ALTER TABLE server_users ADD COLUMN updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
       );
     } else {
+      await addColumnIfMissing(
+        `ALTER TABLE server_users ADD COLUMN brand_id TEXT NOT NULL DEFAULT ''`
+      );
       await addColumnIfMissing(`ALTER TABLE server_users ADD COLUMN public_id TEXT`);
       await addColumnIfMissing(`ALTER TABLE server_users ADD COLUMN handle TEXT`);
       await addColumnIfMissing(`ALTER TABLE server_users ADD COLUMN country_code TEXT`);
@@ -670,6 +808,15 @@ export async function ensureCentralIdentitySchema(db: D1Database): Promise<void>
       await addColumnIfMissing(`ALTER TABLE server_users ADD COLUMN last_login_at TEXT`);
       await addColumnIfMissing(`ALTER TABLE server_users ADD COLUMN created_at TEXT`);
       await addColumnIfMissing(`ALTER TABLE server_users ADD COLUMN updated_at TEXT`);
+    }
+
+    if (isPgLike) {
+      await runSchemaChange(
+        `ALTER TABLE server_users
+         DROP CONSTRAINT IF EXISTS server_users_email_key`
+      );
+    } else {
+      await rebuildSqliteServerUsersTableForBrandRealms(db);
     }
 
     if (isPgLike) {
@@ -1207,15 +1354,22 @@ export async function ensureCentralIdentitySchema(db: D1Database): Promise<void>
       )
       .run();
     await db
+      .prepare(`DROP INDEX IF EXISTS idx_server_users_email`)
+      .run();
+    await db
+      .prepare(`DROP INDEX IF EXISTS idx_server_users_handle_unique`)
+      .run();
+    await db
       .prepare(
-        `CREATE UNIQUE INDEX IF NOT EXISTS idx_server_users_email
-         ON server_users(email)`
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_server_users_brand_email_unique
+         ON server_users(brand_id, LOWER(email))`
       )
       .run();
     await db
       .prepare(
-        `CREATE UNIQUE INDEX IF NOT EXISTS idx_server_users_handle_unique
-         ON server_users(handle)`
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_server_users_brand_handle_unique
+         ON server_users(brand_id, LOWER(handle))
+         WHERE handle IS NOT NULL AND LENGTH(TRIM(handle)) > 0`
       )
       .run();
     await db
@@ -1413,6 +1567,7 @@ export async function signCentralIdentityGrant(
 
   const publicId =
     normalizeText(serverUser.public_id) || normalizeText((serverUser as any)?.publicId);
+  const brandId = normalizeCentralIdentityBrandId((serverUser as any)?.brand_id);
   const email = normalizeText(serverUser.email).toLowerCase();
   const serverId = normalizeText(serverUser.id);
   const isActive = normalizeBooleanFlag(serverUser.is_active, true);
@@ -1428,6 +1583,7 @@ export async function signCentralIdentityGrant(
     payload_version: 1,
     server_id: serverId,
     public_id: publicId,
+    brand_id: brandId,
     email,
     is_active: isActive,
     auth_version: authVersion,
@@ -1480,6 +1636,7 @@ export async function verifyCentralIdentityGrant(
     server_id: normalizeText((payload as any).server_id),
     public_id:
       normalizeText((payload as any).public_id) || normalizeText(payload.sub),
+    brand_id: normalizeCentralIdentityBrandId((payload as any).brand_id),
     email: normalizeText((payload as any).email).toLowerCase(),
     is_active: normalizeBooleanFlag((payload as any).is_active, true),
     auth_version: normalizeInteger((payload as any).auth_version, 1),

@@ -13,6 +13,7 @@ type PollingConfig = {
   onError?: (error: Error) => void;
   fetchOptions?: RequestInit;
   jitterMaxMs?: number;
+  pauseWhenHidden?: boolean;
 };
 
 type PollerState = {
@@ -69,8 +70,9 @@ class PollingManager {
 
     this.pollers.set(key, state);
 
-    // Start polling immediately if tab is visible
-    if (!this.isPaused) {
+    // Start polling immediately if tab is visible or this poller is allowed
+    // to keep critical app state fresh while WebKit reports the page hidden.
+    if (!this.isPaused || config.pauseWhenHidden === false) {
       this.scheduleNext(key, 0); // Start immediately
     }
   }
@@ -211,6 +213,9 @@ class PollingManager {
     this.isPaused = true;
     
     this.pollers.forEach((state) => {
+      if (state.config.pauseWhenHidden === false) {
+        return;
+      }
       if (state.timer) {
         clearTimeout(state.timer);
         state.timer = null;
@@ -225,6 +230,9 @@ class PollingManager {
     this.isPaused = false;
     
     this.pollers.forEach((state, key) => {
+      if (state.config.pauseWhenHidden === false) {
+        return;
+      }
       // Resume with current backoff state (don't burst)
       const timeSinceLastRequest = Date.now() - state.lastRequestTime;
       const delay = Math.max(0, state.currentInterval - timeSinceLastRequest);

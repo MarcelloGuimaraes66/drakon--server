@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 
 namespace chatv2 {
 
@@ -17,6 +18,12 @@ std::string trimCopy_(std::string value)
         value.pop_back();
     }
     return value;
+}
+
+std::string readEnvTrimmed_(const char* name)
+{
+    const char* raw = std::getenv(name);
+    return raw == nullptr ? std::string() : trimCopy_(raw);
 }
 
 } // namespace
@@ -82,6 +89,11 @@ LocalLlmClient::Config buildChatModelClientConfigFromPayload(
 
     if (apiKey.empty() && payload.is_object()) {
         apiKey = payload.value("model_api_key", std::string());
+    }
+    if (apiKey.empty()) {
+        apiKey = normalizeChatModelTierName(tier) == "core"
+            ? readEnvTrimmed_("ZAI_API_KEY")
+            : readEnvTrimmed_("OPENAI_API_KEY");
     }
 
     config.baseUrl = chatCompletionsBaseUrlForTier(tier);

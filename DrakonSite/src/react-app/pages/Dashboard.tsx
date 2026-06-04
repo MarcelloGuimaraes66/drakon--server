@@ -576,7 +576,7 @@ function DashboardContent() {
   };
 
   const getAlertMedia = (alert: any) => {
-    if (!alert) return { mediaUrl: null, isVideo: false, albumImages: [] as any[] };
+    if (!alert) return { mediaUrl: "", isVideo: false, posterUrl: null, albumImages: [] as any[] };
     const details = alert.details || {};
     const clipPath = alert.clip_url || details.clip_path || details.clipPath || null;
     const imagePath = alert.image_path || details.image_path || details.imagePath || null;
@@ -590,12 +590,17 @@ function DashboardContent() {
     };
     const buildMediaUrl = (value: string | null) => {
       if (!value) return null;
-      if (
-        value.startsWith("http://") ||
-        value.startsWith("https://") ||
-        value.startsWith("/")
-      ) {
+      if (value.startsWith("http://") || value.startsWith("https://") || value.startsWith("/api/")) {
         return value;
+      }
+      const lower = value.toLowerCase();
+      const isVideo =
+        lower.endsWith(".mp4") ||
+        lower.endsWith(".mov") ||
+        lower.endsWith(".m4v") ||
+        lower.endsWith(".webm");
+      if (value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value)) {
+        return `/api/job-${isVideo ? "clips" : "images"}/local/${encodeURIComponent(value)}`;
       }
       const filename = value.split(/[\\/]/).pop();
       return filename ? `/api/detections/${filename}` : null;
@@ -704,7 +709,14 @@ function DashboardContent() {
     const isVideo = mediaUrl
       ? mediaUrl.toLowerCase().endsWith(".mp4") || mediaUrl.toLowerCase().includes("/api/job-clips/")
       : false;
-    return { mediaUrl, isVideo, albumImages };
+    const posterUrlRaw =
+      alert.image_url ||
+      details.image_url ||
+      details.imageUrl ||
+      buildMediaUrl(imagePath) ||
+      primaryAlbumUrl;
+    const posterUrl = typeof posterUrlRaw === "string" && posterUrlRaw.trim() ? posterUrlRaw.trim() : null;
+    return { mediaUrl, isVideo, posterUrl, albumImages };
   };
 
   const normalizeAlertAnalysisInputType = (...values: any[]): "video" | "image" | null => {
@@ -845,7 +857,7 @@ function DashboardContent() {
         key: `alert-video-${Number(alert?.id) || 0}`,
         kind: "video",
         url: alertMedia.mediaUrl,
-        thumbnailUrl: null,
+        thumbnailUrl: alertMedia.posterUrl,
         label: isPortuguese ? "Clip do alerta" : "Alert clip",
       });
     } else if (alertMedia.mediaUrl && alertMedia.albumImages.length === 0) {
@@ -2164,10 +2176,15 @@ function DashboardContent() {
               }
 
               const alert = alertGroup.latestAlert;
-              const mediaSourceAlert = alertGroup.mediaAlert;
+              const latestAlertMedia = getAlertMedia(alert);
+              const mediaSourceAlert =
+                latestAlertMedia.mediaUrl || latestAlertMedia.albumImages.length > 0
+                  ? alert
+                  : alertGroup.mediaAlert;
               const alertDetails = alert.details || {};
               const alertTime = alert.detected_at || alert.created_at || null;
-              const { mediaUrl, isVideo, albumImages } = getAlertMedia(mediaSourceAlert);
+              const { mediaUrl, isVideo, posterUrl, albumImages } =
+                mediaSourceAlert === alert ? latestAlertMedia : getAlertMedia(mediaSourceAlert);
               const downloadTargetUrl = getAlertDownloadTarget(mediaUrl, albumImages);
               const hasAlbumEntries = albumImages.length > 0;
               const hasImageAlbum = hasAlbumEntries && albumImages.length > 1;
@@ -2192,6 +2209,7 @@ function DashboardContent() {
               const normalizedInputType = getAlertAnalysisInputType(alert, {
                 mediaUrl,
                 isVideo,
+                posterUrl,
                 albumImages,
               });
               const mediaTypeBadgeLabel =
@@ -2326,19 +2344,27 @@ function DashboardContent() {
                           }
                           className="w-full h-full object-cover"
                         />
-                      ) : mediaUrl ? (
-                        isVideo ? (
-                          <video
-                            src={mediaUrl}
-                            className="w-full h-full object-cover cursor-pointer"
-                            controls
-                            playsInline
-                            preload="metadata"
-                          />
-                        ) : (
-                          <img
-                            src={mediaUrl}
-                            alt={agentLabel || alertDetails.agent_key || alert.algo_type || "Alert"}
+	                      ) : mediaUrl ? (
+	                        isVideo ? (
+	                          posterUrl ? (
+	                            <img
+	                              src={posterUrl}
+	                              alt={agentLabel || alertDetails.agent_key || alert.algo_type || "Alert"}
+	                              className="w-full h-full object-cover"
+	                            />
+	                          ) : (
+	                            <video
+	                              src={mediaUrl}
+	                              className="w-full h-full object-cover cursor-pointer"
+	                              controls
+	                              playsInline
+	                              preload="metadata"
+	                            />
+	                          )
+	                        ) : (
+	                          <img
+	                            src={mediaUrl}
+	                            alt={agentLabel || alertDetails.agent_key || alert.algo_type || "Alert"}
                             className="w-full h-full object-cover"
                           />
                         )
@@ -2347,19 +2373,27 @@ function DashboardContent() {
                           {t("dashboard.noMediaAvailable")}
                         </div>
                       )
-                    ) : mediaUrl ? (
-                      isVideo ? (
-                        <video
-                          src={mediaUrl}
-                          className="w-full h-full object-cover cursor-pointer"
-                          controls
-                          playsInline
-                          preload="metadata"
-                        />
-                      ) : (
-                        <img
-                          src={mediaUrl}
-                          alt={agentLabel || alertDetails.agent_key || alert.algo_type || "Alert"}
+	                    ) : mediaUrl ? (
+	                      isVideo ? (
+	                        posterUrl ? (
+	                          <img
+	                            src={posterUrl}
+	                            alt={agentLabel || alertDetails.agent_key || alert.algo_type || "Alert"}
+	                            className="w-full h-full object-cover"
+	                          />
+	                        ) : (
+	                          <video
+	                            src={mediaUrl}
+	                            className="w-full h-full object-cover cursor-pointer"
+	                            controls
+	                            playsInline
+	                            preload="metadata"
+	                          />
+	                        )
+	                      ) : (
+	                        <img
+	                          src={mediaUrl}
+	                          alt={agentLabel || alertDetails.agent_key || alert.algo_type || "Alert"}
                           className="w-full h-full object-cover"
                         />
                       )
@@ -3021,13 +3055,21 @@ function DashboardContent() {
                     </div>
                   )
                 ) : activeAlertMedia.isVideo ? (
-                  <video
-                    src={activeAlertMedia.mediaUrl || undefined}
-                    className="h-48 w-full object-cover"
-                    muted
-                    playsInline
-                    preload="metadata"
-                  />
+                  activeAlertMedia.posterUrl ? (
+                    <img
+                      src={activeAlertMedia.posterUrl}
+                      alt={String(activeAlert?.details?.camera_name || activeAlert?.camera_name || "Alert media")}
+                      className="h-48 w-full object-cover"
+                    />
+                  ) : (
+                    <video
+                      src={activeAlertMedia.mediaUrl || undefined}
+                      className="h-48 w-full object-cover"
+                      muted
+                      playsInline
+                      preload="metadata"
+                    />
+                  )
                 ) : activeAlertMedia.mediaUrl ? (
                   <img
                     src={activeAlertMedia.mediaUrl}
@@ -3328,9 +3370,3 @@ export default function DashboardPage() {
     </Layout>
   );
 }
-
-
-
-
-
-

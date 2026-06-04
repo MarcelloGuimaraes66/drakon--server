@@ -27,6 +27,7 @@ export type JobExecutionSegmentPlan = {
   operator_camera_ids: number[];
   owner_camera_ids: number[];
   camera_id_map: Record<string, number>;
+  allow_event_media: boolean;
   payload: Record<string, unknown>;
   is_local: boolean;
 };
@@ -560,6 +561,7 @@ export function buildJobExecutionPlan(
       operator_camera_ids: sortedCameraIds,
       owner_camera_ids: ownerCameraIds,
       camera_id_map: cameraIdMap,
+      allow_event_media: executionDomain !== "local",
       payload,
       is_local: executionDomain === "local",
     });

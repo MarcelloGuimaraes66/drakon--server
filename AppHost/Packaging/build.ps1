@@ -509,6 +509,7 @@ function Invoke-BuildStep {
     Write-Host "Build step completed."
     Write-Host "Sign the payload executable before packaging:"
     Write-Host "  $($BrandMetadata.PayloadExePath)"
+    Write-Host "  powershell -NoProfile -ExecutionPolicy Bypass -File `"$packagingRoot\sign-windows-artifacts.ps1`" -Brand $($BrandMetadata.Brand) -Configuration $($BrandMetadata.Configuration) -Target Payload -CertificateThumbprint <thumbprint> -TimestampUrl <rfc3161-url>"
 }
 
 function Invoke-PackageStep {
@@ -567,6 +568,7 @@ function Invoke-PackageStep {
     Write-Host "Package step completed."
     Write-Host "Sign the installer:"
     Write-Host "  $($BrandMetadata.InstallerOutputPath)"
+    Write-Host "  powershell -NoProfile -ExecutionPolicy Bypass -File `"$packagingRoot\sign-windows-artifacts.ps1`" -Brand $($BrandMetadata.Brand) -Configuration $($BrandMetadata.Configuration) -Target Installer -CertificateThumbprint <thumbprint> -TimestampUrl <rfc3161-url>"
 }
 
 $iscc = Resolve-IsccCommand

@@ -3688,9 +3688,7 @@ export default function JobsPage() {
                     <div>
                       <h3 className={`${flowDensity === "compact" ? "text-base" : "text-lg"} font-semibold text-white`}>{t("jobs.addStep")}</h3>
                       <p className={`mt-1 text-blue-100/75 ${flowDensity === "compact" ? "text-[11px]" : "text-xs"}`}>
-                        {t("jobs.newStepHint", {
-                          defaultValue: "Crie o proximo step do fluxo e defina o tempo maximo de execucao.",
-                        })}
+                        {t("jobs.newStepHint")}
                       </p>
                     </div>
                   </div>
@@ -3706,7 +3704,7 @@ export default function JobsPage() {
                           setNewStep({ ...newStep, name: e.target.value })
                         }
                         className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
-                        placeholder="Step name"
+                        placeholder={t("jobs.stepNamePlaceholder")}
                       />
                     </div>
                     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -3729,7 +3727,7 @@ export default function JobsPage() {
                       </div>
                       <div>
                         <label className="mb-1.5 block text-xs uppercase tracking-[0.22em] text-blue-100/70">
-                          Max time to run step
+                          {t("jobs.stepMaxRuntime")}
                         </label>
                         <div className="grid grid-cols-2 gap-2">
                           <StepTimeoutPartInput
@@ -3762,7 +3760,9 @@ export default function JobsPage() {
                         </div>
                         {selectedJobMaxTimeoutSeconds !== null && (
                           <p className="mt-1.5 text-[11px] text-blue-100/60">
-                            Max for this job: {formatStepTimeoutHuman(selectedJobMaxTimeoutSeconds)}
+                            {t("jobs.stepMaxForJob", {
+                              value: formatStepTimeoutHuman(selectedJobMaxTimeoutSeconds),
+                            })}
                           </p>
                         )}
                       </div>
@@ -3774,7 +3774,7 @@ export default function JobsPage() {
                       className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-3.5 py-2 text-sm font-semibold text-white transition-colors hover:bg-blue-500"
                     >
                       <Save className="h-4 w-4" />
-                      Save Step
+                      {t("jobs.saveStep")}
                     </button>
                     <button
                       onClick={() => setShowNewStepForm(false)}
@@ -3804,9 +3804,7 @@ export default function JobsPage() {
                   </div>
                   <div className={`mt-3 font-semibold ${flowDensity === "compact" ? "text-base" : "text-lg"}`}>{t("jobs.addStep")}</div>
                   <div className={`mt-2 max-w-[16rem] text-blue-100/70 ${flowDensity === "compact" ? "text-[12px] leading-5" : "text-sm leading-6"}`}>
-                    {t("jobs.addStepCardHint", {
-                      defaultValue: "Adicione um novo step ao pipeline e conecte cameras, regras e compartilhamento de conhecimento.",
-                    })}
+                    {t("jobs.addStepCardHint")}
                   </div>
                 </button>
               ) : null
@@ -3814,7 +3812,7 @@ export default function JobsPage() {
             emptyState={
               !showNewStepForm ? (
                 <div className="rounded-[28px] border border-dashed border-gray-800 bg-gray-950/35 px-6 py-14 text-center text-gray-500">
-                  No steps yet. Add your first step to begin.
+                  {t("jobs.noStepsYetMessage")}
                 </div>
               ) : null
             }
@@ -4177,7 +4175,7 @@ export default function JobsPage() {
                         setNewStep({ ...newStep, name: e.target.value })
                       }
                       className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-gray-200 text-sm focus:outline-none focus:border-blue-500"
-                      placeholder="Step name"
+                      placeholder={t("jobs.stepNamePlaceholder")}
                     />
                   </div>
                   <div>
@@ -4199,7 +4197,7 @@ export default function JobsPage() {
                   </div>
                   <div>
                     <label className="block text-xs text-gray-400 mb-1">
-                      Max time to run step (hours/minutes)
+                      {t("jobs.stepMaxRuntime")}
                     </label>
                     <div className="grid grid-cols-2 gap-2">
                       <StepTimeoutPartInput
@@ -4232,7 +4230,9 @@ export default function JobsPage() {
                     </div>
                     {selectedJobMaxTimeoutSeconds !== null && (
                       <p className="mt-1 text-[11px] text-gray-500">
-                        Max for this job: {formatStepTimeoutHuman(selectedJobMaxTimeoutSeconds)}
+                        {t("jobs.stepMaxForJob", {
+                          value: formatStepTimeoutHuman(selectedJobMaxTimeoutSeconds),
+                        })}
                       </p>
                     )}
                   </div>
@@ -4243,13 +4243,13 @@ export default function JobsPage() {
                     className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm"
                   >
                     <Save className="w-3.5 h-3.5 inline mr-1" />
-                    Save
+                    {t("jobs.saveStep")}
                   </button>
                   <button
                     onClick={() => setShowNewStepForm(false)}
                     className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded text-sm"
                   >
-                    Cancel
+                    {t("jobs.cancel")}
                   </button>
                 </div>
               </div>
@@ -4257,7 +4257,7 @@ export default function JobsPage() {
 
             {steps.length === 0 && !showNewStepForm ? (
               <div className="text-center py-8 text-gray-500">
-                No steps yet. Add your first step to begin.
+                {t("jobs.noStepsYetMessage")}
               </div>
             ) : (
               <div className="space-y-3">
@@ -8348,6 +8348,7 @@ function StepCard({
             prompt_template: normalized.prompt_template,
             alert_condition: normalized.alert_condition,
             negative_condition: normalized.negative_condition,
+            language: "match_input_language",
             analysis_regions: enhanceAnalysisRegions,
           }),
         }
@@ -13515,4 +13516,3 @@ function StepCard({
     </StepFlowCard>
   );
 }
-

@@ -238,11 +238,12 @@ export default function DashboardAlertAlbumOverlay({
 
                   {selectedMedia ? (
                     selectedMedia.kind === "video" && selectedMedia.url ? (
-                      <video
-                        src={selectedMedia.url}
-                        className="h-[42vh] w-full rounded-[28px] border border-white/[0.05] bg-black/35 object-contain shadow-[0_36px_100px_-44px_rgba(0,0,0,0.96)] md:h-[52vh]"
-                        controls
-                        autoPlay
+	                      <video
+	                        src={selectedMedia.url}
+	                        poster={selectedMedia.thumbnailUrl || undefined}
+	                        className="h-[42vh] w-full rounded-[28px] border border-white/[0.05] bg-black/35 object-contain shadow-[0_36px_100px_-44px_rgba(0,0,0,0.96)] md:h-[52vh]"
+	                        controls
+	                        autoPlay
                         playsInline
                         preload="metadata"
                       />
@@ -300,25 +301,34 @@ export default function DashboardAlertAlbumOverlay({
                                 : "border-white/[0.06] bg-white/[0.03] hover:border-white/[0.16] hover:bg-white/[0.05]"
                             }`}
                           >
-                            <div className="relative h-16 overflow-hidden rounded-xl border border-white/[0.04] bg-black/35">
-                              {entry.kind === "image" && entry.thumbnailUrl ? (
-                                <img
-                                  src={entry.thumbnailUrl}
-                                  alt={entry.label}
-                                  className="h-full w-full object-cover"
-                                />
-                              ) : entry.kind === "video" ? (
-                                <div className="flex h-full w-full items-center justify-center bg-[radial-gradient(circle_at_top,rgba(59,130,246,0.18),rgba(15,18,28,0.96)_72%)] text-white">
-                                  <div className="flex h-9 w-9 items-center justify-center rounded-full bg-white/10">
-                                    <Play className="h-4 w-4" />
-                                  </div>
-                                </div>
-                              ) : (
-                                <div className="flex h-full w-full items-center justify-center bg-[radial-gradient(circle_at_top,rgba(244,63,94,0.16),rgba(15,18,28,0.96)_72%)] text-rose-100">
-                                  <Camera className="h-5 w-5" />
-                                </div>
-                              )}
-                            </div>
+	                            <div className="relative h-16 overflow-hidden rounded-xl border border-white/[0.04] bg-black/35">
+	                              {(entry.kind === "image" || entry.kind === "video") && entry.thumbnailUrl ? (
+	                                <>
+	                                  <img
+	                                    src={entry.thumbnailUrl}
+	                                    alt={entry.label}
+	                                    className="h-full w-full object-cover"
+	                                  />
+	                                  {entry.kind === "video" ? (
+	                                    <div className="absolute inset-0 flex items-center justify-center bg-black/20 text-white">
+	                                      <div className="flex h-9 w-9 items-center justify-center rounded-full bg-black/45">
+	                                        <Play className="h-4 w-4" />
+	                                      </div>
+	                                    </div>
+	                                  ) : null}
+	                                </>
+	                              ) : entry.kind === "video" ? (
+	                                <div className="flex h-full w-full items-center justify-center bg-[radial-gradient(circle_at_top,rgba(59,130,246,0.18),rgba(15,18,28,0.96)_72%)] text-white">
+	                                  <div className="flex h-9 w-9 items-center justify-center rounded-full bg-white/10">
+	                                    <Play className="h-4 w-4" />
+	                                  </div>
+	                                </div>
+	                              ) : (
+	                                <div className="flex h-full w-full items-center justify-center bg-[radial-gradient(circle_at_top,rgba(244,63,94,0.16),rgba(15,18,28,0.96)_72%)] text-rose-100">
+	                                  <Camera className="h-5 w-5" />
+	                                </div>
+	                              )}
+	                            </div>
 
                             <div className="min-w-0">
                               <div className="truncate text-[11px] font-medium text-white">{entry.label}</div>

@@ -1,6 +1,7 @@
 .codex/
 .codex_tmp/
 .codex-logs/
+.tmp/
 .repo-backups/
 _tmp*/
 .tmp_logs_1/
@@ -64,10 +65,13 @@ cam127_gate_count.json
 analyze_cam127_gate.py
 .claude/
 models/
+.archon/backups/
+storage/
 
 # AppHost generated and packaged outputs
 AppHost/dist/
 AppHost/stage/
+AppHost/stage-hotfix-*/
 AppHost/artifacts/
 AppHost/generated/
 AppHost/_icon_debug/
@@ -81,6 +85,7 @@ DrakonSite/.dev.vars
 DrakonSite/dist/
 DrakonSite/node_modules/
 DrakonSite/storage/
+DrakonSite/C:*/
 DrakonSite/visual-artifacts/
 DrakonSite/.visual-chrome-profile/
 DrakonSite/index.html
@@ -93,6 +98,7 @@ DrakonSite/_deploy_payload/
 DrakonSite/_partner_zip/
 DrakonSite/.deploy-account-delete/
 DrakonSite/_diff_jobruntime.patch
+DrakonSite/db/patches/perceptrum_sql.sql
 DrakonSite/__pycache__/
 DrakonSite/*.docx
 DrakonSite/**/*.bak*
@@ -101,6 +107,11 @@ DrakonSite/.env*
 DrakonSite/env.dev
 !DrakonSite/.env.example
 !DrakonSite/.env.*.example
+
+# Local deploy snapshots and ad-hoc database dumps
+_deploy/
+tmp_perceptrum_server_*.sql
+tmp_perceptrum_site_*.sql
 
 # Perceptrum local runtime/build artifacts
 Perceptrum/.local/

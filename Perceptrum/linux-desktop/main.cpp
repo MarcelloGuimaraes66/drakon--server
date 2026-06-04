@@ -67,9 +67,16 @@ struct BackendSession {
     perceptrum::platform::ProcessHandle processHandle;
 };
 
+struct AgentSession {
+    bool started = false;
+    perceptrum::platform::ProcessHandle processHandle;
+};
+
 struct AgentStatusSummary {
     bool available = false;
+    bool stale = false;
     int exitCode = 0;
+    long long heartbeatAgeMs = -1;
     std::string status;
     std::string runtimeMode;
     std::string agentRuntime;
@@ -152,6 +159,19 @@ std::filesystem::path NormalizePath(const std::filesystem::path& path)
     std::error_code errorCode;
     const auto canonical = std::filesystem::weakly_canonical(path, errorCode);
     return errorCode ? path : canonical;
+}
+
+std::filesystem::path AbsolutePathFrom(
+    const std::filesystem::path& base,
+    const std::filesystem::path& path)
+{
+    if (path.empty()) {
+        return {};
+    }
+    if (path.is_absolute()) {
+        return NormalizePath(path);
+    }
+    return NormalizePath(base / path);
 }
 
 std::filesystem::path ResolveWebRoot()
@@ -459,6 +479,61 @@ std::string EnvAssignment(std::string_view name, std::string value)
     return std::string(name) + "=" + value;
 }
 
+std::string ShellQuote(std::string_view value)
+{
+    std::string quoted = "'";
+    for (const char ch : value) {
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted.push_back(ch);
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+std::string RedactDiagnosticText(std::string_view text)
+{
+    std::istringstream input{std::string(text)};
+    std::ostringstream output;
+    std::string line;
+    while (std::getline(input, line)) {
+        std::string lowered = line;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (lowered.find("token") != std::string::npos ||
+            lowered.find("password") != std::string::npos ||
+            lowered.find("secret") != std::string::npos ||
+            lowered.find("authorization") != std::string::npos ||
+            lowered.find("cookie") != std::string::npos) {
+            output << "[redacted sensitive log line]\n";
+        } else {
+            output << line << '\n';
+        }
+    }
+    return output.str();
+}
+
+std::string TailTextFile(const std::filesystem::path& path, std::size_t maxBytes)
+{
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream.is_open()) {
+        return {};
+    }
+    stream.seekg(0, std::ios::end);
+    const auto size = stream.tellg();
+    if (size > static_cast<std::streamoff>(maxBytes)) {
+        stream.seekg(-static_cast<std::streamoff>(maxBytes), std::ios::end);
+    } else {
+        stream.seekg(0, std::ios::beg);
+    }
+    std::ostringstream buffer;
+    buffer << stream.rdbuf();
+    return RedactDiagnosticText(buffer.str());
+}
+
 std::vector<std::string> RuntimePathEnvironmentAssignments(
     const perceptrum::linux_runtime::RuntimePaths& paths)
 {
@@ -468,38 +543,47 @@ std::vector<std::string> RuntimePathEnvironmentAssignments(
         EnvAssignment("APP_RUNTIME_CACHE_ROOT", paths.cacheRoot.string()),
         EnvAssignment("APP_RUNTIME_STATE_ROOT", paths.stateRoot.string()),
         EnvAssignment("APP_RUNTIME_LOG_ROOT", paths.logRoot.string()),
+        EnvAssignment(
+            "APP_ALLOW_PLAINTEXT_SECRET_RECOVERY",
+            ReadTextEnv("APP_ALLOW_PLAINTEXT_SECRET_RECOVERY").empty()
+                ? "1"
+                : ReadTextEnv("APP_ALLOW_PLAINTEXT_SECRET_RECOVERY")),
+    };
+}
+
+std::vector<std::string> AgentFeatureGateEnvironmentAssignments()
+{
+    return {
+        EnvAssignment("PERCEPTRUM_ENABLE_AGENT_CORE", "1"),
+        EnvAssignment("PERCEPTRUM_ENABLE_CAMERA_CAPTURE", "1"),
+        EnvAssignment("PERCEPTRUM_ENABLE_RTSP_CAPTURE", "1"),
+        EnvAssignment("PERCEPTRUM_ENABLE_FRAME_WRITER", "1"),
+        EnvAssignment("PERCEPTRUM_ENABLE_JOB_RUNTIME", "1"),
     };
 }
 
 std::filesystem::path ResolveSqlitePath(
-    const perceptrum::linux_runtime::RuntimePaths& paths,
-    const std::filesystem::path& webSourceDir)
+    const std::filesystem::path& storageRoot)
 {
     const auto configured = ReadPathEnv("SQLITE_DB_PATH");
     if (!configured.empty()) {
-        return configured;
+        return AbsolutePathFrom(storageRoot, configured);
     }
 
-    const auto devSeed = webSourceDir / "storage" / "sqlite" / "local-site" / "perceptrum_site.sqlite";
-    std::error_code errorCode;
-    if (std::filesystem::is_regular_file(devSeed, errorCode) && !errorCode) {
-        return devSeed;
-    }
-
-    return paths.dataRoot / "local-site" / "perceptrum_site.sqlite";
+    return NormalizePath(storageRoot / "storage" / "sqlite" / "local-site" / "perceptrum_site.sqlite");
 }
 
 std::vector<std::string> BackendEnvironmentAssignments(
     const perceptrum::linux_runtime::RuntimePaths& paths,
     const std::filesystem::path& webRoot,
-    const std::filesystem::path& webSourceDir,
     const std::string& backendBaseUrl)
 {
     const int port = ResolveBackendPort(backendBaseUrl);
     const auto storageRoot = ReadPathEnv("STORAGE_ROOT").empty()
         ? paths.dataRoot
         : ReadPathEnv("STORAGE_ROOT");
-    const auto sqlitePath = ResolveSqlitePath(paths, webSourceDir);
+    const auto absoluteStorageRoot = NormalizePath(storageRoot);
+    const auto sqlitePath = ResolveSqlitePath(absoluteStorageRoot);
 
     std::vector<std::string> assignments = {
         EnvAssignment("APP_RUNTIME_ENV", ReadTextEnv("APP_RUNTIME_ENV").empty() ? "local" : ReadTextEnv("APP_RUNTIME_ENV")),
@@ -507,12 +591,16 @@ std::vector<std::string> BackendEnvironmentAssignments(
         EnvAssignment("APP_STATIC_ROOT", webRoot.string()),
         EnvAssignment("APP_BASE_URL", backendBaseUrl),
         EnvAssignment("PORT", std::to_string(port)),
-        EnvAssignment("STORAGE_ROOT", storageRoot.string()),
+        EnvAssignment("STORAGE_ROOT", absoluteStorageRoot.string()),
         EnvAssignment("SQLITE_DB_PATH", sqlitePath.string()),
     };
     auto runtimeAssignments = RuntimePathEnvironmentAssignments(paths);
     assignments.insert(assignments.end(), runtimeAssignments.begin(), runtimeAssignments.end());
     assignments.push_back(EnvAssignment("PERCEPTRUM_LINUX_HOST", "1"));
+    if (const auto config = perceptrum::linux_runtime::ReadAgentConfig(paths);
+        config.has_value() && !config->exeId.empty()) {
+        assignments.push_back(EnvAssignment("APP_PROVISIONED_EXE_ID", config->exeId));
+    }
 
     return assignments;
 }
@@ -601,6 +689,17 @@ bool ParseAgentStatusJson(const std::string& text, AgentStatusSummary& summary)
     summary.status = payload.value("status", std::string{});
     summary.runtimeMode = payload.value("runtime_mode", std::string{});
     summary.agentRuntime = payload.value("agent_runtime", std::string{});
+    const long long heartbeat = payload.value("heartbeat_unix_ms", 0LL);
+    if (heartbeat > 0) {
+        summary.heartbeatAgeMs = perceptrum::linux_runtime::UnixTimeMillisecondsNow() - heartbeat;
+        const long long staleAfterMs =
+            static_cast<long long>(ParsePositiveInt(ReadTextEnv("PERCEPTRUM_AGENT_HEALTH_STALE_SECONDS"), 30)) * 1000LL;
+        if (summary.heartbeatAgeMs < 0 || summary.heartbeatAgeMs > staleAfterMs) {
+            summary.stale = true;
+            summary.available = false;
+            summary.status = "stale";
+        }
+    }
     return true;
 }
 
@@ -632,6 +731,84 @@ AgentStatusSummary QueryAgentStatus(const perceptrum::linux_runtime::RuntimePath
 
     (void)ReadAgentHealthSnapshot(paths, summary);
     return summary;
+}
+
+bool AgentAutostartDisabled()
+{
+    const std::string value = ReadTextEnv("PERCEPTRUM_DISABLE_AGENT_AUTOSTART");
+    return value == "1" || value == "true" || value == "TRUE";
+}
+
+bool LaunchResidentAgentProcess(
+    const perceptrum::linux_runtime::RuntimePaths& paths,
+    AgentSession& session,
+    std::string& errorMessage)
+{
+    errorMessage.clear();
+    if (AgentAutostartDisabled()) {
+        return true;
+    }
+    if (session.started && perceptrum::platform::IsProcessRunning(session.processHandle)) {
+        return true;
+    }
+
+    const auto agentPath = ResolveAgentExecutablePath();
+    if (agentPath.empty()) {
+        errorMessage = "Unable to locate perceptrum-agent. Set PERCEPTRUM_AGENT_PATH or install it next to perceptrum-desktop.";
+        return false;
+    }
+
+    auto arguments = RuntimePathEnvironmentAssignments(paths);
+    auto gateAssignments = AgentFeatureGateEnvironmentAssignments();
+    arguments.insert(arguments.end(), gateAssignments.begin(), gateAssignments.end());
+    arguments.push_back(EnvAssignment("PERCEPTRUM_LINUX_DESKTOP_AGENT", "1"));
+
+    const auto agentOutputLog = paths.logRoot / "perceptrum-agent.resident.stderr.log";
+    std::ostringstream command;
+    command << "exec env";
+    for (const auto& assignment : arguments) {
+        command << ' ' << ShellQuote(assignment);
+    }
+    command << ' ' << ShellQuote(agentPath.string())
+            << " run >> " << ShellQuote(agentOutputLog.string()) << " 2>&1";
+
+    perceptrum::platform::ProcessLaunchOptions options;
+    options.executablePath = "sh";
+    options.workingDirectory = paths.dataRoot;
+    options.hideWindow = false;
+    options.arguments = { "-c", command.str() };
+
+    if (!perceptrum::platform::LaunchProcess(options, session.processHandle, errorMessage)) {
+        return false;
+    }
+
+    session.started = true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    int exitCode = 0;
+    if (perceptrum::platform::TryGetProcessExitCode(session.processHandle, exitCode)) {
+        session.started = false;
+        errorMessage = "perceptrum-agent run exited immediately with code " + std::to_string(exitCode) + ".";
+        const auto stderrTail = TailTextFile(agentOutputLog, 4096);
+        if (!stderrTail.empty()) {
+            errorMessage += " Recent agent stderr/log: " + stderrTail;
+        }
+        return false;
+    }
+    return true;
+}
+
+void StopOwnedAgent(AgentSession& session)
+{
+    if (session.started) {
+        std::string terminateError;
+        (void)perceptrum::platform::TerminateProcess(
+            session.processHandle,
+            0,
+            3000,
+            &terminateError);
+    }
+    perceptrum::platform::CloseProcess(session.processHandle);
+    session.started = false;
 }
 
 bool ProvisionAgentFromLocalSession(
@@ -692,7 +869,7 @@ bool LaunchBackendProcess(
     const auto workingDirectory = ReadPathEnv("PERCEPTRUM_BACKEND_WORKDIR").empty()
         ? (useBackendCommand ? paths.dataRoot : webSourceDir)
         : ReadPathEnv("PERCEPTRUM_BACKEND_WORKDIR");
-    auto assignments = BackendEnvironmentAssignments(paths, webRoot, webSourceDir, backendBaseUrl);
+    auto assignments = BackendEnvironmentAssignments(paths, webRoot, backendBaseUrl);
 
     perceptrum::platform::ProcessLaunchOptions launchOptions;
     launchOptions.executablePath = "env";
@@ -920,6 +1097,7 @@ struct WebKitHostContext {
     std::string url;
     std::string backendBaseUrl;
     perceptrum::linux_runtime::RuntimePaths paths;
+    AgentSession* agentSession = nullptr;
     bool pairingRequested = false;
     bool pairingCompleted = false;
     std::string lastTheme = "dark";
@@ -1086,6 +1264,17 @@ void OnWebKitScriptMessage(
     context->pairingRequested = true;
     std::string errorMessage;
     if (PersistResidentRuntimeSession(*context, payload, errorMessage)) {
+        if (context->agentSession != nullptr) {
+            std::string launchError;
+            if (context->agentSession->started) {
+                StopOwnedAgent(*context->agentSession);
+            }
+            if (LaunchResidentAgentProcess(context->paths, *context->agentSession, launchError)) {
+                AppendDesktopHostLog(*context, "resident perceptrum-agent restarted after local session provisioning");
+            } else {
+                AppendDesktopHostLog(*context, "resident perceptrum-agent start failed: " + launchError);
+            }
+        }
         context->pairingCompleted = true;
         AppendDesktopHostLog(*context, "resident runtime session persisted via WebKit bridge");
     } else {
@@ -1200,6 +1389,7 @@ bool LaunchNativeWebKitWindow(
     const std::string& url,
     const std::string& backendBaseUrl,
     const perceptrum::linux_runtime::RuntimePaths& paths,
+    AgentSession* agentSession,
     std::string& errorMessage)
 {
     errorMessage.clear();
@@ -1211,7 +1401,7 @@ bool LaunchNativeWebKitWindow(
         return false;
     }
 
-    WebKitHostContext context{ url, backendBaseUrl, paths };
+    WebKitHostContext context{ url, backendBaseUrl, paths, agentSession };
     GtkApplication* application = gtk_application_new(
         "ai.perceptrum.desktop",
         G_APPLICATION_DEFAULT_FLAGS);
@@ -1236,6 +1426,7 @@ bool LaunchNativeWebKitWindow(
     const std::string&,
     const std::string&,
     const perceptrum::linux_runtime::RuntimePaths&,
+    AgentSession*,
     std::string& errorMessage)
 {
     errorMessage = "WebKitGTK support was not compiled into this Linux desktop host.";
@@ -1337,14 +1528,29 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    AgentSession agentSession;
+    const auto residentAgentConfig = perceptrum::linux_runtime::ReadAgentConfig(paths);
+    if (residentAgentConfig.has_value() && residentAgentConfig->provisioned) {
+        std::string agentError;
+        if (LaunchResidentAgentProcess(paths, agentSession, agentError)) {
+            if (agentSession.started) {
+                std::cout << "agentStatus=started\n";
+            }
+        } else {
+            std::cerr << "Failed to start resident agent: " << agentError << '\n';
+        }
+    }
+
     if (windowMode != WindowMode::Browser) {
         std::string nativeError;
-        if (LaunchNativeWebKitWindow(launchPlan.launchUrl, launchPlan.backendBaseUrl, paths, nativeError)) {
+        if (LaunchNativeWebKitWindow(launchPlan.launchUrl, launchPlan.backendBaseUrl, paths, &agentSession, nativeError)) {
+            StopOwnedAgent(agentSession);
             StopOwnedBackend(backendSession);
             return 0;
         }
 
         if (windowMode == WindowMode::WebKit) {
+            StopOwnedAgent(agentSession);
             StopOwnedBackend(backendSession);
             std::cerr << "Failed to launch WebKitGTK window: " << nativeError << '\n';
             return 6;
@@ -1356,10 +1562,12 @@ int main(int argc, char** argv) {
 
     if (!LaunchBrowser(launchPlan.launchUrl, errorMessage)) {
         std::cerr << "Failed to launch browser through xdg-open: " << errorMessage << '\n';
+        StopOwnedAgent(agentSession);
         StopOwnedBackend(backendSession);
         return 7;
     }
 
+    perceptrum::platform::CloseProcess(agentSession.processHandle);
     perceptrum::platform::CloseProcess(backendSession.processHandle);
 
     return 0;

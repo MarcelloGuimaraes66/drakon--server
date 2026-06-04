@@ -1,3 +1,4 @@
+import type { TFunction } from "i18next";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useAuth } from "@getmocha/users-service/react";
 import { useTranslation } from "react-i18next";
@@ -120,6 +121,7 @@ function normalizeCameraFindShare(value: unknown): CameraFindShare | null {
     id,
     owner_public_id: typeof row.owner_public_id === "string" ? row.owner_public_id : "",
     invitee_public_id: typeof row.invitee_public_id === "string" ? row.invitee_public_id : "",
+    origin_brand_id: typeof row.origin_brand_id === "string" ? row.origin_brand_id : null,
     owner_local_camera_id: Number(row.owner_local_camera_id || 0),
     camera_name: typeof row.camera_name === "string" ? row.camera_name : "",
     city: typeof row.city === "string" ? row.city : null,
@@ -130,7 +132,33 @@ function normalizeCameraFindShare(value: unknown): CameraFindShare | null {
     accepted_at: typeof row.accepted_at === "string" ? row.accepted_at : null,
     revoked_at: typeof row.revoked_at === "string" ? row.revoked_at : null,
     updated_at: typeof row.updated_at === "string" ? row.updated_at : "",
+    owner_handle: typeof row.owner_handle === "string" ? row.owner_handle : null,
+    owner_email: typeof row.owner_email === "string" ? row.owner_email : null,
+    invitee_handle: typeof row.invitee_handle === "string" ? row.invitee_handle : null,
+    invitee_email: typeof row.invitee_email === "string" ? row.invitee_email : null,
   };
+}
+
+function buildSharedAccountLabel(
+  handle?: string | null,
+  email?: string | null,
+  fallback?: string | null
+) {
+  const normalizedHandle = typeof handle === "string" ? handle.trim().replace(/^@+/, "") : "";
+  if (normalizedHandle) {
+    return `@${normalizedHandle}`;
+  }
+  const normalizedEmail = typeof email === "string" ? email.trim() : "";
+  if (normalizedEmail) {
+    return normalizedEmail;
+  }
+  return typeof fallback === "string" ? fallback.trim() : "";
+}
+
+function translateSharedCameraStatus(status: string, t: TFunction) {
+  const key = `settings.workspaceAccess.status.${String(status || "").toLowerCase()}`;
+  const translated = t(key);
+  return translated === key ? status : translated;
 }
 
 export type CameraEditorCamera = {
@@ -1150,26 +1178,32 @@ export default function CameraEditorModal({
     setShareError(null);
     try {
       const response = await fetch(`/api/shared-find/outgoing?camera_id=${cameraId}`);
-      const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(data?.error || "Failed to load shared find invitations.");
+        throw new Error(await parseApiError(response, t("sharedCameraAccess.errors.load")));
       }
-      setCameraShares(
-        Array.isArray(data?.shares)
-          ? data.shares
-              .map((row: unknown) => normalizeCameraFindShare(row))
-              .filter((row: CameraFindShare | null): row is CameraFindShare => Boolean(row))
-          : []
+      const data = await response.json().catch(() => ({}));
+      const shares = Array.isArray(data?.shares)
+        ? data.shares
+            .map((row: unknown) => normalizeCameraFindShare(row))
+            .filter((row: CameraFindShare | null): row is CameraFindShare => Boolean(row))
+        : [];
+      const visibleShares = shares.filter(
+        (share: CameraFindShare) => share.status !== "revoked" && share.status !== "denied"
       );
-      if (
-        (!Array.isArray(data?.shares) || data.shares.length === 0) &&
-        typeof data?.sync_error === "string" &&
-        data.sync_error.trim()
-      ) {
-        setShareError(data.sync_error);
-      }
+      const syncError =
+        typeof data?.sync_error === "string" && data.sync_error.trim()
+          ? data.sync_error.trim()
+          : null;
+      setCameraShares(visibleShares);
+      setShareError(
+        syncError
+          ? visibleShares.length
+            ? t("sharedCameraAccess.messages.syncStale", { error: syncError })
+            : syncError
+          : null
+      );
     } catch (error) {
-      setShareError(error instanceof Error ? error.message : "Failed to load shared find invitations.");
+      setShareError(error instanceof Error ? error.message : t("sharedCameraAccess.errors.load"));
     } finally {
       setLoadingCameraShares(false);
     }
@@ -1179,7 +1213,7 @@ export default function CameraEditorModal({
     if (!camera) return;
     const query = shareLookupValue.trim();
     if (!query) {
-      setShareError("Enter a @handle or email to invite.");
+      setShareError(t("sharedCameraAccess.errors.queryRequired"));
       return;
     }
 
@@ -1191,16 +1225,13 @@ export default function CameraEditorModal({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query }),
       });
-      const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(data?.error || "Failed to create the shared find invitation.");
+        throw new Error(await parseApiError(response, t("sharedCameraAccess.errors.create")));
       }
       setShareLookupValue("");
       await loadCameraShares(camera.id);
     } catch (error) {
-      setShareError(
-        error instanceof Error ? error.message : "Failed to create the shared find invitation."
-      );
+      setShareError(error instanceof Error ? error.message : t("sharedCameraAccess.errors.create"));
     } finally {
       setCreatingCameraShare(false);
     }
@@ -1214,15 +1245,12 @@ export default function CameraEditorModal({
       const response = await fetch(`/api/shared-find/shares/${shareId}/revoke`, {
         method: "POST",
       });
-      const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(data?.error || "Failed to revoke the shared find invitation.");
+        throw new Error(await parseApiError(response, t("sharedCameraAccess.errors.revoke")));
       }
       await loadCameraShares(camera.id);
     } catch (error) {
-      setShareError(
-        error instanceof Error ? error.message : "Failed to revoke the shared find invitation."
-      );
+      setShareError(error instanceof Error ? error.message : t("sharedCameraAccess.errors.revoke"));
     } finally {
       setRevokingShareId(null);
     }
@@ -2155,9 +2183,11 @@ export default function CameraEditorModal({
                 <div className="md:col-span-2 flex flex-col gap-2">
                   <div className="space-y-3 rounded-2xl border border-gray-800 bg-gray-950/50 p-4">
                     <div>
-                      <p className="text-sm font-medium text-gray-200">Shared Drakon Find Access</p>
+                      <p className="text-sm font-medium text-gray-200">
+                        {t("sharedCameraAccess.title")}
+                      </p>
                       <p className="mt-1 text-xs text-gray-500">
-                        Invite a Perceptrum user by @handle or email so they can use this camera in Drakon Find.
+                        {t("sharedCameraAccess.description")}
                       </p>
                     </div>
 
@@ -2168,7 +2198,7 @@ export default function CameraEditorModal({
                             type="text"
                             value={shareLookupValue}
                             onChange={(event) => setShareLookupValue(event.target.value)}
-                            placeholder="@nickname or email"
+                            placeholder={t("sharedCameraAccess.placeholder")}
                             className="w-full rounded-lg border border-gray-700 bg-gray-800 px-4 py-2.5 text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
                           />
                           <button
@@ -2177,7 +2207,9 @@ export default function CameraEditorModal({
                             disabled={creatingCameraShare}
                             className="rounded-lg bg-blue-500 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-blue-600 disabled:cursor-not-allowed disabled:bg-gray-700"
                           >
-                            {creatingCameraShare ? "Inviting..." : "Invite"}
+                            {creatingCameraShare
+                              ? t("sharedCameraAccess.actions.inviting")
+                              : t("sharedCameraAccess.actions.invite")}
                           </button>
                         </div>
 
@@ -2185,7 +2217,9 @@ export default function CameraEditorModal({
 
                         <div className="space-y-2">
                           {loadingCameraShares ? (
-                            <p className="text-xs text-gray-400">Loading invitations...</p>
+                            <p className="text-xs text-gray-400">
+                              {t("sharedCameraAccess.messages.loading")}
+                            </p>
                           ) : cameraShares.length ? (
                             cameraShares.map((share) => (
                               <div
@@ -2194,12 +2228,22 @@ export default function CameraEditorModal({
                               >
                                 <div>
                                   <p className="text-sm text-gray-200 break-all">
-                                    Invitee: {share.invitee_public_id}
+                                    {t("sharedCameraAccess.labels.sharedWith")}{" "}
+                                    {buildSharedAccountLabel(
+                                      share.invitee_handle,
+                                      share.invitee_email,
+                                      share.invitee_public_id
+                                    )}
                                   </p>
                                   <p className="text-xs text-gray-400">
-                                    Status: {share.status}
-                                    {share.accepted_at ? ` • accepted ${share.accepted_at}` : ""}
+                                    {t("sharedCameraAccess.labels.status")}{" "}
+                                    {translateSharedCameraStatus(share.status, t)}
                                   </p>
+                                  {share.accepted_at ? (
+                                    <p className="text-xs text-gray-500">
+                                      {t("sharedCameraAccess.labels.acceptedAt")} {share.accepted_at}
+                                    </p>
+                                  ) : null}
                                 </div>
                                 <button
                                   type="button"
@@ -2207,20 +2251,22 @@ export default function CameraEditorModal({
                                   disabled={revokingShareId === share.id}
                                   className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-100 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
                                 >
-                                  {revokingShareId === share.id ? "Revoking..." : "Remove access"}
+                                  {revokingShareId === share.id
+                                    ? t("sharedCameraAccess.actions.removing")
+                                    : t("sharedCameraAccess.actions.remove")}
                                 </button>
                               </div>
                             ))
                           ) : (
                             <p className="text-xs text-gray-400">
-                              No shared Drakon Find invitations have been created for this camera yet.
+                              {t("sharedCameraAccess.messages.empty")}
                             </p>
                           )}
                         </div>
                       </>
                     ) : (
                       <p className="text-xs text-gray-400">
-                        Save the camera first to invite authorized users for Drakon Find.
+                        {t("sharedCameraAccess.messages.saveFirst")}
                       </p>
                     )}
                   </div>

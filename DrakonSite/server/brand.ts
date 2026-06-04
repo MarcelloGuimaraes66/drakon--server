@@ -44,6 +44,11 @@ export function resolveDatabaseBackend(brand: ActiveBrandRuntime): DatabaseBacke
     return envValue;
   }
 
+  const runtimeProfile = String(process.env.APP_RUNTIME_ENV || "").trim().toLowerCase();
+  if (runtimeProfile === "server") {
+    return "postgres";
+  }
+
   return brand.id === "perceptrum" ? "sqlite" : "postgres";
 }
 

@@ -18,6 +18,7 @@ declare global {
     R2_PUBLIC_BASE_URL?: string;
     LOCAL_MEDIA_BASE_DIR?: string;
     APP_SERVICE_SESSION_DIR?: string;
+    APP_RUNTIME_DATA_ROOT?: string;
     STORAGE_ROOT?: string;
     CAMERA_RECORDINGS_BASE_DIR?: string;
     APP_ALLOWED_ORIGINS?: string;

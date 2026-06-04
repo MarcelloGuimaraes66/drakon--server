@@ -111,6 +111,7 @@ export function useDashboardAlertRefresh(refresh: () => void) {
         url,
         interval: ALERT_POLL_INTERVAL_MS,
         jitterMaxMs: 500,
+        pauseWhenHidden: false,
         onData: (events: DashboardAlertEvent[]) => {
           if (!Array.isArray(events) || events.length === 0) return;
           const maxId = Math.max(

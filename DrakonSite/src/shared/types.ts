@@ -398,6 +398,8 @@ export interface CameraFindShare {
   updated_at: string;
   owner_handle?: string | null;
   owner_email?: string | null;
+  invitee_handle?: string | null;
+  invitee_email?: string | null;
 }
 
 export interface Algorithm {

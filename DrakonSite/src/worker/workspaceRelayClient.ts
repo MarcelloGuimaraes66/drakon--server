@@ -34,6 +34,14 @@ function normalizeText(value: unknown): string {
   return value.trim();
 }
 
+function buildRedactedRelayErrorSummary(message: Record<string, unknown>) {
+  return {
+    type: normalizeText(message.type) || "relay_error",
+    code: normalizeText(message.code) || null,
+    error: normalizeText(message.error) || normalizeText(message.message) || "relay_error",
+  };
+}
+
 function getWorkspaceRelayConnectionMap() {
   const globalKey = "__workspaceRelayConnectionMap";
   const root = globalThis as any;
@@ -144,7 +152,10 @@ async function openWorkspaceRelaySocket(state: WorkspaceRelayConnectionState) {
       try {
         const message = JSON.parse(String(event.data || "{}")) as Record<string, unknown>;
         if (normalizeText(message.type) === "relay_error") {
-          console.error("[WORKSPACE RELAY] Central relay error:", message);
+          console.error(
+            "[WORKSPACE RELAY] Central relay error:",
+            buildRedactedRelayErrorSummary(message)
+          );
         }
         void state.onMessage(
           {

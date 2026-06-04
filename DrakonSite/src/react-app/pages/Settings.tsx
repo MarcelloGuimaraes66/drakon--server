@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, type MouseEvent } from "react";
 import { useAuth } from "@getmocha/users-service/react";
 import { useLocation, useNavigate } from "react-router";
 import { useTranslation } from "react-i18next";
@@ -115,6 +115,45 @@ function requestDesktopAccountDeletionCleanup(clearStorageRoot: boolean): boolea
     return true;
   } catch (error) {
     console.warn("Failed to request desktop AppData cleanup after account deletion:", error);
+    return false;
+  }
+}
+
+function requestDesktopExternalUrlWindowOpen(input: {
+  url: string;
+  title?: string;
+}): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  const desktopWindow = window as DesktopShellWindow;
+  const webview = desktopWindow.chrome?.webview;
+  if (
+    desktopWindow.__drakonDesktopShell !== true &&
+    !(desktopWindow.chrome && typeof webview !== "undefined")
+  ) {
+    return false;
+  }
+
+  if (!webview || typeof webview.postMessage !== "function") {
+    return false;
+  }
+
+  const url = input.url.trim();
+  if (!url) {
+    return false;
+  }
+
+  try {
+    webview.postMessage({
+      type: "open-external-url-window",
+      url,
+      title: typeof input.title === "string" ? input.title.trim() : "",
+    });
+    return true;
+  } catch (error) {
+    console.warn("Failed to request desktop external URL window:", error);
     return false;
   }
 }
@@ -773,6 +812,15 @@ export default function Settings() {
   const isHandleValid = normalizedHandleValue.length > 0 && !/\s/.test(normalizedHandleValue);
   const zAiProviderLabel = t("settings.apiKeys.providers.zai");
   const openAiProviderLabel = t("settings.apiKeys.providers.openai");
+  const handleApiKeysLinkClick = (
+    event: MouseEvent<HTMLAnchorElement>,
+    url: string,
+    title: string
+  ) => {
+    if (requestDesktopExternalUrlWindowOpen({ url, title })) {
+      event.preventDefault();
+    }
+  };
   const tutorialButtonLabel =
     onboardingStatus === "never_started"
       ? t("tutorial.settingsCard.start")
@@ -1611,6 +1659,13 @@ export default function Settings() {
                 href={zAiKeysUrl}
                 target="_blank"
                 rel="noopener noreferrer"
+                onClick={(event) =>
+                  handleApiKeysLinkClick(
+                    event,
+                    zAiKeysUrl,
+                    t("settings.apiKeys.sectionTitle", { provider: zAiProviderLabel })
+                  )
+                }
                 data-onboarding-target={ONBOARDING_TARGETS.settingsZAiOpenButton}
                 className="inline-flex items-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-2 text-sm font-medium text-cyan-300 transition-colors hover:bg-cyan-500/15 hover:text-cyan-200"
               >
@@ -1736,6 +1791,13 @@ export default function Settings() {
                 href={openAiKeysUrl}
                 target="_blank"
                 rel="noopener noreferrer"
+                onClick={(event) =>
+                  handleApiKeysLinkClick(
+                    event,
+                    openAiKeysUrl,
+                    t("settings.apiKeys.sectionTitle", { provider: openAiProviderLabel })
+                  )
+                }
                 data-onboarding-target={ONBOARDING_TARGETS.settingsOpenAiOpenButton}
                 className="inline-flex items-center gap-2 rounded-lg border border-blue-500/20 bg-blue-500/10 px-3 py-2 text-sm font-medium text-blue-300 transition-colors hover:bg-blue-500/15 hover:text-blue-200"
               >
@@ -1960,7 +2022,5 @@ export default function Settings() {
     </Layout>
   );
 }
-
-
 
 

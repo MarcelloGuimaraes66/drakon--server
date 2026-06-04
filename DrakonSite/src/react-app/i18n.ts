@@ -2089,6 +2089,13 @@ const enPageExtensions: Record<string, string> = {
   "jobs.elapsedTime": "Elapsed time",
   "jobs.previousStep": "Previous Step",
   "jobs.selectStep": "Select step...",
+  "jobs.newStepHint": "Create the next step in the flow and define the maximum runtime.",
+  "jobs.stepNamePlaceholder": "Step name",
+  "jobs.stepMaxRuntime": "Max step runtime",
+  "jobs.stepMaxForJob": "Max for this job: {{value}}",
+  "jobs.saveStep": "Save Step",
+  "jobs.addStepCardHint": "Add a new step to the pipeline and connect cameras, rules, and knowledge sharing.",
+  "jobs.noStepsYetMessage": "No steps yet. Add your first step to begin.",
   "jobs.answerResultKey": "Answer/Result Key",
   "jobs.answerResultPlaceholder": "If a person is seen... or If count > 3...",
   "jobs.targetKey": "Target Key",
@@ -2254,6 +2261,13 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.actions": "Acciones",
     "jobs.open": "Abrir",
     "jobs.cancel": "Cancelar",
+    "jobs.newStepHint": "Crea el siguiente paso del flujo y define el tiempo maximo de ejecucion.",
+    "jobs.stepNamePlaceholder": "Nombre del paso",
+    "jobs.stepMaxRuntime": "Tiempo maximo del paso",
+    "jobs.stepMaxForJob": "Maximo para esta tarea: {{value}}",
+    "jobs.saveStep": "Guardar paso",
+    "jobs.addStepCardHint": "Agrega un nuevo paso al pipeline y conecta camaras, reglas e intercambio de conocimiento.",
+    "jobs.noStepsYetMessage": "Aun no hay pasos. Agrega el primero para comenzar.",
     "jobs.delete": "Eliminar",
     "jobs.timezoneGlobal": "Zona horaria global",
     "jobs.deleteJobTitle": "Eliminar tarea",
@@ -2606,6 +2620,13 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.actions": "Acoes",
     "jobs.open": "Abrir",
     "jobs.cancel": "Cancelar",
+    "jobs.newStepHint": "Crie a proxima etapa do fluxo e defina o tempo maximo de execucao.",
+    "jobs.stepNamePlaceholder": "Nome da etapa",
+    "jobs.stepMaxRuntime": "Tempo maximo da etapa",
+    "jobs.stepMaxForJob": "Maximo para esta tarefa: {{value}}",
+    "jobs.saveStep": "Salvar etapa",
+    "jobs.addStepCardHint": "Adicione uma nova etapa ao pipeline e conecte cameras, regras e compartilhamento de conhecimento.",
+    "jobs.noStepsYetMessage": "Ainda nao ha etapas. Adicione a primeira para comecar.",
     "jobs.delete": "Excluir",
     "jobs.timezoneGlobal": "Fuso horario global",
     "jobs.deleteJobTitle": "Excluir tarefa",
@@ -2967,6 +2988,13 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.actions": "Actions",
     "jobs.open": "Ouvrir",
     "jobs.cancel": "Annuler",
+    "jobs.newStepHint": "Creez l'etape suivante du flux et definissez la duree maximale d'execution.",
+    "jobs.stepNamePlaceholder": "Nom de l'etape",
+    "jobs.stepMaxRuntime": "Duree maximale de l'etape",
+    "jobs.stepMaxForJob": "Maximum pour cette tache : {{value}}",
+    "jobs.saveStep": "Enregistrer l'etape",
+    "jobs.addStepCardHint": "Ajoutez une nouvelle etape au pipeline et connectez cameras, regles et partage de connaissances.",
+    "jobs.noStepsYetMessage": "Aucune etape pour le moment. Ajoutez la premiere pour commencer.",
     "jobs.delete": "Supprimer",
     "jobs.timezoneGlobal": "Fuseau horaire global",
     "jobs.deleteJobTitle": "Supprimer la tache",
@@ -3350,6 +3378,13 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.actions": "操作",
     "jobs.open": "打开",
     "jobs.cancel": "取消",
+    "jobs.newStepHint": "Create the next step in the flow and define the maximum runtime.",
+    "jobs.stepNamePlaceholder": "Step name",
+    "jobs.stepMaxRuntime": "Max step runtime",
+    "jobs.stepMaxForJob": "Max for this job: {{value}}",
+    "jobs.saveStep": "Save Step",
+    "jobs.addStepCardHint": "Add a new step to the pipeline and connect cameras, rules, and knowledge sharing.",
+    "jobs.noStepsYetMessage": "No steps yet. Add your first step to begin.",
     "jobs.delete": "删除",
     "jobs.timezoneGlobal": "全局时区",
     "jobs.deleteJobTitle": "删除任务",
@@ -3683,6 +3718,13 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.actions": "الاجراءات",
     "jobs.open": "فتح",
     "jobs.cancel": "الغاء",
+    "jobs.newStepHint": "Create the next step in the flow and define the maximum runtime.",
+    "jobs.stepNamePlaceholder": "Step name",
+    "jobs.stepMaxRuntime": "Max step runtime",
+    "jobs.stepMaxForJob": "Max for this job: {{value}}",
+    "jobs.saveStep": "Save Step",
+    "jobs.addStepCardHint": "Add a new step to the pipeline and connect cameras, rules, and knowledge sharing.",
+    "jobs.noStepsYetMessage": "No steps yet. Add your first step to begin.",
     "jobs.delete": "حذف",
     "jobs.timezoneGlobal": "المنطقة الزمنية العامة",
     "jobs.deleteJobTitle": "حذف المهمة",
@@ -4871,6 +4913,181 @@ const workspaceAccessTranslations: Record<string, Record<string, string>> = {
   },
 };
 
+const sharedCameraAccessTranslations: Record<string, Record<string, string>> = {
+  en: {
+    "sharedCameraAccess.title": "Shared Access",
+    "sharedCameraAccess.description":
+      "Invite an authorized user by @handle or email so they can use this camera in Drakon Find.",
+    "sharedCameraAccess.placeholder": "@handle or email",
+    "sharedCameraAccess.actions.invite": "Invite",
+    "sharedCameraAccess.actions.inviting": "Inviting...",
+    "sharedCameraAccess.actions.remove": "Remove access",
+    "sharedCameraAccess.actions.removing": "Removing...",
+    "sharedCameraAccess.labels.sharedWith": "Shared with:",
+    "sharedCameraAccess.labels.status": "Status:",
+    "sharedCameraAccess.labels.acceptedAt": "Accepted at:",
+    "sharedCameraAccess.messages.loading": "Loading invitations...",
+    "sharedCameraAccess.messages.empty":
+      "No shared access invitations have been created for this camera yet.",
+    "sharedCameraAccess.messages.saveFirst":
+      "Save the camera first to invite authorized users for shared access.",
+    "sharedCameraAccess.messages.syncStale": "Shared access data may be stale. {{error}}",
+    "sharedCameraAccess.errors.load": "Failed to load shared access invitations.",
+    "sharedCameraAccess.errors.create": "Failed to create the shared access invitation.",
+    "sharedCameraAccess.errors.revoke": "Failed to revoke the shared access invitation.",
+    "sharedCameraAccess.errors.queryRequired": "Enter an @handle or email to invite.",
+  },
+  es: {
+    "sharedCameraAccess.title": "Acceso compartido",
+    "sharedCameraAccess.description":
+      "Invita a un usuario autorizado por @handle o correo para que pueda usar esta camara en Drakon Find.",
+    "sharedCameraAccess.placeholder": "@handle o correo",
+    "sharedCameraAccess.actions.invite": "Invitar",
+    "sharedCameraAccess.actions.inviting": "Invitando...",
+    "sharedCameraAccess.actions.remove": "Quitar acceso",
+    "sharedCameraAccess.actions.removing": "Quitando acceso...",
+    "sharedCameraAccess.labels.sharedWith": "Compartido con:",
+    "sharedCameraAccess.labels.status": "Estado:",
+    "sharedCameraAccess.labels.acceptedAt": "Aceptada el:",
+    "sharedCameraAccess.messages.loading": "Cargando invitaciones...",
+    "sharedCameraAccess.messages.empty":
+      "Todavia no se han creado invitaciones de acceso compartido para esta camara.",
+    "sharedCameraAccess.messages.saveFirst":
+      "Guarda la camara primero para invitar usuarios autorizados al acceso compartido.",
+    "sharedCameraAccess.messages.syncStale":
+      "Los datos de acceso compartido pueden estar desactualizados. {{error}}",
+    "sharedCameraAccess.errors.load": "No se pudieron cargar las invitaciones de acceso compartido.",
+    "sharedCameraAccess.errors.create": "No se pudo crear la invitacion de acceso compartido.",
+    "sharedCameraAccess.errors.revoke": "No se pudo quitar el acceso compartido.",
+    "sharedCameraAccess.errors.queryRequired": "Ingresa un @handle o correo para invitar.",
+  },
+  pt: {
+    "sharedCameraAccess.title": "Acesso compartilhado",
+    "sharedCameraAccess.description":
+      "Convide um usuario autorizado por @handle ou e-mail para que ele possa usar esta camera no Drakon Find.",
+    "sharedCameraAccess.placeholder": "@handle ou e-mail",
+    "sharedCameraAccess.actions.invite": "Convidar",
+    "sharedCameraAccess.actions.inviting": "Convidando...",
+    "sharedCameraAccess.actions.remove": "Remover acesso",
+    "sharedCameraAccess.actions.removing": "Removendo...",
+    "sharedCameraAccess.labels.sharedWith": "Compartilhado com:",
+    "sharedCameraAccess.labels.status": "Status:",
+    "sharedCameraAccess.labels.acceptedAt": "Aceito em:",
+    "sharedCameraAccess.messages.loading": "Carregando convites...",
+    "sharedCameraAccess.messages.empty":
+      "Ainda nao foram criados convites de acesso compartilhado para esta camera.",
+    "sharedCameraAccess.messages.saveFirst":
+      "Salve a camera primeiro para convidar usuarios autorizados para o acesso compartilhado.",
+    "sharedCameraAccess.messages.syncStale":
+      "Os dados de acesso compartilhado podem estar desatualizados. {{error}}",
+    "sharedCameraAccess.errors.load": "Falha ao carregar os convites de acesso compartilhado.",
+    "sharedCameraAccess.errors.create": "Falha ao criar o convite de acesso compartilhado.",
+    "sharedCameraAccess.errors.revoke": "Falha ao revogar o convite de acesso compartilhado.",
+    "sharedCameraAccess.errors.queryRequired": "Digite um @handle ou e-mail para convidar.",
+  },
+  fr: {
+    "sharedCameraAccess.title": "Acces partage",
+    "sharedCameraAccess.description":
+      "Invitez un utilisateur autorise par @handle ou e-mail pour qu'il puisse utiliser cette camera dans Drakon Find.",
+    "sharedCameraAccess.placeholder": "@handle ou e-mail",
+    "sharedCameraAccess.actions.invite": "Inviter",
+    "sharedCameraAccess.actions.inviting": "Invitation...",
+    "sharedCameraAccess.actions.remove": "Retirer l'acces",
+    "sharedCameraAccess.actions.removing": "Retrait...",
+    "sharedCameraAccess.labels.sharedWith": "Partage avec :",
+    "sharedCameraAccess.labels.status": "Statut :",
+    "sharedCameraAccess.labels.acceptedAt": "Acceptee le :",
+    "sharedCameraAccess.messages.loading": "Chargement des invitations...",
+    "sharedCameraAccess.messages.empty":
+      "Aucune invitation d'acces partage n'a encore ete creee pour cette camera.",
+    "sharedCameraAccess.messages.saveFirst":
+      "Enregistrez d'abord la camera pour inviter des utilisateurs autorises a l'acces partage.",
+    "sharedCameraAccess.messages.syncStale":
+      "Les donnees d'acces partage peuvent etre obsoletes. {{error}}",
+    "sharedCameraAccess.errors.load": "Impossible de charger les invitations d'acces partage.",
+    "sharedCameraAccess.errors.create": "Impossible de creer l'invitation d'acces partage.",
+    "sharedCameraAccess.errors.revoke": "Impossible de revoquer l'invitation d'acces partage.",
+    "sharedCameraAccess.errors.queryRequired": "Saisissez un @handle ou un e-mail pour inviter.",
+  },
+  zh: {},
+  ar: {},
+};
+
+const drakonFindSharedAccessTranslations: Record<string, Record<string, string>> = {
+  en: {
+    "drakonFind.sharedAccess.syncWarningTitle": "Shared access sync warning",
+    "drakonFind.sharedAccess.pending.title": "Pending Shared Access Invitations",
+    "drakonFind.sharedAccess.pending.description":
+      "Accept a camera to make it available in your Drakon Find scope.",
+    "drakonFind.sharedAccess.pending.count": "{{count}} pending",
+    "drakonFind.sharedAccess.fields.sharedBy": "Shared by:",
+    "drakonFind.sharedAccess.fields.locationUnavailable": "Location unavailable",
+    "drakonFind.sharedAccess.actions.working": "Working...",
+    "drakonFind.sharedAccess.actions.deny": "Deny",
+    "drakonFind.sharedAccess.actions.accept": "Accept access",
+    "drakonFind.sharedAccess.toast.accepted": "Shared access accepted.",
+    "drakonFind.sharedAccess.toast.denied": "Shared access invitation denied.",
+    "drakonFind.sharedAccess.toast.acceptFailed": "Failed to accept the shared access invitation.",
+    "drakonFind.sharedAccess.toast.denyFailed": "Failed to deny the shared access invitation.",
+  },
+  es: {
+    "drakonFind.sharedAccess.syncWarningTitle": "Advertencia de sincronizacion de acceso compartido",
+    "drakonFind.sharedAccess.pending.title": "Invitaciones de acceso compartido pendientes",
+    "drakonFind.sharedAccess.pending.description":
+      "Acepta una camara para que este disponible en tu alcance de Drakon Find.",
+    "drakonFind.sharedAccess.pending.count": "{{count}} pendientes",
+    "drakonFind.sharedAccess.fields.sharedBy": "Compartida por:",
+    "drakonFind.sharedAccess.fields.locationUnavailable": "Ubicacion no disponible",
+    "drakonFind.sharedAccess.actions.working": "Procesando...",
+    "drakonFind.sharedAccess.actions.deny": "Denegar",
+    "drakonFind.sharedAccess.actions.accept": "Aceptar acceso",
+    "drakonFind.sharedAccess.toast.accepted": "Acceso compartido aceptado.",
+    "drakonFind.sharedAccess.toast.denied": "Invitacion de acceso compartido denegada.",
+    "drakonFind.sharedAccess.toast.acceptFailed":
+      "No se pudo aceptar la invitacion de acceso compartido.",
+    "drakonFind.sharedAccess.toast.denyFailed":
+      "No se pudo denegar la invitacion de acceso compartido.",
+  },
+  pt: {
+    "drakonFind.sharedAccess.syncWarningTitle": "Aviso de sincronizacao de acesso compartilhado",
+    "drakonFind.sharedAccess.pending.title": "Convites de acesso compartilhado pendentes",
+    "drakonFind.sharedAccess.pending.description":
+      "Aceite uma camera para disponibiliza-la no seu escopo do Drakon Find.",
+    "drakonFind.sharedAccess.pending.count": "{{count}} pendentes",
+    "drakonFind.sharedAccess.fields.sharedBy": "Compartilhada por:",
+    "drakonFind.sharedAccess.fields.locationUnavailable": "Localizacao indisponivel",
+    "drakonFind.sharedAccess.actions.working": "Processando...",
+    "drakonFind.sharedAccess.actions.deny": "Recusar",
+    "drakonFind.sharedAccess.actions.accept": "Aceitar acesso",
+    "drakonFind.sharedAccess.toast.accepted": "Acesso compartilhado aceito.",
+    "drakonFind.sharedAccess.toast.denied": "Convite de acesso compartilhado recusado.",
+    "drakonFind.sharedAccess.toast.acceptFailed":
+      "Falha ao aceitar o convite de acesso compartilhado.",
+    "drakonFind.sharedAccess.toast.denyFailed":
+      "Falha ao recusar o convite de acesso compartilhado.",
+  },
+  fr: {
+    "drakonFind.sharedAccess.syncWarningTitle": "Avertissement de synchronisation d'acces partage",
+    "drakonFind.sharedAccess.pending.title": "Invitations d'acces partage en attente",
+    "drakonFind.sharedAccess.pending.description":
+      "Acceptez une camera pour la rendre disponible dans votre portee Drakon Find.",
+    "drakonFind.sharedAccess.pending.count": "{{count}} en attente",
+    "drakonFind.sharedAccess.fields.sharedBy": "Partagee par :",
+    "drakonFind.sharedAccess.fields.locationUnavailable": "Localisation indisponible",
+    "drakonFind.sharedAccess.actions.working": "Traitement...",
+    "drakonFind.sharedAccess.actions.deny": "Refuser",
+    "drakonFind.sharedAccess.actions.accept": "Accepter l'acces",
+    "drakonFind.sharedAccess.toast.accepted": "Acces partage accepte.",
+    "drakonFind.sharedAccess.toast.denied": "Invitation d'acces partage refusee.",
+    "drakonFind.sharedAccess.toast.acceptFailed":
+      "Impossible d'accepter l'invitation d'acces partage.",
+    "drakonFind.sharedAccess.toast.denyFailed":
+      "Impossible de refuser l'invitation d'acces partage.",
+  },
+  zh: {},
+  ar: {},
+};
+
 const accountUsersTranslations: Record<string, Record<string, string>> = {
   en: {
     "settings.tabs.usersRights": "Users & Rights",
@@ -5303,11 +5520,19 @@ for (const [lang, entries] of Object.entries(workspaceAccessTranslations)) {
   Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
 }
 
+for (const [lang, entries] of Object.entries(sharedCameraAccessTranslations)) {
+  Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
+}
+
 for (const [lang, entries] of Object.entries(accountUsersTranslations)) {
   Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
 }
 
 for (const [lang, entries] of Object.entries(drakonFindOverrides)) {
+  Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
+}
+
+for (const [lang, entries] of Object.entries(drakonFindSharedAccessTranslations)) {
   Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
 }
 

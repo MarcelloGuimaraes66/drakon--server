@@ -14,6 +14,7 @@ import {
 type CameraRecordingEnv = Partial<
   Record<
     | "APP_SERVICE_SESSION_DIR"
+    | "APP_RUNTIME_DATA_ROOT"
     | "STORAGE_ROOT"
     | "LOCAL_MEDIA_BASE_DIR"
     | "CAMERA_RECORDINGS_BASE_DIR",
@@ -289,8 +290,8 @@ function parseClipFilename(filename: string, expectedCameraId: number) {
   }
 
   const newPattern =
-    /^([^_]+)_(\d{8})_(\d{6})_(\d{8})_(\d{6})_(10|60)s\.mp4$/i;
-  const legacyPattern = /^([^_]+)_(\d{8})_(\d{6})_(10|60)s\.mp4$/i;
+    /^([^_]+)_(\d{8})_(\d{6})_(\d{8})_(\d{6})_(10|60|300)s\.mp4$/i;
+  const legacyPattern = /^([^_]+)_(\d{8})_(\d{6})_(10|60|300)s\.mp4$/i;
 
   const newMatch = normalized.match(newPattern);
   if (newMatch) {
@@ -470,6 +471,15 @@ async function resolveRecordingRoots(env: CameraRecordingEnv | undefined) {
       "APP_SERVICE_SESSION_DIR"
     );
   }
+
+  addFramesPathCandidate(
+    candidates,
+    seenPaths,
+    pathMod,
+    "runtime_data_frames",
+    readEnvString(env, "APP_RUNTIME_DATA_ROOT"),
+    "APP_RUNTIME_DATA_ROOT"
+  );
 
   const storageRoot = readEnvString(env, "STORAGE_ROOT");
   if (storageRoot) {

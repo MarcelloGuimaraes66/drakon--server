@@ -1,6 +1,7 @@
 import { CSSProperties, RefObject, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { useNavigate } from "react-router";
+import { useTranslation } from "react-i18next";
 import {
   X,
   AlertCircle,
@@ -11,9 +12,12 @@ import {
   CirclePlay,
   Cpu,
   Clock3,
+  Loader2,
+  MapPin,
   Radar,
 } from "lucide-react";
 import { sanitizeAiApiErrorText } from "@/shared/aiApiErrorDisplay";
+import type { CameraFindShare } from "@/shared/types";
 
 interface Notification {
   id: number;
@@ -33,22 +37,92 @@ interface NotificationsDropdownProps {
   isOpen: boolean;
   onClose: () => void;
   anchorRef: RefObject<HTMLElement | null>;
+  onNotificationsChanged?: () => void;
+}
+
+function normalizeCameraFindShare(value: unknown): CameraFindShare | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Partial<CameraFindShare> & Record<string, unknown>;
+  const id = Number(row.id || 0);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  return {
+    id,
+    owner_public_id: typeof row.owner_public_id === "string" ? row.owner_public_id : "",
+    invitee_public_id: typeof row.invitee_public_id === "string" ? row.invitee_public_id : "",
+    origin_brand_id: typeof row.origin_brand_id === "string" ? row.origin_brand_id : null,
+    owner_local_camera_id: Number(row.owner_local_camera_id || 0),
+    camera_name: typeof row.camera_name === "string" ? row.camera_name : "",
+    city: typeof row.city === "string" ? row.city : null,
+    state_code: typeof row.state_code === "string" ? row.state_code : null,
+    country_code: typeof row.country_code === "string" ? row.country_code : "BR",
+    status: typeof row.status === "string" ? row.status : "pending",
+    created_at: typeof row.created_at === "string" ? row.created_at : "",
+    accepted_at: typeof row.accepted_at === "string" ? row.accepted_at : null,
+    revoked_at: typeof row.revoked_at === "string" ? row.revoked_at : null,
+    updated_at: typeof row.updated_at === "string" ? row.updated_at : "",
+    owner_handle: typeof row.owner_handle === "string" ? row.owner_handle : null,
+    owner_email: typeof row.owner_email === "string" ? row.owner_email : null,
+    invitee_handle: typeof row.invitee_handle === "string" ? row.invitee_handle : null,
+    invitee_email: typeof row.invitee_email === "string" ? row.invitee_email : null,
+  };
+}
+
+function buildSharedAccountLabel(
+  handle?: string | null,
+  email?: string | null,
+  fallback?: string | null
+) {
+  const normalizedHandle = typeof handle === "string" ? handle.trim().replace(/^@+/, "") : "";
+  if (normalizedHandle) {
+    return `@${normalizedHandle}`;
+  }
+  const normalizedEmail = typeof email === "string" ? email.trim() : "";
+  if (normalizedEmail) {
+    return normalizedEmail;
+  }
+  return typeof fallback === "string" ? fallback.trim() : "";
+}
+
+function formatSharedLocation(share: CameraFindShare, fallbackLabel: string) {
+  const parts = [share.city, share.state_code, share.country_code]
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter(Boolean);
+  return parts.length ? parts.join(", ") : fallbackLabel;
+}
+
+function formatProgramLabel(value?: string | null) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (normalized === "drakon") return "Drakon";
+  if (normalized === "perceptrum") return "Perceptrum";
+  if (!normalized) return "";
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }
 
 export default function NotificationsDropdown({
   isOpen,
   onClose,
   anchorRef,
+  onNotificationsChanged,
 }: NotificationsDropdownProps) {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [panelStyle, setPanelStyle] = useState<CSSProperties>({});
+  const [activeSharedInvitation, setActiveSharedInvitation] =
+    useState<CameraFindShare | null>(null);
+  const [activeSharedInvitationNotification, setActiveSharedInvitationNotification] =
+    useState<Notification | null>(null);
+  const [isSharedInvitationOpen, setIsSharedInvitationOpen] = useState(false);
+  const [isSharedInvitationLoading, setIsSharedInvitationLoading] = useState(false);
+  const [sharedInvitationError, setSharedInvitationError] = useState<string | null>(null);
+  const [sharedInvitationAction, setSharedInvitationAction] = useState<"accept" | "deny" | null>(
+    null
+  );
 
   useEffect(() => {
     if (isOpen) {
-      fetchNotifications();
-      markAsRead();
+      void hydrateNotifications();
     }
   }, [isOpen]);
 
@@ -92,7 +166,6 @@ export default function NotificationsDropdown({
   }, [anchorRef, isOpen]);
 
   const fetchNotifications = async () => {
-    setIsLoading(true);
     try {
       const response = await fetch("/api/notifications");
       if (response.ok) {
@@ -101,8 +174,6 @@ export default function NotificationsDropdown({
       }
     } catch (error) {
       console.error("Failed to fetch notifications:", error);
-    } finally {
-      setIsLoading(false);
     }
   };
 
@@ -113,8 +184,129 @@ export default function NotificationsDropdown({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ all: true }),
       });
+      onNotificationsChanged?.();
     } catch (error) {
       console.error("Failed to mark notifications as read:", error);
+    }
+  };
+
+  const syncSharedInvitationNotifications = async () => {
+    try {
+      await fetch("/api/shared-find/sync", { method: "POST" });
+      onNotificationsChanged?.();
+    } catch (error) {
+      console.error("Failed to sync shared camera notifications:", error);
+    }
+  };
+
+  const hydrateNotifications = async () => {
+    setIsLoading(true);
+    try {
+      await syncSharedInvitationNotifications();
+      await fetchNotifications();
+      await markAsRead();
+      await fetchNotifications();
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const loadSharedInvitationByShareId = async (shareId: number) => {
+    const response = await fetch("/api/shared-find/incoming");
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(
+        sanitizeAiApiErrorText(
+          typeof data?.error === "string" && data.error.trim()
+            ? data.error
+            : typeof data?.sync_error === "string" && data.sync_error.trim()
+              ? data.sync_error
+              : t("sharedCameraAccess.errors.load")
+        )
+      );
+    }
+    const shares = Array.isArray(data?.shares)
+      ? data.shares
+          .map((row: unknown) => normalizeCameraFindShare(row))
+          .filter((row: CameraFindShare | null): row is CameraFindShare => Boolean(row))
+      : [];
+    return shares.find((share: CameraFindShare) => share.id === shareId) || null;
+  };
+
+  const openSharedInvitation = async (notification: Notification) => {
+    const shareId = Number(notification.event_id || 0);
+    if (!Number.isInteger(shareId) || shareId <= 0) {
+      return;
+    }
+
+    setActiveSharedInvitation(null);
+    setActiveSharedInvitationNotification(notification);
+    setSharedInvitationError(null);
+    setIsSharedInvitationLoading(true);
+    setIsSharedInvitationOpen(true);
+
+    try {
+      const share = await loadSharedInvitationByShareId(shareId);
+      if (!share || share.status !== "pending") {
+        await fetchNotifications();
+        onNotificationsChanged?.();
+        throw new Error(t("drakonFind.sharedAccess.toast.denyFailed"));
+      }
+      setActiveSharedInvitation(share);
+    } catch (error) {
+      setSharedInvitationError(
+        sanitizeAiApiErrorText(
+          error instanceof Error && error.message
+            ? error.message
+            : t("sharedCameraAccess.errors.load")
+        )
+      );
+    } finally {
+      setIsSharedInvitationLoading(false);
+    }
+  };
+
+  const closeSharedInvitation = () => {
+    setIsSharedInvitationOpen(false);
+    setActiveSharedInvitation(null);
+    setActiveSharedInvitationNotification(null);
+    setSharedInvitationError(null);
+    setSharedInvitationAction(null);
+  };
+
+  const handleSharedInvitationAction = async (action: "accept" | "deny") => {
+    if (!activeSharedInvitation) return;
+
+    const fallbackErrorMessage =
+      action === "accept"
+        ? t("drakonFind.sharedAccess.toast.acceptFailed")
+        : t("drakonFind.sharedAccess.toast.denyFailed");
+
+    setSharedInvitationAction(action);
+    setSharedInvitationError(null);
+    try {
+      const response = await fetch(`/api/shared-find/shares/${activeSharedInvitation.id}/${action}`, {
+        method: "POST",
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(
+          sanitizeAiApiErrorText(
+            typeof data?.error === "string" && data.error.trim() ? data.error : fallbackErrorMessage
+          )
+        );
+      }
+      await fetchNotifications();
+      onNotificationsChanged?.();
+      closeSharedInvitation();
+    } catch (error) {
+      setSharedInvitationError(
+        sanitizeAiApiErrorText(
+          error instanceof Error && error.message ? error.message : fallbackErrorMessage
+        )
+      );
+    } finally {
+      setSharedInvitationAction(null);
     }
   };
 
@@ -214,7 +406,7 @@ export default function NotificationsDropdown({
     }
     if (type === "shared_find_invitation") {
       return {
-        label: "Find",
+        label: "Share",
         className: "bg-amber-500/20 text-amber-200",
       };
     }
@@ -243,9 +435,6 @@ export default function NotificationsDropdown({
     if (notification.type === "agent_api_error") {
       return notification.camera_id ? "/ai-agents" : "/jobs";
     }
-    if (notification.type === "shared_find_invitation") {
-      return "/drakon-find";
-    }
     return null;
   };
 
@@ -255,7 +444,7 @@ export default function NotificationsDropdown({
     const diffMs = now.getTime() - date.getTime();
     const diffMins = Math.floor(diffMs / 60000);
 
-    if (diffMins < 1) return "Just now";
+    if (diffMins < 1) return t("notifications.justNow");
     if (diffMins < 60) return `${diffMins}m ago`;
     if (diffMins < 1440) return `${Math.floor(diffMins / 60)}h ago`;
     return date.toLocaleDateString();
@@ -274,8 +463,14 @@ export default function NotificationsDropdown({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ids: [notification.id] }),
       });
+      onNotificationsChanged?.();
     } catch (error) {
       console.error("Failed to mark notification as read:", error);
+    }
+
+    if (notification.type === "shared_find_invitation") {
+      await openSharedInvitation(notification);
+      return;
     }
 
     const target = getNotificationTarget(notification);
@@ -297,12 +492,12 @@ export default function NotificationsDropdown({
 
       {/* Dropdown panel */}
       <div
-        className="fixed z-[101] flex w-96 max-w-[calc(100vw-2rem)] flex-col rounded-xl border border-gray-800 bg-gray-900 shadow-2xl"
+        className="fluent-flyout fixed z-[101] flex w-96 max-w-[calc(100vw-2rem)] flex-col rounded-lg border"
         style={panelStyle}
       >
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-gray-800">
-          <h3 className="text-lg font-semibold text-gray-100">Notifications</h3>
+          <h3 className="text-lg font-semibold text-gray-100">{t("notifications.title")}</h3>
           <button
             onClick={onClose}
             className="p-1 text-gray-400 hover:text-gray-200 hover:bg-gray-800 rounded-lg transition-colors"
@@ -315,19 +510,22 @@ export default function NotificationsDropdown({
         <div className="flex-1 overflow-y-auto">
           {isLoading ? (
             <div className="p-8 text-center text-gray-500">
-              Loading notifications...
+              {t("notifications.loading")}
             </div>
           ) : notifications.length === 0 ? (
             <div className="p-8 text-center">
               <AlertCircle className="w-12 h-12 text-gray-600 mx-auto mb-3" />
-              <p className="text-gray-500">No notifications</p>
+              <p className="text-gray-500">{t("notifications.noNotifications")}</p>
             </div>
           ) : (
             <div className="divide-y divide-gray-800">
               {notifications.map((notification) => {
                 const badge = getNotificationBadge(notification.type);
                 const target = getNotificationTarget(notification);
-                const isClickable = !!target;
+                const isClickable =
+                  notification.type === "shared_find_invitation"
+                    ? Number(notification.event_id || 0) > 0
+                    : !!target;
                 const displayTitle = sanitizeAiApiErrorText(notification.title);
                 const displayMessage = notification.message
                   ? sanitizeAiApiErrorText(notification.message)
@@ -427,6 +625,119 @@ export default function NotificationsDropdown({
           )}
         </div>
       </div>
+
+      {isSharedInvitationOpen ? (
+        <div className="fluent-modal-backdrop fixed inset-0 z-[102] flex items-center justify-center px-4 py-6">
+          <div className="fluent-modal-panel w-full max-w-lg rounded-lg border p-6">
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="fluent-status-warning inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em]">
+                  <Radar className="h-3.5 w-3.5" />
+                  {t("sharedCameraAccess.title")}
+                </div>
+                <h3 className="mt-3 text-lg font-semibold text-gray-100">
+                  {sanitizeAiApiErrorText(
+                    activeSharedInvitationNotification?.title ||
+                      t("drakonFind.sharedAccess.pending.title")
+                  )}
+                </h3>
+                {activeSharedInvitationNotification?.message ? (
+                  <p className="mt-2 text-sm leading-6 text-gray-300">
+                    {sanitizeAiApiErrorText(activeSharedInvitationNotification.message)}
+                  </p>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                onClick={closeSharedInvitation}
+                className="fluent-toolbar-button rounded-lg border p-2 transition-colors"
+                aria-label={t("jobs.promptEditor.closePromptEditorAria")}
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {isSharedInvitationLoading ? (
+              <div className="flex min-h-[180px] items-center justify-center text-gray-300">
+                <Loader2 className="mr-3 h-5 w-5 animate-spin" />
+                <span>{t("notifications.loading")}</span>
+              </div>
+            ) : activeSharedInvitation ? (
+              <div className="space-y-4">
+                <div className="fluent-panel rounded-lg border p-4">
+                  <p className="text-sm font-medium text-gray-100">
+                    {activeSharedInvitation.camera_name || t("drakonFind.generic.unnamedCamera")}
+                  </p>
+                  <p className="mt-1 text-xs text-gray-400">
+                    {formatSharedLocation(
+                      activeSharedInvitation,
+                      t("drakonFind.sharedAccess.fields.locationUnavailable")
+                    )}
+                  </p>
+                  <p className="mt-2 text-xs text-gray-500 break-all">
+                    {t("drakonFind.sharedAccess.fields.sharedBy")}{" "}
+                    {buildSharedAccountLabel(
+                      activeSharedInvitation.owner_handle,
+                      activeSharedInvitation.owner_email,
+                      activeSharedInvitation.owner_public_id
+                    )}
+                  </p>
+                  {activeSharedInvitation.origin_brand_id ? (
+                    <div className="fluent-status-warning mt-3 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em]">
+                      <MapPin className="h-3.5 w-3.5" />
+                      {formatProgramLabel(activeSharedInvitation.origin_brand_id)}
+                    </div>
+                  ) : null}
+                </div>
+
+                {sharedInvitationError ? (
+                  <div className="fluent-status-danger rounded-lg border px-4 py-3 text-sm">
+                    {sharedInvitationError}
+                  </div>
+                ) : null}
+
+                <div className="flex flex-wrap justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void handleSharedInvitationAction("deny")}
+                    disabled={sharedInvitationAction !== null}
+                    className="fluent-toolbar-button rounded-lg border px-4 py-2 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {sharedInvitationAction === "deny"
+                      ? t("drakonFind.sharedAccess.actions.working")
+                      : t("drakonFind.sharedAccess.actions.deny")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleSharedInvitationAction("accept")}
+                    disabled={sharedInvitationAction !== null}
+                    className="fluent-primary-button rounded-lg border px-4 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {sharedInvitationAction === "accept"
+                      ? t("drakonFind.sharedAccess.actions.working")
+                      : t("drakonFind.sharedAccess.actions.accept")}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="fluent-status-danger rounded-lg border px-4 py-3 text-sm">
+                  {sharedInvitationError || t("sharedCameraAccess.errors.load")}
+                </div>
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={closeSharedInvitation}
+                    className="fluent-toolbar-button rounded-lg border px-4 py-2 text-sm transition-colors"
+                  >
+                    {t("jobs.cancel")}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : null}
     </>
     ,
     document.body

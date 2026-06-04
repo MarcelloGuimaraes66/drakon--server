@@ -47,6 +47,7 @@ import {
 } from "@/react-app/utils/cameraCaptureAcceleration";
 import {
   describeCameraStartBlockedError,
+  describeCameraStartFailureError,
   toggleCameraService,
 } from "@/react-app/utils/cameraService";
 import {
@@ -562,6 +563,29 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
           title: blockedToast.title,
           message: blockedToast.message,
           type: "camera_start_blocked",
+        });
+      } else if (!isRunning) {
+        const failureToast = describeCameraStartFailureError(
+          error,
+          typeof camera.name === "string" ? camera.name : `Camera #${camera.id}`
+        );
+        pushToast({
+          cameraId: camera.id,
+          cameraName:
+            typeof camera.name === "string" && camera.name.trim()
+              ? camera.name.trim()
+              : `Camera #${camera.id}`,
+          title: failureToast.title,
+          message: failureToast.message,
+          type: "agent_api_error",
+        });
+        patchCamera(camera.id, {
+          is_service_running: 0,
+          is_online: 0,
+        });
+        dashboardSummaryStore.patchCameraLocal(camera.id, {
+          is_service_running: 0,
+          is_online: 0,
         });
       }
       console.error("Failed to toggle service:", error);

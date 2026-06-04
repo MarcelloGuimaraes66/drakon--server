@@ -286,10 +286,13 @@
   --fluent-accent-border: rgba(74, 149, 255, 0.36);
   --fluent-success-bg: rgba(16, 185, 129, 0.12);
   --fluent-success-border: rgba(16, 185, 129, 0.28);
+  --fluent-success-text: #8ee6c3;
   --fluent-warning-bg: rgba(245, 158, 11, 0.12);
   --fluent-warning-border: rgba(245, 158, 11, 0.28);
+  --fluent-warning-text: #f8d58a;
   --fluent-danger-bg: rgba(239, 68, 68, 0.12);
   --fluent-danger-border: rgba(239, 68, 68, 0.3);
+  --fluent-danger-text: #f7a8a8;
   --fluent-shadow-card: none;
   --fluent-shadow-flyout: 0 18px 38px -26px rgba(0, 0, 0, 0.92);
   --fluent-radius-card: 8px;
@@ -330,10 +333,13 @@ body {
   --fluent-accent-border: rgba(37, 99, 235, 0.24);
   --fluent-success-bg: rgba(5, 150, 105, 0.1);
   --fluent-success-border: rgba(5, 150, 105, 0.22);
+  --fluent-success-text: #047857;
   --fluent-warning-bg: rgba(217, 119, 6, 0.1);
   --fluent-warning-border: rgba(217, 119, 6, 0.24);
+  --fluent-warning-text: #9a5a00;
   --fluent-danger-bg: rgba(220, 38, 38, 0.1);
   --fluent-danger-border: rgba(220, 38, 38, 0.24);
+  --fluent-danger-text: #b91c1c;
   --fluent-shadow-card: none;
   --fluent-shadow-flyout: 0 18px 38px -28px rgba(15, 23, 42, 0.35);
 }
@@ -407,6 +413,17 @@ body {
   background: var(--fluent-control-bg-hover);
   border-color: var(--fluent-control-border-strong);
   color: var(--fluent-text-primary);
+}
+
+.fluent-primary-button {
+  background: var(--fluent-accent-strong);
+  border-color: var(--fluent-control-border-strong);
+  color: #ffffff;
+}
+
+.fluent-primary-button:hover {
+  background: var(--fluent-accent);
+  color: #ffffff;
 }
 
 .fluent-segmented-active {
@@ -499,6 +516,24 @@ body {
   border-color: var(--fluent-divider);
 }
 
+.fluent-status-success {
+  background: var(--fluent-success-bg);
+  border-color: var(--fluent-success-border);
+  color: var(--fluent-success-text);
+}
+
+.fluent-status-warning {
+  background: var(--fluent-warning-bg);
+  border-color: var(--fluent-warning-border);
+  color: var(--fluent-warning-text);
+}
+
+.fluent-status-danger {
+  background: var(--fluent-danger-bg);
+  border-color: var(--fluent-danger-border);
+  color: var(--fluent-danger-text);
+}
+
 .fluent-internal-content {
   background: var(--fluent-content-bg);
   color: var(--fluent-text-primary);
@@ -524,10 +559,14 @@ body {
   [class*="to-blue-"],
   [class*="from-cyan-"],
   [class*="to-cyan-"],
+  [class*="from-purple-"],
+  [class*="to-purple-"],
   .bg-blue-500,
   .bg-blue-600,
   .bg-cyan-500,
-  .bg-cyan-600
+  .bg-cyan-600,
+  .bg-purple-500,
+  .bg-purple-600
 ) {
   background-color: var(--fluent-accent-strong) !important;
   color: #ffffff !important;
@@ -624,6 +663,8 @@ body {
   .bg-blue-600,
   .bg-cyan-500,
   .bg-cyan-600,
+  .bg-purple-500,
+  .bg-purple-600,
   .fluent-tab-active
 ) {
   color: #ffffff !important;
@@ -635,6 +676,7 @@ body {
 ) {
   background-color: var(--fluent-success-bg) !important;
   border-color: var(--fluent-success-border) !important;
+  color: var(--fluent-success-text) !important;
 }
 
 .fluent-internal-content :where(
@@ -644,6 +686,7 @@ body {
 ) {
   background-color: var(--fluent-warning-bg) !important;
   border-color: var(--fluent-warning-border) !important;
+  color: var(--fluent-warning-text) !important;
 }
 
 .fluent-internal-content :where(
@@ -652,6 +695,101 @@ body {
 ) {
   background-color: var(--fluent-danger-bg) !important;
   border-color: var(--fluent-danger-border) !important;
+  color: var(--fluent-danger-text) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="border-blue-"],
+  [class*="border-cyan-"],
+  [class*="border-purple-"]
+) {
+  border-color: var(--fluent-accent-border) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="border-emerald-"],
+  [class*="border-green-"]
+) {
+  border-color: var(--fluent-success-border) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="border-amber-"],
+  [class*="border-yellow-"],
+  [class*="border-orange-"]
+) {
+  border-color: var(--fluent-warning-border) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="border-red-"],
+  [class*="border-rose-"]
+) {
+  border-color: var(--fluent-danger-border) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="text-blue-"],
+  [class*="text-cyan-"],
+  [class*="text-purple-"],
+  .text-blue-100,
+  .text-blue-200,
+  .text-blue-300,
+  .text-blue-400,
+  .text-cyan-100,
+  .text-cyan-200,
+  .text-cyan-300,
+  .text-cyan-400,
+  .text-purple-100,
+  .text-purple-200
+) {
+  color: var(--fluent-accent) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="text-emerald-"],
+  [class*="text-green-"],
+  .text-emerald-100,
+  .text-emerald-200,
+  .text-emerald-300,
+  .text-emerald-400,
+  .text-green-100,
+  .text-green-200,
+  .text-green-300,
+  .text-green-400
+) {
+  color: var(--fluent-success-text) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="text-amber-"],
+  [class*="text-yellow-"],
+  [class*="text-orange-"],
+  .text-amber-100,
+  .text-amber-200,
+  .text-amber-300,
+  .text-amber-400,
+  .text-yellow-100,
+  .text-yellow-200,
+  .text-orange-100,
+  .text-orange-200
+) {
+  color: var(--fluent-warning-text) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="text-red-"],
+  [class*="text-rose-"],
+  .text-red-100,
+  .text-red-200,
+  .text-red-300,
+  .text-red-400,
+  .text-rose-100,
+  .text-rose-200,
+  .text-rose-300,
+  .text-rose-400
+) {
+  color: var(--fluent-danger-text) !important;
 }
 
 .fluent-internal-content :where(
@@ -665,10 +803,13 @@ body {
 .fluent-internal-content :where(
   [class*="rounded-2xl"],
   [class*="rounded-3xl"],
+  [class*="rounded-xl"],
   [class*="rounded-[24px]"],
   [class*="rounded-[26px]"],
   [class*="rounded-[28px]"],
-  [class*="rounded-[30px]"]
+  [class*="rounded-[30px]"],
+  [class*="rounded-[32px]"],
+  [class*="rounded-[34px]"]
 ) {
   border-radius: var(--fluent-radius-card) !important;
 }

@@ -620,7 +620,7 @@ static std::string redactSensitiveFieldsInLog(const std::string& message) {
     out = redactSensitiveRtspInLog(out);
 
     // JSON-like sensitive fields in payload/cmd logs.
-    static constexpr std::array<const char*, 29> kJsonSensitiveKeys = {
+    static constexpr std::array<const char*, 43> kJsonSensitiveKeys = {
         "password",
         "passwd",
         "pwd",
@@ -639,6 +639,20 @@ static std::string redactSensitiveFieldsInLog(const std::string& message) {
         "apikey",
         "token",
         "access_token",
+        "refresh_token",
+        "session_token",
+        "exe_token",
+        "exe-token",
+        "grant_token",
+        "central_grant_token",
+        "central_device_session_token",
+        "workspace_token",
+        "relay_token",
+        "authorization",
+        "cookie",
+        "set-cookie",
+        "client_secret",
+        "oauth_secret",
         "telegram_bot_token",
         "telegramBotToken",
         "bot_token",
@@ -657,7 +671,7 @@ static std::string redactSensitiveFieldsInLog(const std::string& message) {
     }
 
     // key=value patterns that may appear outside JSON.
-    static constexpr std::array<const char*, 18> kEqualsSensitiveKeys = {
+    static constexpr std::array<const char*, 32> kEqualsSensitiveKeys = {
         "password",
         "passwd",
         "pwd",
@@ -671,6 +685,20 @@ static std::string redactSensitiveFieldsInLog(const std::string& message) {
         "validator_model_api_key",
         "router_api_key",
         "token",
+        "access_token",
+        "refresh_token",
+        "session_token",
+        "exe_token",
+        "exe-token",
+        "grant_token",
+        "central_grant_token",
+        "central_device_session_token",
+        "workspace_token",
+        "relay_token",
+        "authorization",
+        "cookie",
+        "client_secret",
+        "oauth_secret",
         "telegram_bot_token",
         "telegram_chat_id",
         "z_ai_api_key",

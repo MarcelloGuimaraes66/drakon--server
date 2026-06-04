@@ -9,10 +9,13 @@
 #include "../Perceptrum/runtime/interfaces/ITokenStore.h"
 
 #include <string_view>
+#include <string>
 #include <memory>
 #include <optional>
 
 namespace perceptrum::linux_runtime {
+
+class LinuxJobRuntime;
 
 struct LinuxFeatureGates {
     bool agentCore = false;
@@ -67,6 +70,7 @@ private:
 class LinuxMinimalAgentRuntime final : public perceptrum::runtime::IAgentRuntime {
 public:
     LinuxMinimalAgentRuntime(RuntimePaths paths, perceptrum::runtime::IRuntimeLogger* logger);
+    ~LinuxMinimalAgentRuntime() override;
 
     bool start() override;
     void stop() noexcept override;
@@ -77,8 +81,10 @@ private:
 
     RuntimePaths paths_;
     perceptrum::runtime::IRuntimeLogger* logger_ = nullptr;
+    LinuxTokenStore tokenStore_;
     LinuxFeatureGates gates_;
     perceptrum::runtime::AgentRuntimeStatus status_;
+    std::unique_ptr<LinuxJobRuntime> jobRuntime_;
 };
 
 class LinuxMinimalAgentCoreFactory final : public perceptrum::runtime::IAgentCoreFactory {
@@ -97,5 +103,6 @@ private:
 
 LinuxFeatureGates ResolveLinuxFeatureGates();
 perceptrum::runtime::RuntimeRoots ToRuntimeRoots(const RuntimePaths& paths);
+std::string RedactSensitiveRuntimeText(std::string_view text);
 
 } // namespace perceptrum::linux_runtime

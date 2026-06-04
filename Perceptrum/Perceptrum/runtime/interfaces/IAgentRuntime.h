@@ -25,6 +25,7 @@ struct AgentRuntimeStatus {
     bool rtspCameraStarted = false;
     bool rtspThumbnailGenerated = false;
     bool rtspEventPublished = false;
+    bool cameraRecordingClipGenerated = false;
     std::string mode = "linux_minimal";
     std::string runtimeName = "linux_minimal_agent_runtime";
     std::string integrationStatus = "linux_minimal_runtime_ready";
@@ -35,6 +36,23 @@ struct AgentRuntimeStatus {
     std::string rtspThumbnailPath;
     std::string rtspEventPath;
     std::string rtspLastError;
+    std::string cameraThumbnailRoot;
+    std::string cameraRecordingsRoot;
+    std::string cameraRecordingClipPaths;
+    std::string cameraRecordingProfiles;
+    std::string inferenceTempRoot;
+    std::string jobsInferenceTempRoot;
+    std::string jobRuntimeLastCommandType;
+    std::string jobRuntimeLastError;
+    std::string jobRuntimeLlmProvider;
+    std::string cameraSessionStatusJson;
+    int jobRuntimeCommandsPolled = 0;
+    int jobRuntimeCommandsCompleted = 0;
+    int jobRuntimeCommandsFailed = 0;
+    std::string agentCorePathAdapter;
+    std::string agentCoreHttpClient;
+    std::string agentCoreClock;
+    std::string agentCoreLifecycle;
     AgentCoreStatusContract agentCoreStatus;
 };
 

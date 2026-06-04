@@ -12,8 +12,12 @@ OutputBaseFilename={#MyOutputBaseFilename}
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
+ShowLanguageDialog=no
 SetupIconFile=..\stage\runtime\branding\app.ico
 UninstallDisplayIcon={app}\runtime\branding\app.ico
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 Source: "..\stage\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "prereqs\*"
@@ -28,7 +32,7 @@ Name: "{autodesktop}\{#MyShortcutName}"; Filename: "{app}\{#MyExeName}"; Working
 Name: "desktopicon"; Description: "Create desktop shortcuts"; GroupDescription: "Additional icons:"
 
 [Run]
-Filename: "{app}\{#MyExeName}"; Description: "Abrir {#MyAppName}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyExeName}"; Description: "Launch {#MyAppName}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 const
@@ -284,9 +288,9 @@ procedure CurPageChanged(CurPageID: Integer);
 begin
   if CurPageID = wpFinished then
   begin
-    WizardForm.FinishedHeadingLabel.Caption := 'Instalacao concluida';
-    WizardForm.FinishedLabel.Caption := 'Clique em Concluir para sair do instalador.';
-    WizardForm.NextButton.Caption := '&Concluir';
+    WizardForm.FinishedHeadingLabel.Caption := 'Installation completed';
+    WizardForm.FinishedLabel.Caption := 'Click Finish to exit the installer.';
+    WizardForm.NextButton.Caption := '&Finish';
   end;
 end;
 

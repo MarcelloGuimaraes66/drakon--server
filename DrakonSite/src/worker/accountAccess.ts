@@ -554,7 +554,7 @@ export async function ensureSelfAccountMembership(
            created_at,
            updated_at
          )
-         VALUES (?, ?, 'owner', 'active', 'self_service', TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, 'all', 'all', 'all', 'all', 'all', 'all', ?, ?, ?, ?)
+         VALUES (?, ?, 'owner', 'active', 'self_service', 1, 1, 1, 1, 1, 1, 1, 'all', 'all', 'all', 'all', 'all', 'all', ?, ?, ?, ?)
          ON CONFLICT (member_user_id) DO NOTHING`
       )
       .bind(

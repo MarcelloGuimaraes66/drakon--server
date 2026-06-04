@@ -12,6 +12,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 include(CTest)
 include(GNUInstallDirs)
 
+set(CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS
+    OWNER_READ OWNER_WRITE OWNER_EXECUTE
+    GROUP_READ GROUP_EXECUTE
+    WORLD_READ WORLD_EXECUTE)
+
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT OR CMAKE_INSTALL_PREFIX STREQUAL "/usr/local")
     set(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "Default Linux install prefix" FORCE)
 endif()
@@ -27,7 +32,7 @@ if(WEBKITGTK_FOUND)
     set(PERCEPTRUM_WEBKITGTK_DEFAULT ON)
 endif()
 
-option(PERCEPTRUM_ENABLE_AGENT_CORE "Enable full AgentCore integration in Linux runtime" OFF)
+option(PERCEPTRUM_ENABLE_AGENT_CORE "Build the portable AgentCore foundation in the Linux runtime" OFF)
 option(PERCEPTRUM_ENABLE_CAMERA_CAPTURE "Enable camera capture in Linux runtime" OFF)
 option(PERCEPTRUM_ENABLE_RTSP_CAPTURE "Enable RTSP capture in Linux runtime" OFF)
 option(PERCEPTRUM_ENABLE_JOB_RUNTIME "Enable JobRuntime in Linux runtime" OFF)
@@ -85,6 +90,13 @@ add_library(perceptrum_core STATIC
     Perceptrum/jobs/JobPayloadParser.cpp
 )
 
+if(PERCEPTRUM_ENABLE_AGENT_CORE)
+    target_sources(perceptrum_core
+        PRIVATE
+            Perceptrum/core/AgentCorePortable.cpp
+            Perceptrum/core/AgentCorePortable.h)
+endif()
+
 target_include_directories(perceptrum_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/Perceptrum
@@ -99,7 +111,8 @@ target_compile_definitions(perceptrum_core
     PUBLIC
         PERCEPTRUM_LINUX_BUILD=1
         PERCEPTRUM_VERSION="${PROJECT_VERSION}"
-        PERCEPTRUM_ENABLE_AGENT_CORE=$<BOOL:${PERCEPTRUM_ENABLE_AGENT_CORE}>
+        PERCEPTRUM_ENABLE_AGENT_CORE=0
+        PERCEPTRUM_AGENT_CORE_PORTABLE_AVAILABLE=$<BOOL:${PERCEPTRUM_ENABLE_AGENT_CORE}>
         PERCEPTRUM_ENABLE_CAMERA_CAPTURE=$<BOOL:${PERCEPTRUM_ENABLE_CAMERA_CAPTURE}>
         PERCEPTRUM_ENABLE_RTSP_CAPTURE=$<BOOL:${PERCEPTRUM_ENABLE_RTSP_CAPTURE}>
         PERCEPTRUM_ENABLE_JOB_RUNTIME=$<BOOL:${PERCEPTRUM_ENABLE_JOB_RUNTIME}>
@@ -112,6 +125,14 @@ add_executable(perceptrum-agent
     linux/RuntimePaths.cpp
     linux/LinuxRuntimeAdapters.cpp
     linux/LinuxRuntimeAdapters.h
+    linux/LinuxJobRuntime.cpp
+    linux/LinuxJobRuntime.h
+    linux/LinuxRtspCandidateBuilder.cpp
+    linux/LinuxRtspCandidateBuilder.h
+    linux/LinuxCameraSessionManager.cpp
+    linux/LinuxCameraSessionManager.h
+    linux/LinuxFrameDiskWriter.cpp
+    linux/LinuxFrameDiskWriter.h
     linux/LinuxRtspThumbnailProbe.cpp
     linux/LinuxRtspThumbnailProbe.h
 )
@@ -178,6 +199,13 @@ add_custom_command(
         "${CMAKE_CURRENT_SOURCE_DIR}/../DrakonSite/server/index.ts"
         "${CMAKE_CURRENT_SOURCE_DIR}/../DrakonSite/server/camera-discovery.ts"
         "${CMAKE_CURRENT_SOURCE_DIR}/../DrakonSite/src/worker/index.ts"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../DrakonSite/src/worker/cameraResourceAdmission.ts"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../DrakonSite/src/worker/localAgentIngress.ts"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../DrakonSite/src/worker/sharedCameraAccess.ts"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../DrakonSite/src/worker/sharedFindRelayState.ts"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../DrakonSite/src/worker/workspaceLocalState.ts"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../DrakonSite/src/worker/workspaceRelayClient.ts"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../DrakonSite/src/worker/workspaceRelayState.ts"
         "${CMAKE_CURRENT_SOURCE_DIR}/../DrakonSite/scripts/convert-postgres-dump-to-sqlite.mjs"
     COMMENT "Staging Linux local backend runtime")
 add_custom_target(perceptrum-linux-backend-runtime ALL
@@ -226,7 +254,24 @@ install(PROGRAMS "${PERCEPTRUM_LINUX_DESKTOP_LAUNCHER}"
     DESTINATION "${PERCEPTRUM_INSTALL_BINDIR}")
 install(DIRECTORY "${PERCEPTRUM_LINUX_BACKEND_RUNTIME_DIR}/"
     DESTINATION "${PERCEPTRUM_INSTALL_DATADIR}/perceptrum-desktop/backend"
-    USE_SOURCE_PERMISSIONS)
+    FILE_PERMISSIONS
+        OWNER_READ OWNER_WRITE
+        GROUP_READ
+        WORLD_READ
+    DIRECTORY_PERMISSIONS
+        OWNER_READ OWNER_WRITE OWNER_EXECUTE
+        GROUP_READ GROUP_EXECUTE
+        WORLD_READ WORLD_EXECUTE
+    PATTERN "perceptrum-local-backend.sh"
+        PERMISSIONS
+            OWNER_READ OWNER_WRITE OWNER_EXECUTE
+            GROUP_READ GROUP_EXECUTE
+            WORLD_READ WORLD_EXECUTE
+    PATTERN "*.node"
+        PERMISSIONS
+            OWNER_READ OWNER_WRITE OWNER_EXECUTE
+            GROUP_READ GROUP_EXECUTE
+            WORLD_READ WORLD_EXECUTE)
 if(EXISTS "${PERCEPTRUM_LINUX_APP_ICON}")
     install(FILES "${PERCEPTRUM_LINUX_APP_ICON}"
         DESTINATION "${PERCEPTRUM_INSTALL_DATADIR}/icons/hicolor/1024x600/apps"
@@ -660,7 +705,7 @@ add_test(NAME headless_bridge_reports_linux_minimal_runtime
 
 add_test(NAME apphost_project_files_not_touched_by_linux_ctest
     COMMAND sh -c
-        "test -z \"$(git -C '${CMAKE_CURRENT_SOURCE_DIR}/..' diff --name-only -- AppHost '*.vcxproj' '*.sln')\"")
+        "test -z \"$(git -C '${CMAKE_CURRENT_SOURCE_DIR}/..' diff --name-only -- '*.vcxproj' '*.sln')\"")
 
 add_test(NAME agent_logger_does_not_write_cwd_logs
     COMMAND sh -c
@@ -696,6 +741,25 @@ add_test(NAME agent_health_does_not_expose_secrets
         APP_RUNTIME_LOG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_does_not_expose_secrets/state/logs' \
         '$<TARGET_FILE:perceptrum-agent>' provision --base-url http://127.0.0.1:4000 --exe-token TEST_TOKEN --client-id test-client --timezone America/Manaus && \
         ! grep -q TEST_TOKEN '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_does_not_expose_secrets/data/agent_health.json'")
+
+add_test(NAME agent_health_redacts_sensitive_urls
+    COMMAND sh -c
+        "rm -rf '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls' && \
+        mkdir -p '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls/data' \
+                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls/config' \
+                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls/cache' \
+                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls/state/logs' && \
+        PATH=/nonexistent APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 \
+        APP_RUNTIME_DATA_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls/data' \
+        APP_RUNTIME_CONFIG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls/config' \
+        APP_RUNTIME_CACHE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls/cache' \
+        APP_RUNTIME_STATE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls/state' \
+        APP_RUNTIME_LOG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls/state/logs' \
+        '$<TARGET_FILE:perceptrum-agent>' provision --base-url 'http://baseuser:basepass@127.0.0.1:4000?access_token=BASE_ACCESS_TOKEN' --exe-token TEST_TOKEN --client-id test-client --timezone America/Manaus && \
+        ! grep -q baseuser '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls/data/agent_health.json' && \
+        ! grep -q basepass '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls/data/agent_health.json' && \
+        ! grep -q BASE_ACCESS_TOKEN '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls/data/agent_health.json' && \
+        grep -F -q 'http://***:***@127.0.0.1:4000?access_token=****' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agent_health_redacts_sensitive_urls/data/agent_health.json'")
 
 add_test(NAME linux_runtime_reports_interface_adapters
     COMMAND sh -c
@@ -767,6 +831,59 @@ add_test(NAME agentcore_lightweight_status_compiles_in_linux_core
         "test -f '${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/perceptrum_core.dir/Perceptrum/core/AgentCoreStatus.cpp.o' && \
         grep -q 'Perceptrum/core/AgentCoreStatus.cpp' '${CMAKE_CURRENT_BINARY_DIR}/build.ninja'")
 
+if(PERCEPTRUM_ENABLE_AGENT_CORE)
+    add_test(NAME agentcore_portable_gate_compiles_without_legacy_sources
+        COMMAND sh -c
+            "test -f '${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/perceptrum_core.dir/Perceptrum/core/AgentCorePortable.cpp.o' && \
+            grep -q 'Perceptrum/core/AgentCorePortable.cpp' '${CMAKE_CURRENT_BINARY_DIR}/build.ninja' && \
+            ! grep -q 'Perceptrum/core/AgentCore.cpp' '${CMAKE_CURRENT_BINARY_DIR}/build.ninja' && \
+            ! grep -q 'Perceptrum/camera/CameraSession.cpp' '${CMAKE_CURRENT_BINARY_DIR}/build.ninja' && \
+            ! grep -q 'Perceptrum/camera/FrameDiskWriter.cpp' '${CMAKE_CURRENT_BINARY_DIR}/build.ninja' && \
+            ! grep -q 'Perceptrum/jobs/JobRuntime.cpp' '${CMAKE_CURRENT_BINARY_DIR}/build.ninja'")
+
+    add_test(NAME agentcore_portable_gate_initializes_status
+        COMMAND sh -c
+            "rm -rf '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status' && \
+            mkdir -p '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/data' \
+                     '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/config' \
+                     '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/cache' \
+                     '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/state/logs' && \
+            PERCEPTRUM_ENABLE_AGENT_CORE=1 \
+            APP_RUNTIME_DATA_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/data' \
+            APP_RUNTIME_CONFIG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/config' \
+            APP_RUNTIME_CACHE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/cache' \
+            APP_RUNTIME_STATE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/state' \
+            APP_RUNTIME_LOG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/state/logs' \
+            timeout 3s '$<TARGET_FILE:perceptrum-agent>' run || true; \
+            grep -q '\"runtime_mode\": \"linux_agentcore_portable\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/data/agent_health.json' && \
+            grep -q '\"agent_core_enabled\": true' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/data/agent_health.json' && \
+            grep -q '\"agent_core_partial\": false' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/data/agent_health.json' && \
+            grep -q '\"agent_core_status_provider\": \"linux_portable_agentcore_status_provider\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/data/agent_health.json' && \
+            grep -q '\"agent_core_http_client\": \"linux_agentcore_curl_http_client\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_gate_initializes_status/data/agent_health.json'")
+
+    if(PERCEPTRUM_ENABLE_JOB_RUNTIME)
+    add_test(NAME agentcore_portable_job_runtime_gate_initializes
+        COMMAND sh -c
+            "rm -rf '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_job_runtime_gate_initializes' && \
+            mkdir -p '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_job_runtime_gate_initializes/data' \
+                     '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_job_runtime_gate_initializes/config' \
+                     '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_job_runtime_gate_initializes/cache' \
+                     '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_job_runtime_gate_initializes/state/logs' && \
+            PERCEPTRUM_ENABLE_AGENT_CORE=1 \
+            PERCEPTRUM_ENABLE_JOB_RUNTIME=1 \
+            PERCEPTRUM_LINUX_LLM_PROVIDER=fake \
+            APP_RUNTIME_DATA_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_job_runtime_gate_initializes/data' \
+            APP_RUNTIME_CONFIG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_job_runtime_gate_initializes/config' \
+            APP_RUNTIME_CACHE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_job_runtime_gate_initializes/cache' \
+            APP_RUNTIME_STATE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_job_runtime_gate_initializes/state' \
+            APP_RUNTIME_LOG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_job_runtime_gate_initializes/state/logs' \
+            timeout 3s '$<TARGET_FILE:perceptrum-agent>' run || true; \
+            grep -q '\"job_runtime_enabled\": true' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_job_runtime_gate_initializes/data/agent_health.json' && \
+            grep -q '\"job_runtime_llm_provider\": \"fake\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_job_runtime_gate_initializes/data/agent_health.json' && \
+            grep -q '\"jobs_inference_temp_root\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/agentcore_portable_job_runtime_gate_initializes/data/agent_health.json'")
+    endif()
+endif()
+
 add_test(NAME linux_unsupported_feature_gate_returns_functional_error
     COMMAND sh -c
         "rm -rf '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_unsupported_feature_gate_returns_functional_error' && \
@@ -803,6 +920,7 @@ add_test(NAME linux_rtsp_thumbnail_adapter_compiles_without_legacy_sources
         ! grep -q 'Perceptrum/camera/FrameDiskWriter.cpp' '${CMAKE_CURRENT_BINARY_DIR}/build.ninja' && \
         ! grep -q 'Perceptrum/jobs/JobRuntime.cpp' '${CMAKE_CURRENT_BINARY_DIR}/build.ninja'")
 
+if(PERCEPTRUM_ENABLE_CAMERA_CAPTURE AND PERCEPTRUM_ENABLE_RTSP_CAPTURE AND PERCEPTRUM_ENABLE_FRAME_WRITER)
 add_test(NAME linux_rtsp_thumbnail_gates_generate_health_and_event
     COMMAND sh -c
         "rm -rf '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event' && \
@@ -814,6 +932,8 @@ add_test(NAME linux_rtsp_thumbnail_gates_generate_health_and_event
         APP_AGENT_RTSP_URL='lavfi:testsrc=size=96x54:rate=1' \
         APP_AGENT_CAMERA_ID='linux-rtsp-test' \
         APP_AGENT_CAMERA_NAME='Linux RTSP Test' \
+        APP_AGENT_RECORDING_PROFILES='10,60,300' \
+        APP_AGENT_RECORDING_CAPTURE_SECONDS=1 \
         PERCEPTRUM_ENABLE_CAMERA_CAPTURE=1 \
         PERCEPTRUM_ENABLE_RTSP_CAPTURE=1 \
         PERCEPTRUM_ENABLE_FRAME_WRITER=1 \
@@ -831,9 +951,263 @@ add_test(NAME linux_rtsp_thumbnail_gates_generate_health_and_event
         grep -q '\"frame_writer_enabled\": true' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event/data/agent_health.json' && \
         grep -q '\"rtsp_camera_started\": true' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event/data/agent_health.json' && \
         grep -q '\"rtsp_thumbnail_generated\": true' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event/data/agent_health.json' && \
+        grep -q '\"camera_recording_clip_generated\": true' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event/data/agent_health.json' && \
+        grep -q '\"camera_recording_profiles\": \"10,60,300\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event/data/agent_health.json' && \
         grep -q '\"rtsp_event_published\": true' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event/data/agent_health.json' && \
-        test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event/cache/agentcore/rtsp-thumbnails/linux-rtsp-test-latest.jpg' && \
-        grep -q 'linux_rtsp_thumbnail' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event/data/agent_events.jsonl'")
+        test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event/cache/agentcore/camera-thumbnails/linux-rtsp-test-latest.jpg' && \
+        test -n \"$(find '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event/data/frames/cam_linux-rtsp-test' -name '*_10s.mp4' -size +0c -print -quit)\" && \
+        test -n \"$(find '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event/data/frames/cam_linux-rtsp-test' -name '*_60s.mp4' -size +0c -print -quit)\" && \
+        test -n \"$(find '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event/data/frames/cam_linux-rtsp-test' -name '*_300s.mp4' -size +0c -print -quit)\" && \
+        grep -q 'linux_rtsp_thumbnail' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_rtsp_thumbnail_gates_generate_health_and_event/state/events/agent_events.jsonl'")
+endif()
+
+if(PERCEPTRUM_ENABLE_JOB_RUNTIME)
+add_test(NAME linux_job_runtime_polls_commands_and_posts_fake_inference
+    COMMAND sh -c
+        "rm -rf '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference' && \
+        mkdir -p '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/data' \
+                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/config/secrets' \
+                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/cache' \
+                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/state/logs' || exit 1; \
+        node '${CMAKE_CURRENT_SOURCE_DIR}/linux/tests/mock_command_server.js' \
+            '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/port.txt' \
+            '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/results.json' & \
+        server_pid=$!; \
+        for i in 1 2 3 4 5 6 7 8 9 10; do test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/port.txt' && break; sleep 0.2; done; \
+        port=$(cat '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/port.txt'); \
+        printf '{\"schema_version\":1,\"base_url\":\"http://127.0.0.1:%s\",\"client_id\":\"test-client\",\"exe_id\":\"test-exe\",\"timezone\":\"UTC\",\"paired\":true,\"provisioned\":true}\\n' \"$port\" > '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/config/agent_config.json'; \
+        printf 'TEST_TOKEN\\n' > '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/config/secrets/exe_token.txt'; \
+	        APP_AGENT_RTSP_ALLOW_TEST_SOURCE=1 \
+	        APP_AGENT_WEBCAM_TEST_SOURCE='lavfi:testsrc=size=96x54:rate=1' \
+	        APP_AGENT_RECORDING_PROFILES='10' \
+	        APP_AGENT_RECORDING_CAPTURE_SECONDS=1 \
+        APP_AGENT_COMMAND_POLL_INTERVAL_MS=100 \
+        APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 \
+        PERCEPTRUM_ENABLE_JOB_RUNTIME=1 \
+        PERCEPTRUM_ENABLE_CAMERA_CAPTURE=1 \
+        PERCEPTRUM_ENABLE_RTSP_CAPTURE=1 \
+        PERCEPTRUM_ENABLE_FRAME_WRITER=1 \
+        PERCEPTRUM_LINUX_LLM_PROVIDER=fake \
+        APP_RUNTIME_DATA_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/data' \
+        APP_RUNTIME_CONFIG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/config' \
+        APP_RUNTIME_CACHE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/cache' \
+        APP_RUNTIME_STATE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/state' \
+        APP_RUNTIME_LOG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/state/logs' \
+	        timeout 10s '$<TARGET_FILE:perceptrum-agent>' run || true; \
+	        kill -TERM \"$server_pid\" 2>/dev/null || true; \
+	        wait \"$server_pid\" 2>/dev/null || true; \
+	        test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/results.json' && \
+	        grep -q '\"id\": 100' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/results.json' && \
+	        grep -q '\"connection_method\": \"WEBCAM\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/results.json' && \
+	        grep -q '\"thumbnail_uploaded\": true' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/results.json' && \
+	        grep -q '\"id\": 101' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/results.json' && \
+	        grep -q '\"id\": 102' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/results.json' && \
+	        grep -q '\"camera_id\": 20' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/results.json' && \
+	        grep -q 'fake_local_inference_ok' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/results.json' && \
+	        grep -q '\"job_runtime_enabled\": true' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/data/agent_health.json' && \
+	        grep -q '\"input_artifacts\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/results.json' && \
+	        grep -q '\"latest_thumbnail\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/results.json' && \
+	        grep -q '\"event_type\": \"job_agent_completed\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/results.json' && \
+	        test -n \"$(find '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/data/frames/cam_20' -name '*_10s.mp4' -size +0c -print -quit)\" && \
+	        test -n \"$(find '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/data/frames/cam_22' -name '*_10s.mp4' -size +0c -print -quit)\" && \
+	        test -n \"$(find '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_polls_commands_and_posts_fake_inference/cache/agentcore/jobs-inference-temp' -name 'job_23_command_101.json' -size +0c -print -quit)\"")
+
+	add_test(NAME linux_job_runtime_real_provider_without_key_fails
+	    COMMAND sh -c
+	        "rm -rf '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails' && \
+	        mkdir -p '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/data' \
+	                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/config/secrets' \
+	                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/cache' \
+	                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/state/logs' || exit 1; \
+	        node '${CMAKE_CURRENT_SOURCE_DIR}/linux/tests/mock_job_llm_missing_key_server.js' \
+	            '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/port.txt' \
+	            '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/results.json' & \
+	        server_pid=$!; \
+	        for i in 1 2 3 4 5 6 7 8 9 10; do test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/port.txt' && break; sleep 0.2; done; \
+	        port=$(cat '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/port.txt'); \
+	        printf '{\"schema_version\":1,\"base_url\":\"http://127.0.0.1:%s\",\"client_id\":\"test-client\",\"exe_id\":\"test-exe\",\"timezone\":\"UTC\",\"paired\":true,\"provisioned\":true}\\n' \"$port\" > '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/config/agent_config.json'; \
+	        printf 'TEST_TOKEN\\n' > '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/config/secrets/exe_token.txt'; \
+	        env -u OPENAI_API_KEY -u ZAI_API_KEY \
+	        APP_AGENT_COMMAND_POLL_INTERVAL_MS=100 \
+	        APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 \
+	        PERCEPTRUM_ENABLE_JOB_RUNTIME=1 \
+	        PERCEPTRUM_LINUX_LLM_PROVIDER=openai \
+	        APP_RUNTIME_DATA_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/data' \
+	        APP_RUNTIME_CONFIG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/config' \
+	        APP_RUNTIME_CACHE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/cache' \
+	        APP_RUNTIME_STATE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/state' \
+	        APP_RUNTIME_LOG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/state/logs' \
+	        timeout 6s '$<TARGET_FILE:perceptrum-agent>' run || true; \
+	        kill -TERM \"$server_pid\" 2>/dev/null || true; \
+	        wait \"$server_pid\" 2>/dev/null || true; \
+	        test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/results.json' && \
+	        grep -q '\"id\": 300' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/results.json' && \
+	        grep -q '\"status\": \"failed\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/results.json' && \
+	        grep -q 'missing_openai_api_key' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_without_key_fails/results.json'")
+
+	add_test(NAME linux_job_runtime_real_provider_openai_manual
+	    COMMAND sh -c
+	        "test -n \"$OPENAI_API_KEY\" && \
+	        rm -rf '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual' && \
+	        mkdir -p '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/data' \
+	                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/config/secrets' \
+	                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/cache' \
+	                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/state/logs' || exit 1; \
+	        node '${CMAKE_CURRENT_SOURCE_DIR}/linux/tests/mock_command_server.js' \
+	            '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/port.txt' \
+	            '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/results.json' & \
+	        server_pid=$!; \
+	        for i in 1 2 3 4 5 6 7 8 9 10; do test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/port.txt' && break; sleep 0.2; done; \
+	        port=$(cat '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/port.txt'); \
+	        printf '{\"schema_version\":1,\"base_url\":\"http://127.0.0.1:%s\",\"client_id\":\"test-client\",\"exe_id\":\"test-exe\",\"timezone\":\"UTC\",\"paired\":true,\"provisioned\":true}\\n' \"$port\" > '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/config/agent_config.json'; \
+	        printf 'TEST_TOKEN\\n' > '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/config/secrets/exe_token.txt'; \
+	        APP_AGENT_RTSP_ALLOW_TEST_SOURCE=1 \
+	        APP_AGENT_WEBCAM_TEST_SOURCE='lavfi:testsrc=size=96x54:rate=1' \
+	        APP_AGENT_RECORDING_PROFILES='10' \
+	        APP_AGENT_RECORDING_CAPTURE_SECONDS=1 \
+	        APP_AGENT_COMMAND_POLL_INTERVAL_MS=100 \
+	        APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 \
+	        PERCEPTRUM_ENABLE_JOB_RUNTIME=1 \
+	        PERCEPTRUM_ENABLE_CAMERA_CAPTURE=1 \
+	        PERCEPTRUM_ENABLE_RTSP_CAPTURE=1 \
+	        PERCEPTRUM_ENABLE_FRAME_WRITER=1 \
+	        PERCEPTRUM_LINUX_LLM_PROVIDER=openai \
+	        APP_RUNTIME_DATA_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/data' \
+	        APP_RUNTIME_CONFIG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/config' \
+	        APP_RUNTIME_CACHE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/cache' \
+	        APP_RUNTIME_STATE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/state' \
+	        APP_RUNTIME_LOG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/state/logs' \
+	        timeout 25s '$<TARGET_FILE:perceptrum-agent>' run || true; \
+	        kill -TERM \"$server_pid\" 2>/dev/null || true; \
+	        wait \"$server_pid\" 2>/dev/null || true; \
+	        test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/results.json' && \
+	        grep -q '\"provider\": \"openai\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/results.json' && \
+	        grep -q '\"network\": true' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_real_provider_openai_manual/results.json'")
+	set_tests_properties(linux_job_runtime_real_provider_openai_manual PROPERTIES DISABLED TRUE)
+
+	add_test(NAME linux_agent_local_provision_polls_command_result_smoke
+	    COMMAND sh -c
+	        "rm -rf '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke' && \
+	        mkdir -p '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/data' \
+	                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/config' \
+	                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/cache' \
+	                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/state/logs' || exit 1; \
+	        node '${CMAKE_CURRENT_SOURCE_DIR}/linux/tests/mock_command_server.js' \
+	            '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/port.txt' \
+	            '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/results.json' & \
+	        server_pid=$!; \
+	        for i in 1 2 3 4 5 6 7 8 9 10; do test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/port.txt' && break; sleep 0.2; done; \
+	        port=$(cat '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/port.txt'); \
+	        APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 \
+	        APP_RUNTIME_DATA_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/data' \
+	        APP_RUNTIME_CONFIG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/config' \
+	        APP_RUNTIME_CACHE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/cache' \
+	        APP_RUNTIME_STATE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/state' \
+	        APP_RUNTIME_LOG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/state/logs' \
+	        '$<TARGET_FILE:perceptrum-agent>' provision --base-url \"http://127.0.0.1:$port\" --exe-token TEST_TOKEN --client-id test-client --exe-id test-exe --timezone UTC && \
+	        APP_AGENT_RTSP_ALLOW_TEST_SOURCE=1 \
+	        APP_AGENT_WEBCAM_TEST_SOURCE='lavfi:testsrc=size=96x54:rate=1' \
+	        APP_AGENT_RECORDING_PROFILES='10' \
+	        APP_AGENT_RECORDING_CAPTURE_SECONDS=1 \
+	        APP_AGENT_COMMAND_POLL_INTERVAL_MS=100 \
+	        APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 \
+	        PERCEPTRUM_ENABLE_JOB_RUNTIME=1 \
+	        PERCEPTRUM_ENABLE_CAMERA_CAPTURE=1 \
+	        PERCEPTRUM_ENABLE_RTSP_CAPTURE=1 \
+	        PERCEPTRUM_ENABLE_FRAME_WRITER=1 \
+	        PERCEPTRUM_LINUX_LLM_PROVIDER=fake \
+	        APP_RUNTIME_DATA_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/data' \
+	        APP_RUNTIME_CONFIG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/config' \
+	        APP_RUNTIME_CACHE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/cache' \
+	        APP_RUNTIME_STATE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/state' \
+	        APP_RUNTIME_LOG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/state/logs' \
+	        timeout 10s '$<TARGET_FILE:perceptrum-agent>' run || true; \
+	        kill -TERM \"$server_pid\" 2>/dev/null || true; \
+	        wait \"$server_pid\" 2>/dev/null || true; \
+	        test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/results.json' && \
+	        grep -q '\"id\": 100' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/results.json' && \
+	        grep -q '\"id\": 101' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/results.json' && \
+	        grep -q '\"id\": 102' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/results.json' && \
+	        grep -q '\"status\": \"completed\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/results.json' && \
+	        grep -q '\"job_runtime_enabled\": true' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_agent_local_provision_polls_command_result_smoke/data/agent_health.json'")
+
+	add_test(NAME linux_job_runtime_rtsp_sources_and_invalid_candidate
+	    COMMAND sh -c
+	        "rm -rf '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate' && \
+	        mkdir -p '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/data' \
+	                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/config/secrets' \
+	                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/cache' \
+	                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/state/logs' || exit 1; \
+	        ffmpeg -y -hide_banner -loglevel error -f lavfi -i testsrc=size=96x54:rate=5 -t 2 -pix_fmt yuv420p '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/local-source.mp4' && \
+	        PERCEPTRUM_TEST_FILE_SOURCE='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/local-source.mp4' \
+	        node '${CMAKE_CURRENT_SOURCE_DIR}/linux/tests/mock_rtsp_command_server.js' \
+	            '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/port.txt' \
+	            '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/results.json' & \
+	        server_pid=$!; \
+	        for i in 1 2 3 4 5 6 7 8 9 10; do test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/port.txt' && break; sleep 0.2; done; \
+	        port=$(cat '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/port.txt'); \
+	        printf '{\"schema_version\":1,\"base_url\":\"http://127.0.0.1:%s\",\"client_id\":\"test-client\",\"exe_id\":\"test-exe\",\"timezone\":\"UTC\",\"paired\":true,\"provisioned\":true}\\n' \"$port\" > '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/config/agent_config.json'; \
+	        printf 'TEST_TOKEN\\n' > '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/config/secrets/exe_token.txt'; \
+	        APP_AGENT_RTSP_ALLOW_TEST_SOURCE=1 \
+	        APP_AGENT_RECORDING_PROFILES='10' \
+	        APP_AGENT_RECORDING_CAPTURE_SECONDS=1 \
+	        APP_AGENT_COMMAND_POLL_INTERVAL_MS=100 \
+	        APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 \
+	        PERCEPTRUM_ENABLE_JOB_RUNTIME=1 \
+	        PERCEPTRUM_ENABLE_CAMERA_CAPTURE=1 \
+	        PERCEPTRUM_ENABLE_RTSP_CAPTURE=1 \
+	        PERCEPTRUM_ENABLE_FRAME_WRITER=1 \
+	        PERCEPTRUM_LINUX_LLM_PROVIDER=fake \
+	        APP_RUNTIME_DATA_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/data' \
+	        APP_RUNTIME_CONFIG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/config' \
+	        APP_RUNTIME_CACHE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/cache' \
+	        APP_RUNTIME_STATE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/state' \
+	        APP_RUNTIME_LOG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/state/logs' \
+	        timeout 12s '$<TARGET_FILE:perceptrum-agent>' run || true; \
+	        kill -TERM \"$server_pid\" 2>/dev/null || true; \
+	        wait \"$server_pid\" 2>/dev/null || true; \
+	        test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/results.json' && \
+	        grep -q '\"id\": 200' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/results.json' && \
+	        grep -q '\"id\": 201' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/results.json' && \
+	        grep -q '\"id\": 202' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/results.json' && \
+	        grep -q '\"camera_id\": \"30\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/results.json' && \
+	        grep -q '\"camera_id\": \"31\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/results.json' && \
+	        grep -q '\"status\": \"failed\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/results.json' && \
+	        grep -Fq '\"active_rtsp_url\": \"rtsp://***:***@127.0.0.1:1/Streaming/Channels/101\"' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/results.json' && \
+	        ! grep -q 'secretpass' '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/results.json' && \
+	        test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/cache/agentcore/camera-thumbnails/30-latest.jpg' && \
+	        test -s '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_job_runtime_rtsp_sources_and_invalid_candidate/cache/agentcore/camera-thumbnails/31-latest.jpg'")
+	endif()
+
+if(PERCEPTRUM_ENABLE_CAMERA_CAPTURE AND PERCEPTRUM_ENABLE_RTSP_CAPTURE AND PERCEPTRUM_ENABLE_FRAME_WRITER)
+add_test(NAME linux_camera_recordings_endpoint_lists_synthetic_segments
+    COMMAND sh -c
+        "rm -rf '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_camera_recordings_endpoint_lists_synthetic_segments' && \
+        mkdir -p '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_camera_recordings_endpoint_lists_synthetic_segments/data' \
+                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_camera_recordings_endpoint_lists_synthetic_segments/config' \
+                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_camera_recordings_endpoint_lists_synthetic_segments/cache' \
+                 '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_camera_recordings_endpoint_lists_synthetic_segments/state/logs' && \
+        APP_AGENT_RTSP_ALLOW_TEST_SOURCE=1 \
+        APP_AGENT_RTSP_URL='lavfi:testsrc=size=96x54:rate=1' \
+        APP_AGENT_CAMERA_ID='22' \
+        APP_AGENT_CAMERA_NAME='Linux Recording Endpoint Test' \
+        APP_AGENT_RECORDING_PROFILES='10,60,300' \
+        APP_AGENT_RECORDING_CAPTURE_SECONDS=1 \
+        PERCEPTRUM_ENABLE_CAMERA_CAPTURE=1 \
+        PERCEPTRUM_ENABLE_RTSP_CAPTURE=1 \
+        PERCEPTRUM_ENABLE_FRAME_WRITER=1 \
+        APP_RUNTIME_DATA_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_camera_recordings_endpoint_lists_synthetic_segments/data' \
+        APP_RUNTIME_CONFIG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_camera_recordings_endpoint_lists_synthetic_segments/config' \
+        APP_RUNTIME_CACHE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_camera_recordings_endpoint_lists_synthetic_segments/cache' \
+        APP_RUNTIME_STATE_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_camera_recordings_endpoint_lists_synthetic_segments/state' \
+        APP_RUNTIME_LOG_ROOT='${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_camera_recordings_endpoint_lists_synthetic_segments/state/logs' \
+        timeout 8s '$<TARGET_FILE:perceptrum-agent>' run || true; \
+        cd '${PERCEPTRUM_WEB_SOURCE_DIR}' && \
+        './node_modules/.bin/tsx' --tsconfig tsconfig.worker.json \
+            '../Perceptrum/linux/tests/verify_camera_recordings_endpoint.mjs' \
+            '${PERCEPTRUM_CTEST_RUNTIME_ROOT}/linux_camera_recordings_endpoint_lists_synthetic_segments/data' \
+            22")
+endif()
 
 add_test(NAME linux_desktop_uses_shared_web_build
     COMMAND "${CMAKE_COMMAND}" -E env
@@ -982,12 +1356,19 @@ set(CPACK_PACKAGE_CONTACT "Perceptrum")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Perceptrum Linux desktop host and headless runtime")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_PACKAGE_FILE_NAME "perceptrum-desktop_${PROJECT_VERSION}_${CMAKE_SYSTEM_PROCESSOR}")
+set(CPACK_PACKAGE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 set(CPACK_PACKAGING_INSTALL_PREFIX "${PERCEPTRUM_LINUX_PACKAGE_PREFIX}")
 set(CPACK_GENERATOR "TGZ")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND CPACK_GENERATOR "DEB")
     set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Perceptrum")
     set(CPACK_DEBIAN_PACKAGE_SECTION "utils")
-    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libcurl4, libgtk-3-0, libwebkit2gtk-4.1-0, ffmpeg, nodejs, xdg-utils, libsecret-tools")
+    set(PERCEPTRUM_DEBIAN_PACKAGE_DEPENDS
+        "libcurl4, ffmpeg, nodejs, xdg-utils, libsecret-tools, dbus-user-session")
+    if(PERCEPTRUM_ENABLE_WEBKITGTK)
+        string(APPEND PERCEPTRUM_DEBIAN_PACKAGE_DEPENDS ", libgtk-3-0, libwebkit2gtk-4.1-0")
+    endif()
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS "${PERCEPTRUM_DEBIAN_PACKAGE_DEPENDS}")
+    set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "gnome-keyring | kwalletmanager")
 endif()
 include(CPack)

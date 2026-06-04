@@ -22,6 +22,7 @@ import { createWebSocketHandler } from "./websocket";
 import bcrypt from "bcryptjs";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import {
+  buildLocalSegmentStartCameraPayloads,
   executeJobStopPlan,
   enqueueManualJobStart,
   loadJobInferenceProviderRequirements,
@@ -42,6 +43,7 @@ import {
   sanitizeAgentApiErrorDetails,
   sanitizeAiApiErrorText,
 } from "@/shared/aiApiErrorDisplay";
+import { evaluateLinuxCameraStartResult } from "@/shared/linuxCameraStartContract";
 import type {
   CameraImportApplyResult,
   CameraImportCandidate,
@@ -92,6 +94,7 @@ import {
   type CentralIdentityDeviceSessionEnvelope,
   type CentralIdentityGrantClaims,
 } from "./centralIdentity";
+import { extractCentralIdentityGrantBrandHint } from "./centralIdentityBrandHint";
 import {
   ensureSharedFindRelayClientConnected,
   sendSharedFindRelayClientMessage,
@@ -134,6 +137,7 @@ import {
   issueWorkspaceRelaySession,
 } from "./workspaceRelayState";
 import {
+  buildLegacyLocalAppUserId,
   getLocalSessionUserByToken,
   migrateAppUserIdReferences,
   migrateLegacyLocalUserIdToCanonicalId,
@@ -210,6 +214,7 @@ import {
   executeOperationalPlanDbFirst,
   resolveOperationalPlanAgainstDb,
 } from "./operationalQuery/db";
+import { resolveChatCameraReferenceFromRows } from "./chatCameraResolver";
 import { buildOperationalPlan } from "./operationalQuery/planner";
 import type { OperationalPlannerContext } from "./operationalQuery/schema";
 import { resolveConversationMemory, applyConversationMemoryToOperationalPlan, buildSemanticPlanMemoryPatch } from "./semantic/conversationMemory";
@@ -598,6 +603,7 @@ const ZAI_KEY_REQUIRED_MESSAGE =
   "Z.ai API key is not configured. Add it in Settings or paste it here in chat.";
 const CAMERA_START_MEMORY_BLOCKED_ERROR = "insufficient_memory";
 const enforcePerceptrumLicenseRules = brand.id === "perceptrum";
+const keepBrandLocalAccountsSeparateFromCentralIdentity = false;
 const PERCEPTRUM_CHAT_TRIAL_DAYS = 30;
 const PERCEPTRUM_CHAT_TRIAL_EXPIRED_ERROR = "PERCEPTRUM_CHAT_TRIAL_EXPIRED";
 const PERCEPTRUM_CHAT_TRIAL_EXPIRED_MESSAGE =
@@ -620,6 +626,14 @@ function buildZAiKeyRequiredErrorBody() {
     error: ZAI_KEY_REQUIRED_ERROR,
     message: ZAI_KEY_REQUIRED_MESSAGE,
   };
+}
+
+function shouldAutoLinkLocalAccountsToCentralIdentity(): boolean {
+  return !keepBrandLocalAccountsSeparateFromCentralIdentity;
+}
+
+function shouldDetachLegacyCentralIdentityLinks(): boolean {
+  return keepBrandLocalAccountsSeparateFromCentralIdentity;
 }
 
 type PerceptrumChatAccessReason =
@@ -1363,13 +1377,233 @@ function readDashboardAlertString(...values: unknown[]): string | null {
   return null;
 }
 
+const MIN_DASHBOARD_ALERT_CLIP_BYTES = 64 * 1024;
+
 function buildDashboardAlertMediaUrl(value: string | null): string | null {
   if (!value) return null;
   if (value.startsWith("http://") || value.startsWith("https://") || value.startsWith("/api/")) {
     return value;
   }
+  const lower = value.toLowerCase();
+  const isVideo =
+    lower.endsWith(".mp4") ||
+    lower.endsWith(".mov") ||
+    lower.endsWith(".m4v") ||
+    lower.endsWith(".webm");
+  if (value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value)) {
+    return `/api/job-${isVideo ? "clips" : "images"}/local/${encodeURIComponent(value)}`;
+  }
   const filename = value.split(/[\\/]/).pop();
   return filename ? `/api/detections/${filename}` : null;
+}
+
+function readDashboardClipArtifactPath(clip: Record<string, any>): string | null {
+  const candidate = readDashboardAlertString(clip.path, clip.file_path, clip.filePath, clip.url);
+  if (!candidate) return null;
+  const bytes = Number(clip.bytes ?? clip.size ?? 0);
+  if (Number.isFinite(bytes) && bytes > 0 && bytes < MIN_DASHBOARD_ALERT_CLIP_BYTES) {
+    return null;
+  }
+  return candidate;
+}
+
+function readDashboardAlertArtifactMedia(details: Record<string, any>, preferredCameraId?: unknown) {
+  const preferredId = Number(preferredCameraId ?? details?.camera_id ?? details?.cameraId);
+  const cameras = Array.isArray(details?.input_artifacts?.cameras)
+    ? details.input_artifacts.cameras
+    : Array.isArray(details?.camera_artifacts?.cameras)
+    ? details.camera_artifacts.cameras
+    : [];
+
+  const readPath = (...values: unknown[]) => readDashboardAlertString(...values);
+  const cameraRows = cameras.filter((entry: unknown) => entry && typeof entry === "object") as Array<Record<string, any>>;
+  const orderedRows =
+    Number.isInteger(preferredId) && preferredId > 0
+      ? [
+          ...cameraRows.filter((entry) => Number(entry.camera_id ?? entry.cameraId) === preferredId),
+          ...cameraRows.filter((entry) => Number(entry.camera_id ?? entry.cameraId) !== preferredId),
+        ]
+      : cameraRows;
+
+  let imagePath: string | null = null;
+  let clipPath: string | null = null;
+
+  for (const entry of orderedRows) {
+    if (!imagePath) {
+      const latestThumbnail = entry.latest_thumbnail || entry.latestThumbnail;
+      imagePath = readPath(
+        entry.image_path,
+        entry.imagePath,
+        entry.thumbnail_path,
+        entry.thumbnailPath,
+        latestThumbnail?.path,
+        latestThumbnail?.file_path,
+        latestThumbnail?.filePath,
+      );
+    }
+
+    if (!clipPath) {
+      const latestClips = entry.latest_clips || entry.latestClips;
+      if (latestClips && typeof latestClips === "object" && !Array.isArray(latestClips)) {
+        const clipEntries = Object.values(latestClips)
+          .filter((clip) => clip && typeof clip === "object") as Array<Record<string, any>>;
+        clipEntries.sort((left, right) => {
+          const leftBytes = Number(left.bytes ?? left.size ?? 0);
+          const rightBytes = Number(right.bytes ?? right.size ?? 0);
+          return rightBytes - leftBytes;
+        });
+        for (const clip of clipEntries) {
+          const candidate = readDashboardClipArtifactPath(clip);
+          if (candidate) {
+            clipPath = candidate;
+            break;
+          }
+        }
+      } else if (Array.isArray(latestClips)) {
+        for (const clip of latestClips) {
+          if (!clip || typeof clip !== "object") continue;
+          const candidate = readDashboardClipArtifactPath(clip as Record<string, any>);
+          if (candidate) {
+            clipPath = candidate;
+            break;
+          }
+        }
+      }
+      clipPath = clipPath || readPath(entry.clip_path, entry.clipPath, entry.video_path, entry.videoPath);
+    }
+
+    if (imagePath && clipPath) break;
+  }
+
+  return { imagePath, clipPath };
+}
+
+async function enrichDashboardAlertsWithLocalClips(
+  env: Record<string, unknown> | undefined,
+  alerts: Array<Record<string, any>>,
+) {
+  if (!alerts.length) return;
+
+  let fs: any;
+  let pathMod: any;
+  try {
+    fs = await import("node:fs");
+    pathMod = await import("node:path");
+  } catch {
+    return;
+  }
+
+  const processEnv =
+    typeof process !== "undefined" && process.env ? process.env : ({} as Record<string, string | undefined>);
+  const readRoot = (...values: unknown[]) =>
+    values
+      .map((value) => (typeof value === "string" ? value.trim() : ""))
+      .find((value) => value.length > 0) || "";
+  const dataRoot = readRoot(env?.APP_RUNTIME_DATA_ROOT, processEnv.APP_RUNTIME_DATA_ROOT);
+  const homeRoot = readRoot(processEnv.HOME);
+  const defaultDataRoot = homeRoot
+    ? pathMod.join(homeRoot, ".local", "share", "PerceptrumData")
+    : "";
+  const clipCache = new Map<string, Array<{ path: string; mtimeMs: number; size: number }>>();
+
+  const collectClips = (cameraId: number, details: Record<string, any>) => {
+    const cacheKey = String(cameraId);
+    const cached = clipCache.get(cacheKey);
+    if (cached) return cached;
+
+    const roots = [
+      readRoot(details?.input_artifacts?.recordings_root, details?.camera_artifacts?.recordings_root),
+      dataRoot ? pathMod.join(dataRoot, "frames") : "",
+      defaultDataRoot ? pathMod.join(defaultDataRoot, "frames") : "",
+    ].filter((entry, index, list) => entry && list.indexOf(entry) === index);
+
+    const clips: Array<{ path: string; mtimeMs: number; size: number }> = [];
+    const walk = (dir: string, depth: number) => {
+      if (depth > 5 || clips.length > 1500) return;
+      let entries: any[] = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const fullPath = pathMod.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(fullPath, depth + 1);
+          continue;
+        }
+        if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".mp4")) {
+          continue;
+        }
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.size >= MIN_DASHBOARD_ALERT_CLIP_BYTES) {
+            clips.push({ path: fullPath, mtimeMs: Number(stat.mtimeMs) || 0, size: Number(stat.size) || 0 });
+          }
+        } catch {
+          // Ignore files that disappear while scanning.
+        }
+      }
+    };
+
+    for (const root of roots) {
+      const cameraRoot = pathMod.join(root, `cam_${cameraId}`);
+      walk(cameraRoot, 0);
+    }
+    clips.sort((left, right) => right.mtimeMs - left.mtimeMs);
+    clipCache.set(cacheKey, clips);
+    return clips;
+  };
+
+  for (const alert of alerts) {
+    const cameraId = Number(alert?.camera_id ?? alert?.details?.camera_id ?? alert?.details?.cameraId);
+    if (!Number.isInteger(cameraId) || cameraId <= 0) continue;
+    const alertMs = Date.parse(String(alert?.created_at || alert?.detected_at || ""));
+    if (!Number.isFinite(alertMs)) continue;
+
+    const details = alert.details && typeof alert.details === "object" ? alert.details : {};
+    const existingVideo = readDashboardAlertString(
+      alert?.video_url,
+      alert?.clip_url,
+      details?.video_url,
+      details?.clip_url,
+    );
+    if (existingVideo) {
+      continue;
+    }
+    const clips = collectClips(cameraId, details);
+    if (!clips.length) continue;
+    const imagePath = readDashboardAlertString(alert?.image_path, details?.image_path, details?.imagePath);
+    let mediaAnchorMs = alertMs;
+    if (imagePath && (imagePath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(imagePath))) {
+      try {
+        const imageStat = fs.statSync(imagePath);
+        const imageMtimeMs = Number(imageStat.mtimeMs);
+        if (Number.isFinite(imageMtimeMs) && imageMtimeMs > 0) {
+          mediaAnchorMs = imageMtimeMs;
+        }
+      } catch {
+        // Keep the alert timestamp when the thumbnail is unavailable.
+      }
+    }
+    const windowMs = 2 * 60 * 1000;
+    const candidate = clips
+      .map((clip) => ({ ...clip, distanceMs: Math.abs(clip.mtimeMs - mediaAnchorMs) }))
+      .filter((clip) => clip.distanceMs <= windowMs)
+      .sort((left, right) => left.distanceMs - right.distanceMs || right.size - left.size)[0];
+    if (!candidate) continue;
+
+    const clipUrl = buildDashboardAlertMediaUrl(candidate.path);
+    if (!clipUrl) continue;
+    alert.clip_path = candidate.path;
+    alert.video_url = clipUrl;
+    alert.clip_url = clipUrl;
+    alert.media_type = "video";
+    details.clip_path = details.clip_path || candidate.path;
+    details.video_url = details.video_url || clipUrl;
+    details.media_type = details.media_type || "video";
+    alert.details = details;
+  }
 }
 
 function normalizeDashboardAlertText(value: unknown): string {
@@ -1454,11 +1688,12 @@ function normalizeDashboardAlertRow(row: any) {
   details.contributing_events_count = contributingEventsCount;
   details.group_image_count = groupImageCount;
 
+  const artifactMedia = readDashboardAlertArtifactMedia(details, row?.camera_id);
   const directVideoUrl = readDashboardAlertString(details?.video_url, details?.videoUrl);
   const directImageUrl = readDashboardAlertString(details?.image_url, details?.imageUrl);
   const videoKey = readDashboardAlertString(details?.video_key, details?.videoKey);
   const imageKey = readDashboardAlertString(details?.image_key, details?.imageKey);
-  const mediaType = readDashboardAlertString(details?.media_type, details?.mediaType);
+  let mediaType = readDashboardAlertString(details?.media_type, details?.mediaType);
   const rawAgentKey = readDashboardAlertString(
     details?.algorithm_type,
     details?.algorithmType,
@@ -1483,10 +1718,28 @@ function normalizeDashboardAlertRow(row: any) {
     details?.detectedAt,
     row?.created_at,
   );
-  const clipPath = readDashboardAlertString(details?.clip_path, details?.clipPath);
-  const imagePath = readDashboardAlertString(details?.image_path, details?.imagePath);
+  const clipPath = readDashboardAlertString(details?.clip_path, details?.clipPath, artifactMedia.clipPath);
+  const imagePath = readDashboardAlertString(details?.image_path, details?.imagePath, artifactMedia.imagePath);
   const clipUrl = directVideoUrl || buildDashboardAlertMediaUrl(clipPath);
   const imageUrl = directImageUrl || buildDashboardAlertMediaUrl(imagePath);
+  if (!mediaType) {
+    mediaType = clipUrl ? "video" : imageUrl ? "image" : null;
+  }
+  if (!readDashboardAlertString(details?.clip_path, details?.clipPath) && clipPath) {
+    details.clip_path = clipPath;
+  }
+  if (!readDashboardAlertString(details?.image_path, details?.imagePath) && imagePath) {
+    details.image_path = imagePath;
+  }
+  if (!directVideoUrl && clipUrl) {
+    details.video_url = clipUrl;
+  }
+  if (!directImageUrl && imageUrl) {
+    details.image_url = imageUrl;
+  }
+  if (!readDashboardAlertString(details?.media_type, details?.mediaType) && mediaType) {
+    details.media_type = mediaType;
+  }
 
   const rawCameraId = Number(row?.camera_id ?? details?.camera_id ?? details?.cameraId);
   const cameraId = Number.isInteger(rawCameraId) && rawCameraId > 0 ? rawCameraId : null;
@@ -1611,6 +1864,7 @@ async function fetchDashboardAlertsPage(
   db: D1Database,
   userId: string,
   options: DashboardAlertPageOptions,
+  env?: Record<string, unknown>,
 ) {
   const requestedLimit = Number(options.limit);
   const pageLimit =
@@ -1685,6 +1939,7 @@ async function fetchDashboardAlertsPage(
 
   const hasMore = matchedAlerts.length > pageLimit;
   const alerts = matchedAlerts.slice(0, pageLimit);
+  await enrichDashboardAlertsWithLocalClips(env, alerts);
   const nextCursor =
     hasMore && alerts.length > 0 ? Number(alerts[alerts.length - 1]?.id) || null : null;
 
@@ -6862,6 +7117,9 @@ function isIdentityOnlySchemaMode(env: { APP_SCHEMA_SCOPE?: string } | undefined
 
 async function ensureRuntimeSchema(env: Env): Promise<void> {
   if (isIdentityOnlySchemaMode(env)) {
+    // Central-auth still uses shared auth/runtime tables such as app_users and
+    // identity migration audit rows during login materialization.
+    await ensureSchema(env.DB);
     await ensureCentralIdentitySchema(env.DB);
     return;
   }
@@ -8499,7 +8757,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           command_event_id TEXT,
           job_run_id TEXT,
-          camera_session_id TEXT
+          camera_session_id TEXT,
+          not_before_utc TEXT
         )
       `
           : `
@@ -8515,7 +8774,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           command_event_id TEXT,
           job_run_id TEXT,
-          camera_session_id TEXT
+          camera_session_id TEXT,
+          not_before_utc TEXT
         )
       `
       ).run();
@@ -8533,6 +8793,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
         await addColumnIfMissing(`ALTER TABLE commands ADD COLUMN command_event_id TEXT`);
         await addColumnIfMissing(`ALTER TABLE commands ADD COLUMN job_run_id TEXT`);
         await addColumnIfMissing(`ALTER TABLE commands ADD COLUMN camera_session_id TEXT`);
+        await addColumnIfMissing(`ALTER TABLE commands ADD COLUMN not_before_utc TEXT`);
       }
 
       if (await tableExists("job_step_runs")) {
@@ -8919,6 +9180,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
           current_camera_ids_json TEXT NOT NULL DEFAULT '[]',
           remote_camera_ids_json TEXT NOT NULL DEFAULT '[]',
           camera_id_map_json TEXT NOT NULL DEFAULT '{}',
+          preserve_running_camera_ids_json TEXT NOT NULL DEFAULT '[]',
+          allow_event_media INTEGER NOT NULL DEFAULT 1,
           status TEXT NOT NULL DEFAULT 'queued',
           request_id TEXT,
           source_command_id INTEGER,
@@ -8946,6 +9209,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
           current_camera_ids_json TEXT NOT NULL DEFAULT '[]',
           remote_camera_ids_json TEXT NOT NULL DEFAULT '[]',
           camera_id_map_json TEXT NOT NULL DEFAULT '{}',
+          preserve_running_camera_ids_json TEXT NOT NULL DEFAULT '[]',
+          allow_event_media INTEGER NOT NULL DEFAULT 1,
           status TEXT NOT NULL DEFAULT 'queued',
           request_id TEXT,
           source_command_id INTEGER,
@@ -9333,8 +9598,9 @@ async function ensureSchema(db: D1Database): Promise<void> {
         ).run();
       }
       
+      await db.prepare(`DROP INDEX IF EXISTS idx_app_users_email_unique`).run();
       await db.prepare(`
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_app_users_email_unique ON app_users(email)
+        CREATE INDEX IF NOT EXISTS idx_app_users_email_lookup ON app_users(LOWER(email))
       `).run();
       await db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_oauth_sessions_user_provider
@@ -9845,6 +10111,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
           updated_at TEXT NOT NULL,
           owner_handle TEXT,
           owner_email TEXT NOT NULL DEFAULT '',
+          invitee_handle TEXT,
+          invitee_email TEXT NOT NULL DEFAULT '',
           UNIQUE(user_id, direction, share_id)
         )
       `
@@ -9871,6 +10139,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
           updated_at TEXT NOT NULL,
           owner_handle TEXT,
           owner_email TEXT NOT NULL DEFAULT '',
+          invitee_handle TEXT,
+          invitee_email TEXT NOT NULL DEFAULT '',
           UNIQUE(user_id, direction, share_id)
         )
       `
@@ -10355,6 +10625,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
         await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN updated_at TEXT`);
         await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN owner_handle TEXT`);
         await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN owner_email TEXT NOT NULL DEFAULT ''`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN invitee_handle TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN invitee_email TEXT NOT NULL DEFAULT ''`);
       }
 
       if (await tableExists("shared_find_cameras_cache")) {
@@ -10377,6 +10649,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
         );
         await addColumnIfMissing(`ALTER TABLE commands ADD COLUMN remote_owner_public_id TEXT`);
         await addColumnIfMissing(`ALTER TABLE commands ADD COLUMN shared_segment_id TEXT`);
+        await addColumnIfMissing(`ALTER TABLE commands ADD COLUMN not_before_utc TEXT`);
       }
 
       if (await tableExists("job_step_targets")) {
@@ -10424,6 +10697,12 @@ async function ensureSchema(db: D1Database): Promise<void> {
         );
         await addColumnIfMissing(
           `ALTER TABLE shared_job_segments ADD COLUMN camera_id_map_json TEXT NOT NULL DEFAULT '{}'`
+        );
+        await addColumnIfMissing(
+          `ALTER TABLE shared_job_segments ADD COLUMN preserve_running_camera_ids_json TEXT NOT NULL DEFAULT '[]'`
+        );
+        await addColumnIfMissing(
+          `ALTER TABLE shared_job_segments ADD COLUMN allow_event_media INTEGER NOT NULL DEFAULT 1`
         );
         await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN status TEXT NOT NULL DEFAULT 'queued'`);
         await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN request_id TEXT`);
@@ -10573,6 +10852,8 @@ async function ensureAppUserRow(
   }
 ): Promise<void> {
   const now = new Date().toISOString();
+  const normalizedUserId = normalizeText(userData.id);
+  const normalizedEmail = normalizeEmail(userData.email || "");
   const isPgLike =
     String((db as any)?.constructor?.name || "")
       .toLowerCase()
@@ -10585,6 +10866,18 @@ async function ensureAppUserRow(
   const createdAtConflictSql = isPgLike
     ? "created_at = COALESCE(app_users.created_at, excluded.created_at),"
     : "created_at = COALESCE(NULLIF(TRIM(app_users.created_at), ''), excluded.created_at),";
+
+  const existingByEmail =
+    normalizedEmail ? await getAppUserRowByEmail(db, normalizedEmail) : null;
+  const existingByEmailId = normalizeText((existingByEmail as any)?.id);
+  if (existingByEmailId && existingByEmailId !== normalizedUserId) {
+    // Keep the requested canonical id materialized when an older app_users row
+    // for the same email still exists (for example, legacy local ids in SQLite).
+    await migrateAppUserIdReferences(db, {
+      oldUserId: existingByEmailId,
+      newUserId: normalizedUserId,
+    });
+  }
   
   await db.prepare(
     `INSERT INTO app_users (
@@ -10603,10 +10896,10 @@ async function ensureAppUserRow(
        timezone_source = COALESCE(app_users.timezone_source, excluded.timezone_source),
        ${createdAtConflictSql}
        updated_at = excluded.updated_at`
-  )
+    )
     .bind(
-      userData.id,
-      userData.email,
+      normalizedUserId,
+      normalizedEmail,
       userData.auth_provider,
       userData.country_code || null,
       userData.locale || null,
@@ -10860,6 +11153,7 @@ type RequestEffectiveBrandConfig = {
   allowedOrigins: string[];
   features: {
     googleLoginEnabled: boolean;
+    workspaceAccessEnabled: boolean;
   };
 };
 
@@ -10876,6 +11170,7 @@ const REQUEST_EFFECTIVE_BRANDS: Record<
     ],
     features: {
       googleLoginEnabled: false,
+      workspaceAccessEnabled: true,
     },
   },
   perceptrum: {
@@ -10887,9 +11182,13 @@ const REQUEST_EFFECTIVE_BRANDS: Record<
     ],
     features: {
       googleLoginEnabled: true,
+      workspaceAccessEnabled: true,
     },
   },
 };
+
+const CENTRAL_REQUEST_BRAND_HEADER = "x-request-brand-id";
+const LEGACY_SERVER_IDENTITY_DEFAULT_BRAND: RequestEffectiveBrandId = "drakon";
 
 const ALL_REQUEST_EFFECTIVE_ALLOWED_ORIGINS = Array.from(
   new Set(
@@ -10944,7 +11243,18 @@ function normalizeRequestCandidateHostname(value: unknown): string {
   }
 }
 
+function getCurrentRuntimeBrandId(): RequestEffectiveBrandId {
+  return brand.id === "perceptrum" ? "perceptrum" : "drakon";
+}
+
 function resolveRequestEffectiveBrandId(c: any): RequestEffectiveBrandId {
+  const explicitBrandId = normalizeRequestEffectiveBrandIdInput(
+    c.req.header(CENTRAL_REQUEST_BRAND_HEADER)
+  );
+  if (explicitBrandId) {
+    return explicitBrandId;
+  }
+
   for (const candidate of [
     c.req.header("origin"),
     c.req.header("x-forwarded-origin"),
@@ -10968,6 +11278,43 @@ function resolveRequestEffectiveBrandId(c: any): RequestEffectiveBrandId {
 
 function resolveRequestEffectiveBrand(c: any): RequestEffectiveBrandConfig {
   return REQUEST_EFFECTIVE_BRANDS[resolveRequestEffectiveBrandId(c)];
+}
+
+function normalizeRequestEffectiveBrandIdInput(
+  value: unknown
+): RequestEffectiveBrandId | null {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "perceptrum" || normalized === "drakon"
+    ? (normalized as RequestEffectiveBrandId)
+    : null;
+}
+
+function normalizeServerIdentityBrandId(value: unknown): RequestEffectiveBrandId | "" {
+  return normalizeRequestEffectiveBrandIdInput(value) || "";
+}
+
+function isLegacyServerIdentityDefaultBrand(
+  value: unknown
+): value is RequestEffectiveBrandId {
+  return (
+    normalizeRequestEffectiveBrandIdInput(value) === LEGACY_SERVER_IDENTITY_DEFAULT_BRAND
+  );
+}
+
+function isServerIdentityVisibleInBrandRealm(
+  serverUser: Record<string, unknown> | null | undefined,
+  brandId: RequestEffectiveBrandId,
+  options?: {
+    allowLegacyFallback?: boolean;
+  }
+): boolean {
+  const serverUserBrandId = normalizeServerIdentityBrandId(
+    (serverUser as any)?.brand_id
+  );
+  return (
+    serverUserBrandId === brandId ||
+    (options?.allowLegacyFallback !== false && serverUserBrandId === "")
+  );
 }
 
 function isGoogleLoginEnabledForRequest(c: any): boolean {
@@ -11301,6 +11648,40 @@ function shouldClearGoogleSessionOnAuthFailure(error: unknown): boolean {
     message.includes("missing google login pkce verifier") ||
     message.includes("no local account found for this google account")
   );
+}
+
+function getGoogleAuthFailureStatus(error: unknown): number {
+  const message =
+    error instanceof Error ? error.message.toLowerCase() : String(error || "").toLowerCase();
+  if (!message) {
+    return 500;
+  }
+  if (
+    message.includes("not configured") ||
+    message.includes("temporarily unavailable")
+  ) {
+    return 503;
+  }
+  if (
+    message.includes("unable to reach the central identity server") ||
+    message.includes("failed to sync google account with the central identity server") ||
+    message.includes("failed to validate this account with the central identity service")
+  ) {
+    return 502;
+  }
+  if (
+    message.includes("google token exchange failed") ||
+    message.includes("invalid grant") ||
+    message.includes("authorization code") ||
+    message.includes("invalid google login") ||
+    message.includes("google identity token")
+  ) {
+    return 401;
+  }
+  if (shouldClearGoogleSessionOnAuthFailure(error)) {
+    return message.includes("no local account found") ? 404 : 403;
+  }
+  return 500;
 }
 
 async function upsertOAuthIdentityLink(
@@ -11704,6 +12085,50 @@ async function resolveOrCreateGoogleAppUser(
   }
 
   if (isGoogleAuthoritativeEmail(mochaUser)) {
+    const existingLocalUserForSeparatedBrand = shouldDetachLegacyCentralIdentityLinks()
+      ? await db
+          .prepare(
+            `SELECT id, email, country_code, locale, server_public_id, identity_migrated_at
+             FROM local_users
+             WHERE LOWER(email) = LOWER(?)
+             LIMIT 1`
+          )
+          .bind(normalizedEmail)
+          .first()
+      : null;
+
+    if (existingLocalUserForSeparatedBrand) {
+      const detachedLocalUser = await detachLocalUserFromCentralIdentityLink(
+        db,
+        existingLocalUserForSeparatedBrand as any
+      );
+      const canonicalId = resolveCanonicalAppUserIdFromLocalUserRow(detachedLocalUser as any);
+
+      await ensureAppUserRow(db, {
+        id: canonicalId,
+        email: normalizedEmail,
+        auth_provider: "google",
+        country_code:
+          normalizedPreferredCountryCode || (detachedLocalUser as any).country_code || null,
+        locale: normalizeOptionalLocale((detachedLocalUser as any).locale),
+      });
+      await markAppUserAsGoogleLinked(db, canonicalId, normalizedEmail);
+      await upsertOAuthIdentityLink(
+        db,
+        "google",
+        googleSubject,
+        canonicalId,
+        normalizedEmail,
+        googleProfileJson,
+        signedInAt
+      );
+
+      console.log(
+        `[GOOGLE AUTH] Linked google_sub to detached local_users account: ${canonicalId} (email: ${normalizedEmail})`
+      );
+      return canonicalId;
+    }
+
     // First-time link: look up existing app user by authoritative email.
     const existingAppUser = await db.prepare(
       `SELECT id, email, auth_provider FROM app_users WHERE LOWER(email) = LOWER(?) LIMIT 1`
@@ -11746,8 +12171,11 @@ async function resolveOrCreateGoogleAppUser(
       .first();
     
     if (existingLocalUser) {
+      const effectiveLocalUser = shouldDetachLegacyCentralIdentityLinks()
+        ? await detachLocalUserFromCentralIdentityLink(db, existingLocalUser as any)
+        : (existingLocalUser as any);
       const canonicalId = resolveCanonicalAppUserIdFromLocalUserRow(
-        existingLocalUser as any
+        effectiveLocalUser as any
       );
 
       await ensureAppUserRow(db, {
@@ -11755,8 +12183,8 @@ async function resolveOrCreateGoogleAppUser(
         email: normalizedEmail,
         auth_provider: "google",
         country_code:
-          normalizedPreferredCountryCode || (existingLocalUser as any).country_code || null,
-        locale: (existingLocalUser as any).locale || null,
+          normalizedPreferredCountryCode || (effectiveLocalUser as any).country_code || null,
+        locale: normalizeOptionalLocale((effectiveLocalUser as any).locale),
       });
       await markAppUserAsGoogleLinked(db, canonicalId, normalizedEmail);
       await upsertOAuthIdentityLink(
@@ -15745,6 +16173,23 @@ const GOOGLE_OIDC_DISCOVERY_URL = "https://accounts.google.com/.well-known/openi
 const GOOGLE_OIDC_SCOPES = ["openid", "email", "profile"];
 const GOOGLE_OAUTH_STATE_MAX_AGE_SECONDS = 10 * 60;
 
+function buildLocalWorkspaceAccessDegradedPayload(
+  env: Env,
+  payload: Record<string, unknown> = {},
+  reason = "central_identity_unavailable"
+): Record<string, unknown> {
+  return {
+    ...payload,
+    degraded: true,
+    degraded_reason: reason,
+    remote: {
+      configured: isCentralIdentityClientConfigured(env),
+      relay_available: false,
+      reason,
+    },
+  };
+}
+
 // Helper to generate session token
 function generateSessionToken(): string {
   return generateUUID();
@@ -15980,6 +16425,8 @@ const SHARED_RELAY_OPERATOR_UNAVAILABLE_MESSAGE =
   "This workspace is disconnected from the shared camera relay. Reconnect Drakon/Perceptrum on this machine and try again.";
 const SHARED_RELAY_OWNER_UNAVAILABLE_MESSAGE =
   "The owner machine is offline or disconnected from the shared camera relay. Reconnect Drakon/Perceptrum on the owner machine and try again.";
+const CENTRAL_LOGIN_VALIDATION_REQUIRED_ERROR =
+  "Failed to validate this account with the central identity service.";
 
 function looksLikeSharedRelayOperatorConnectionError(message: string): boolean {
   const normalized = normalizeText(message).toLowerCase();
@@ -16064,16 +16511,21 @@ async function parseJsonResponseSafe(response: Response): Promise<any> {
 async function callCentralIdentityEndpoint(
   env: Env,
   pathname: string,
-  body: Record<string, unknown>
+  body: Record<string, unknown>,
+  options?: {
+    requestBrandId?: RequestEffectiveBrandId | null;
+  }
 ): Promise<{
   response: Response;
   data: any;
   verifiedGrant: VerifiedCentralIdentityGrant | null;
 }> {
+  const requestBrandId = options?.requestBrandId || getCurrentRuntimeBrandId();
   const response = await fetch(buildCentralIdentityEndpointUrl(env, pathname), {
     method: "POST",
     headers: {
       "content-type": "application/json",
+      [CENTRAL_REQUEST_BRAND_HEADER]: requestBrandId,
     },
     body: JSON.stringify(body),
   });
@@ -16109,16 +16561,28 @@ async function callCentralIdentityAuthorizedEndpoint(
     method?: "DELETE" | "GET" | "PATCH" | "POST" | "PUT";
     token: string;
     body?: Record<string, unknown>;
+    requestBrandId?: RequestEffectiveBrandId | null;
   }
 ): Promise<{
   response: Response;
   data: any;
 }> {
+  let requestBrandId = normalizeRequestEffectiveBrandIdInput(input.requestBrandId);
+  if (!requestBrandId) {
+    try {
+      const verified = await verifyCentralIdentityGrant(env, input.token);
+      requestBrandId = normalizeServerIdentityBrandId((verified.claims as any)?.brand_id) || null;
+    } catch {
+      requestBrandId = null;
+    }
+  }
+
   const response = await fetch(buildCentralIdentityEndpointUrl(env, pathname), {
     method: input.method || "PATCH",
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${input.token}`,
+      [CENTRAL_REQUEST_BRAND_HEADER]: requestBrandId || getCurrentRuntimeBrandId(),
     },
     body: input.body ? JSON.stringify(input.body) : undefined,
   });
@@ -16307,6 +16771,178 @@ async function updateAppUserCentralIdentityState(
     .run();
 }
 
+const CENTRAL_REAUTH_REQUIRED_ERROR =
+  "This account requires a fresh sign-in with the linked central identity service.";
+const CENTRAL_PASSWORD_SYNC_REQUIRED_ERROR =
+  "This account is managed by the linked central identity service. Reset the password through that linked account.";
+const CENTRAL_SUBACCOUNT_PASSWORD_SYNC_REQUIRED_ERROR =
+  "This subaccount is managed by the linked central identity service. Change the password through that linked account.";
+
+async function invalidateAppUserCentralSession(
+  db: D1Database,
+  input: {
+    appUserId: string | null | undefined;
+    clearGrant?: boolean;
+    refreshedAt?: string | null;
+  }
+): Promise<void> {
+  const appUserId = normalizeText(input.appUserId);
+  if (!appUserId) {
+    return;
+  }
+
+  const nowIso = normalizeText(input.refreshedAt) || new Date().toISOString();
+  if (input.clearGrant) {
+    await db
+      .prepare(
+        `UPDATE app_users
+         SET central_grant_token = NULL,
+             central_grant_expires_at = NULL,
+             central_device_session_id = NULL,
+             central_device_session_token = NULL,
+             central_device_session_expires_at = NULL,
+             central_last_refresh_at = ?,
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .bind(nowIso, nowIso, appUserId)
+      .run();
+    return;
+  }
+
+  await db
+    .prepare(
+      `UPDATE app_users
+       SET central_device_session_id = NULL,
+           central_device_session_token = NULL,
+           central_device_session_expires_at = NULL,
+           central_last_refresh_at = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(nowIso, nowIso, appUserId)
+    .run();
+}
+
+function buildCentralReauthRequiredError(message: string = CENTRAL_REAUTH_REQUIRED_ERROR) {
+  return {
+    error: message,
+    code: "central_reauth_required" as const,
+  };
+}
+
+function buildCentralPasswordSyncRequiredError(message: string) {
+  return {
+    error: message,
+    code: "central_password_sync_required" as const,
+  };
+}
+
+function hasCentralIdentityLink(input: {
+  localUser?: Record<string, unknown> | null;
+  appUser?: Record<string, unknown> | null;
+}): boolean {
+  return Boolean(
+    normalizeText((input.localUser as any)?.server_public_id) ||
+      normalizeText((input.appUser as any)?.central_public_id)
+  );
+}
+
+async function detachLocalUserFromCentralIdentityLink(
+  db: D1Database,
+  localUser: Record<string, unknown> | null | undefined
+): Promise<any> {
+  if (!localUser) {
+    return localUser;
+  }
+
+  const localUserId = Number((localUser as any).id ?? (localUser as any).local_user_id ?? 0);
+  if (!Number.isFinite(localUserId) || localUserId <= 0) {
+    return localUser;
+  }
+
+  const canonicalUserId = resolveCanonicalAppUserIdFromLocalUserRow(localUser as any);
+  const legacyUserId = buildLegacyLocalAppUserId(localUserId);
+  const appUserRow = await getAppUserRowById(db, canonicalUserId);
+  const hasLegacyCentralLink = Boolean(
+    normalizeText((localUser as any)?.server_public_id) ||
+      normalizeText((localUser as any)?.identity_migrated_at) ||
+      normalizeText((appUserRow as any)?.central_public_id) ||
+      normalizeText((appUserRow as any)?.central_grant_token) ||
+      canonicalUserId !== legacyUserId
+  );
+
+  if (!hasLegacyCentralLink) {
+    return localUser;
+  }
+
+  const nowIso = new Date().toISOString();
+
+  if (canonicalUserId !== legacyUserId) {
+    await migrateAppUserIdReferences(db, {
+      oldUserId: canonicalUserId,
+      newUserId: legacyUserId,
+    });
+  }
+
+  await ensureAppUserRow(db, {
+    id: legacyUserId,
+    email: normalizeText((localUser as any)?.email),
+    auth_provider: "local",
+    country_code: normalizeCountryCode((localUser as any)?.country_code, null),
+    locale: normalizeOptionalLocale((localUser as any)?.locale),
+  });
+
+  await db
+    .prepare(
+      `UPDATE local_users
+       SET server_user_id_bigint = NULL,
+           server_public_id = NULL,
+           grant_expires_at = NULL,
+           last_server_sync_at = NULL,
+           status_signature = NULL,
+           identity_source = 'local',
+           identity_migrated_at = NULL,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(nowIso, localUserId)
+    .run();
+
+  await db
+    .prepare(
+      `UPDATE app_users
+       SET central_public_id = NULL,
+           central_grant_token = NULL,
+           central_grant_expires_at = NULL,
+           central_device_session_id = NULL,
+           central_device_session_token = NULL,
+           central_device_session_expires_at = NULL,
+           central_last_refresh_at = ?,
+           central_last_grant_sync_at = NULL,
+           central_auth_provider = NULL,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(nowIso, nowIso, legacyUserId)
+    .run();
+
+  await db
+    .prepare(
+      `DELETE FROM user_secret_recovery
+       WHERE app_user_id = ?
+         AND storage_scope = 'server'`
+    )
+    .bind(legacyUserId)
+    .run();
+
+  const refreshedLocalUser = await db
+    .prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`)
+    .bind(localUserId)
+    .first();
+  return (refreshedLocalUser as any) || localUser;
+}
+
 async function syncLegacyLocalUserGrantCacheFromGrant(
   db: D1Database,
   input: {
@@ -16379,9 +17015,31 @@ function buildCentralIdentityStateFromLegacyLocalIdentity(
   };
 }
 
+async function resolveCentralIdentityRefreshRequestBrandId(
+  db: D1Database,
+  state: AppUserCentralIdentityState,
+  requestBrandId?: RequestEffectiveBrandId | null
+): Promise<RequestEffectiveBrandId | null> {
+  const explicitRequestBrandId = normalizeRequestEffectiveBrandIdInput(requestBrandId);
+  if (explicitRequestBrandId) {
+    return explicitRequestBrandId;
+  }
+
+  const grantBrandHint = extractCentralIdentityGrantBrandHint(state.grantToken, {
+    expectedPublicId: state.publicId,
+  });
+  if (grantBrandHint) {
+    return grantBrandHint;
+  }
+
+  const serverUser = await getServerUserByPublicId(db, state.publicId);
+  return normalizeServerIdentityBrandId((serverUser as any)?.brand_id) || null;
+}
+
 async function ensureFreshCentralRelayContext(
   env: Env,
-  state: AppUserCentralIdentityState
+  state: AppUserCentralIdentityState,
+  requestBrandId?: RequestEffectiveBrandId | null
 ): Promise<CentralUserRelayContext> {
   const nowMs = Date.now();
   if (
@@ -16400,22 +17058,40 @@ async function ensureFreshCentralRelayContext(
   }
 
   if (!state.deviceSessionToken) {
+    await invalidateAppUserCentralSession(env.DB, {
+      appUserId: state.appUserId,
+    });
     throw new Error(
       "This account requires a central identity refresh. Please sign in again with a centrally linked account."
     );
   }
   if (!hasCentralIdentityExpiryAhead(state.deviceSessionExpiresAt, 0, nowMs)) {
+    await invalidateAppUserCentralSession(env.DB, {
+      appUserId: state.appUserId,
+    });
     throw new Error(
       "This account requires a central identity refresh. Please sign in again with a centrally linked account."
     );
   }
 
+  // Background relay refreshes do not have request host context, so reuse the saved
+  // grant realm hint before falling back to the runtime brand default.
+  const refreshRequestBrandId = await resolveCentralIdentityRefreshRequestBrandId(
+    env.DB,
+    state,
+    requestBrandId
+  );
   const remote = await callCentralIdentityEndpoint(env, "/api/identity/refresh", {
     device_token: state.deviceSessionToken,
+  }, {
+    requestBrandId: refreshRequestBrandId,
   });
   if (!remote.response.ok || !remote.verifiedGrant) {
     const status = remote.response.status || 502;
     if (status === 401 || status === 403) {
+      await invalidateAppUserCentralSession(env.DB, {
+        appUserId: state.appUserId,
+      });
       throw new Error(
         "This account requires a central identity refresh. Please sign in again with a centrally linked account."
       );
@@ -16500,6 +17176,8 @@ type SharedFindInvitationCacheRow = {
   updated_at: string;
   owner_handle: string | null;
   owner_email: string;
+  invitee_handle: string | null;
+  invitee_email: string;
 };
 
 type CentralCameraFindShareRow = {
@@ -16521,6 +17199,8 @@ type CentralCameraFindShareRow = {
   updated_at: string;
   owner_handle: string | null;
   owner_email: string;
+  invitee_handle: string | null;
+  invitee_email: string;
 };
 
 type WorkspaceConnectionPolicy = "allow_while_open" | "confirm_each_time";
@@ -16874,11 +17554,12 @@ function isWorkspacePresenceFresh(lastSeenAt: unknown, nowMs = Date.now()) {
 
 async function resolveCurrentUserCentralRelayContext(
   env: Env,
-  user: WorkerAuthenticatedUser
+  user: WorkerAuthenticatedUser,
+  requestBrandId?: RequestEffectiveBrandId | null
 ): Promise<CentralUserRelayContext> {
   const appUserState = await getAppUserCentralIdentityState(env.DB, user.id);
   if (appUserState) {
-    return ensureFreshCentralRelayContext(env, appUserState);
+    return ensureFreshCentralRelayContext(env, appUserState, requestBrandId);
   }
 
   const localIdentity = await findLocalUserIdentityCache(env.DB, {
@@ -16897,7 +17578,7 @@ async function resolveCurrentUserCentralRelayContext(
       "This account is not linked to the central identity service yet. Please sign in again with a centrally linked account."
     );
   }
-  return ensureFreshCentralRelayContext(env, legacyState);
+  return ensureFreshCentralRelayContext(env, legacyState, requestBrandId);
 }
 
 async function resolveSecretRecoveryAuthStateForUser(
@@ -16914,7 +17595,7 @@ async function resolveSecretRecoveryAuthStateForUser(
     return localState;
   }
 
-  if (!isCentralIdentityClientConfigured(env)) {
+  if (!isCentralIdentityClientConfigured(env) || !shouldAutoLinkLocalAccountsToCentralIdentity()) {
     return localState;
   }
 
@@ -17001,9 +17682,34 @@ async function requireVerifiedCentralGrantUser(c: any) {
     return { error: c.json({ error: "This account is not allowed to use shared find." }, 403) };
   }
 
+  const requestBrandId = resolveRequestEffectiveBrandId(c);
+  const claimBrandId = normalizeServerIdentityBrandId(
+    (verifiedGrant.claims as any)?.brand_id
+  );
   const serverUser = await getServerUserByPublicId(c.env.DB, verifiedGrant.claims.public_id);
   if (!serverUser) {
     return { error: c.json({ error: "Central identity user not found." }, 404) };
+  }
+
+  const serverUserBrandId = normalizeServerIdentityBrandId((serverUser as any)?.brand_id);
+  if (claimBrandId && serverUserBrandId && claimBrandId !== serverUserBrandId) {
+    return { error: c.json({ error: "Invalid or expired central identity grant." }, 401) };
+  }
+  if (claimBrandId && claimBrandId !== requestBrandId) {
+    return {
+      error: c.json(
+        { error: "This account does not belong to this application realm." },
+        403
+      ),
+    };
+  }
+  if (serverUserBrandId && serverUserBrandId !== requestBrandId) {
+    return {
+      error: c.json(
+        { error: "This account does not belong to this application realm." },
+        403
+      ),
+    };
   }
 
   if (!normalizeDbBoolean((serverUser as any).is_active, true)) {
@@ -17054,6 +17760,8 @@ function normalizeCentralCameraFindShareRow(value: unknown): CentralCameraFindSh
     updated_at: normalizeText(row.updated_at),
     owner_handle: normalizeUserHandleInput(row.owner_handle),
     owner_email: normalizeEmail(String(row.owner_email || "")),
+    invitee_handle: normalizeUserHandleInput(row.invitee_handle),
+    invitee_email: normalizeEmail(String(row.invitee_email || "")),
   };
 }
 
@@ -17094,6 +17802,8 @@ function normalizeSharedFindInvitationCacheRow(
     updated_at: normalizeText(row.updated_at),
     owner_handle: normalizeUserHandleInput(row.owner_handle),
     owner_email: normalizeEmail(String(row.owner_email || "")),
+    invitee_handle: normalizeUserHandleInput(row.invitee_handle),
+    invitee_email: normalizeEmail(String(row.invitee_email || "")),
   };
 }
 
@@ -17119,6 +17829,8 @@ function mapSharedFindInvitationCacheRowToShare(
     updated_at: row.updated_at,
     owner_handle: row.owner_handle,
     owner_email: row.owner_email,
+    invitee_handle: row.invitee_handle,
+    invitee_email: row.invitee_email,
   };
 }
 
@@ -17297,9 +18009,11 @@ async function replaceSharedFindInvitationCacheForUser(
            revoked_at,
            updated_at,
            owner_handle,
-           owner_email
+           owner_email,
+           invitee_handle,
+           invitee_email
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         userId,
@@ -17326,7 +18040,9 @@ async function replaceSharedFindInvitationCacheForUser(
         row.revoked_at,
         row.updated_at || now,
         row.owner_handle,
-        row.owner_email || ""
+        row.owner_email || "",
+        row.invitee_handle,
+        row.invitee_email || ""
       )
       .run();
   }
@@ -17569,7 +18285,14 @@ async function syncSharedFindInvitationNotifications(
 
   for (const row of pendingRows) {
     const cameraLabel = row.camera_name || `Camera #${row.owner_local_camera_id}`;
-    const message = `${cameraLabel} is waiting for your approval in Drakon Find.`;
+    const ownerLabel =
+      buildSharedFindDisplayLabel({
+        handle: row.owner_handle,
+        email: row.owner_email,
+      }) || "Another user";
+    const originProgramLabel = resolveSharedCameraProgramLabel(row.origin_brand_id);
+    const title = "Shared camera invitation";
+    const message = `${ownerLabel} shared "${cameraLabel}" with you via ${originProgramLabel}.`;
     const existingNotificationId = existingByShareId.get(row.id);
     if (existingNotificationId) {
       await db
@@ -17582,7 +18305,7 @@ async function syncSharedFindInvitationNotifications(
              AND user_id = ?`
         )
         .bind(
-          "Shared Drakon Find invitation",
+          title,
           message,
           row.updated_at || row.created_at || new Date().toISOString(),
           existingNotificationId,
@@ -17613,7 +18336,7 @@ async function syncSharedFindInvitationNotifications(
         userId,
         null,
         "shared_find_invitation",
-        "Shared Drakon Find invitation",
+        title,
         message,
         null,
         null,
@@ -17637,6 +18360,8 @@ async function loadSharedFindCachedStateForUser(db: D1Database, userId: string) 
     owner_public_id: row.owner_public_id,
     invitee_public_id: "",
     origin_brand_id: row.origin_brand_id,
+    permission_profile: row.permission_profile,
+    access_config_json: row.access_config_json,
     owner_local_camera_id: row.owner_local_camera_id,
     camera_name: row.camera_name,
     city: row.city,
@@ -17649,6 +18374,8 @@ async function loadSharedFindCachedStateForUser(db: D1Database, userId: string) 
     updated_at: row.updated_at,
     owner_handle: row.owner_handle,
     owner_email: row.owner_email,
+    invitee_handle: null,
+    invitee_email: "",
   }));
 
   return {
@@ -17818,7 +18545,12 @@ function buildSharedCameraStreamAccessMessage(camera: Record<string, unknown> | 
 
 async function resolveCentralFindShareUserByQuery(
   db: D1Database,
-  rawQuery: unknown
+  rawQuery: unknown,
+  options?: {
+    brandId?: RequestEffectiveBrandId | null;
+    allowLegacyFallback?: boolean;
+    allowCrossBrandFallback?: boolean;
+  }
 ): Promise<SharedFindResolvedUser | null> {
   const normalizedQuery = normalizeSharedFindLookupQuery(rawQuery);
   if (!normalizedQuery || normalizedQuery.length < 3) {
@@ -17827,22 +18559,37 @@ async function resolveCentralFindShareUserByQuery(
 
   const isEmailQuery = normalizedQuery.includes("@") && isValidEmail(normalizedQuery);
   const normalizedHandle = normalizeUserHandleInput(normalizedQuery);
+  const brandId = normalizeRequestEffectiveBrandIdInput(options?.brandId);
 
   let row: any | null = null;
   if (normalizedHandle) {
-    row =
-      (await db
-        .prepare(`SELECT public_id, email, handle FROM server_users WHERE LOWER(handle) = LOWER(?) LIMIT 1`)
-        .bind(normalizedHandle)
-        .first()) || null;
+    row = await getServerUserByHandle(db, normalizedHandle, {
+      brandId: brandId || null,
+      allowLegacyFallback: brandId ? false : options?.allowLegacyFallback,
+    });
+    if (!row && options?.allowCrossBrandFallback) {
+      row = pickCrossBrandServerUserCandidate(
+        await listServerUsersByHandleAcrossBrands(db, normalizedHandle),
+        {
+          allowLegacyFallback: options?.allowLegacyFallback,
+        }
+      );
+    }
   }
 
   if (!row && isEmailQuery) {
-    row =
-      (await db
-        .prepare(`SELECT public_id, email, handle FROM server_users WHERE LOWER(email) = LOWER(?) LIMIT 1`)
-        .bind(normalizeEmail(normalizedQuery))
-        .first()) || null;
+    row = await getServerUserByEmail(db, normalizeEmail(normalizedQuery), {
+      brandId: brandId || null,
+      allowLegacyFallback: options?.allowLegacyFallback,
+    });
+    if (!row && options?.allowCrossBrandFallback) {
+      row = pickCrossBrandServerUserCandidate(
+        await listServerUsersByEmailAcrossBrands(db, normalizedQuery),
+        {
+          allowLegacyFallback: options?.allowLegacyFallback,
+        }
+      );
+    }
   }
 
   if (!row) {
@@ -18024,10 +18771,14 @@ async function getCentralCameraFindShareById(db: D1Database, shareId: number) {
     .prepare(
       `SELECT s.*,
               owner.handle AS owner_handle,
-              owner.email AS owner_email
+              owner.email AS owner_email,
+              invitee.handle AS invitee_handle,
+              invitee.email AS invitee_email
        FROM camera_find_shares s
        LEFT JOIN server_users owner
          ON owner.public_id = s.owner_public_id
+       LEFT JOIN server_users invitee
+         ON invitee.public_id = s.invitee_public_id
        WHERE s.id = ?
        LIMIT 1`
     )
@@ -18064,10 +18815,14 @@ async function listCentralCameraFindShares(
     .prepare(
       `SELECT s.*,
               owner.handle AS owner_handle,
-              owner.email AS owner_email
+              owner.email AS owner_email,
+              invitee.handle AS invitee_handle,
+              invitee.email AS invitee_email
        FROM camera_find_shares s
        LEFT JOIN server_users owner
          ON owner.public_id = s.owner_public_id
+       LEFT JOIN server_users invitee
+         ON invitee.public_id = s.invitee_public_id
        WHERE ${clauses
          .map((clause) => clause.replace(/owner_public_id/g, "s.owner_public_id").replace(/invitee_public_id/g, "s.invitee_public_id").replace(/owner_local_camera_id/g, "s.owner_local_camera_id"))
          .join(" AND ")}
@@ -18089,10 +18844,14 @@ async function listCentralAvailableCameraFindShares(db: D1Database, inviteePubli
     .prepare(
       `SELECT s.*,
               owner.handle AS owner_handle,
-              owner.email AS owner_email
+              owner.email AS owner_email,
+              invitee.handle AS invitee_handle,
+              invitee.email AS invitee_email
        FROM camera_find_shares s
        LEFT JOIN server_users owner
          ON owner.public_id = s.owner_public_id
+       LEFT JOIN server_users invitee
+         ON invitee.public_id = s.invitee_public_id
        WHERE s.invitee_public_id = ?
          AND s.status = 'accepted'
        ORDER BY s.state_code ASC, s.city ASC, s.camera_name ASC, s.id ASC`
@@ -19028,7 +19787,7 @@ async function maybeEnsureSharedFindRelayForUser(
   env: Env,
   user: WorkerAuthenticatedUser | { id: string; email?: string | null }
 ) {
-  if (!isCentralIdentityClientConfigured(env)) {
+  if (!isCentralIdentityClientConfigured(env) || !shouldAutoLinkLocalAccountsToCentralIdentity()) {
     return null;
   }
 
@@ -19061,6 +19820,8 @@ type SharedJobSegmentRow = {
   current_camera_ids_json: string | null;
   remote_camera_ids_json: string | null;
   camera_id_map_json: string | null;
+  preserve_running_camera_ids_json: string | null;
+  allow_event_media: number | null;
   status: string;
   request_id: string | null;
   source_command_id: number | null;
@@ -19073,6 +19834,15 @@ type SharedJobSegmentRow = {
   started_at: string | null;
   completed_at: string | null;
   stopped_at: string | null;
+};
+
+type SharedSegmentCommandRow = {
+  id: number;
+  status: string | null;
+  target_client_id: string | null;
+  target_exe_id: string | null;
+  created_at: string | null;
+  updated_at: string | null;
 };
 
 const SHARED_JOB_CAMERA_ID_SCALAR_KEYS = new Set([
@@ -19254,6 +20024,85 @@ function allowsSharedJobRelayEventMedia(details: Record<string, unknown>): boole
   return normalizeDbBoolean(raw, false);
 }
 
+function sharedJobSegmentAllowsEventMedia(
+  segmentRow: SharedJobSegmentRow | null | undefined,
+  details?: Record<string, unknown> | null
+): boolean {
+  if (details && allowsSharedJobRelayEventMedia(details)) {
+    return true;
+  }
+  return normalizeDbBoolean(segmentRow?.allow_event_media, false);
+}
+
+function parseSharedJobPreserveRunningCameraIds(
+  segmentRow: SharedJobSegmentRow | null | undefined
+): number[] {
+  return parsePositiveIntegerArrayJson(segmentRow?.preserve_running_camera_ids_json);
+}
+
+async function loadSharedJobPreserveRunningCameraIds(
+  db: D1Database,
+  userId: string,
+  cameraIds: number[]
+): Promise<number[]> {
+  const normalizedCameraIds = [...new Set(cameraIds.filter((cameraId) => cameraId > 0))];
+  if (normalizedCameraIds.length === 0) {
+    return [];
+  }
+  const placeholders = normalizedCameraIds.map(() => "?").join(", ");
+  const { results } = await db
+    .prepare(
+      `SELECT id
+       FROM cameras
+       WHERE user_id = ?
+         AND id IN (${placeholders})
+         AND is_service_running = 1`
+    )
+    .bind(userId, ...normalizedCameraIds)
+    .all();
+  return (results || [])
+    .map((row: any) => clampInteger(row?.id))
+    .filter(
+      (cameraId: number, index: number, source: number[]): cameraId is number =>
+        cameraId > 0 && source.indexOf(cameraId) === index
+    );
+}
+
+async function clearSharedSegmentCameraRunningState(
+  db: D1Database,
+  userId: string,
+  segmentRow: SharedJobSegmentRow | null | undefined
+): Promise<void> {
+  if (!segmentRow || normalizeText(segmentRow.role).toLowerCase() !== "operator") {
+    return;
+  }
+
+  const segmentCameraIds = parsePositiveIntegerArrayJson(segmentRow.current_camera_ids_json);
+  if (segmentCameraIds.length === 0) {
+    return;
+  }
+
+  const preserveCameraIds = new Set(parseSharedJobPreserveRunningCameraIds(segmentRow));
+  const cameraIdsToStop = segmentCameraIds.filter((cameraId) => !preserveCameraIds.has(cameraId));
+  if (cameraIdsToStop.length === 0) {
+    return;
+  }
+
+  const placeholders = cameraIdsToStop.map(() => "?").join(", ");
+  await db
+    .prepare(
+      `UPDATE cameras
+       SET is_service_running = 0,
+           is_online = 0,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE user_id = ?
+         AND id IN (${placeholders})
+         AND origin_type = 'shared_find'`
+    )
+    .bind(userId, ...cameraIdsToStop)
+    .run();
+}
+
 async function listSharedJobSegmentsForUserJobRun(
   db: D1Database,
   userId: string,
@@ -19309,6 +20158,130 @@ async function getSharedJobSegmentByIdForUser(
   return (row as SharedJobSegmentRow | null) || null;
 }
 
+async function getLatestSharedSegmentCommandForUser(
+  db: D1Database,
+  userId: string,
+  segmentId: string,
+  commandType: "job_start" | "job_stop"
+): Promise<SharedSegmentCommandRow | null> {
+  const normalizedSegmentId = normalizeText(segmentId);
+  if (!normalizedSegmentId) {
+    return null;
+  }
+  const row = await db
+    .prepare(
+      `SELECT id, status, target_client_id, target_exe_id, created_at, updated_at
+       FROM commands
+       WHERE user_id = ?
+         AND shared_segment_id = ?
+         AND command_type = ?
+       ORDER BY id DESC
+       LIMIT 1`
+    )
+    .bind(userId, normalizedSegmentId, commandType)
+    .first();
+  return (row as SharedSegmentCommandRow | null) || null;
+}
+
+async function insertSharedSegmentCommandOnce(
+  db: D1Database,
+  input: {
+    userId: string;
+    commandType: "job_start" | "job_stop";
+    payload: Record<string, unknown>;
+    nowIso: string;
+    jobRunId: string;
+    executionDomain: string;
+    remoteOwnerPublicId?: string | null;
+    sharedSegmentId: string;
+    targetClientId?: string | null;
+    targetExeId?: string | null;
+  }
+): Promise<{
+  inserted: boolean;
+  commandId: number | null;
+  command: SharedSegmentCommandRow | null;
+}> {
+  const normalizedSegmentId = normalizeText(input.sharedSegmentId);
+  if (!normalizedSegmentId) {
+    return {
+      inserted: false,
+      commandId: null,
+      command: null,
+    };
+  }
+
+  const insertResult = await db
+    .prepare(
+      `INSERT INTO commands (
+         user_id,
+         camera_id,
+         command_type,
+         payload,
+         status,
+         created_at,
+         updated_at,
+         job_run_id,
+         execution_domain,
+         remote_owner_public_id,
+         shared_segment_id,
+         target_client_id,
+         target_exe_id
+       )
+       SELECT ?, NULL, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE NOT EXISTS (
+         SELECT 1
+         FROM commands
+         WHERE user_id = ?
+           AND shared_segment_id = ?
+           AND command_type = ?
+         LIMIT 1
+       )`
+    )
+    .bind(
+      input.userId,
+      input.commandType,
+      JSON.stringify(input.payload),
+      input.nowIso,
+      input.nowIso,
+      normalizeText(input.jobRunId) || null,
+      normalizeText(input.executionDomain) || "local",
+      normalizeText(input.remoteOwnerPublicId) || null,
+      normalizedSegmentId,
+      normalizeText(input.targetClientId) || null,
+      normalizeText(input.targetExeId) || null,
+      input.userId,
+      normalizedSegmentId,
+      input.commandType
+    )
+    .run();
+
+  const inserted = Number((insertResult as any)?.meta?.changes || 0) > 0;
+  const commandId = inserted ? Number((insertResult as any)?.meta?.last_row_id || 0) || null : null;
+  const command =
+    inserted && commandId && commandId > 0
+      ? ({
+          id: commandId,
+          status: "pending",
+          target_client_id: normalizeText(input.targetClientId) || null,
+          target_exe_id: normalizeText(input.targetExeId) || null,
+          created_at: input.nowIso,
+          updated_at: input.nowIso,
+        } satisfies SharedSegmentCommandRow)
+      : await getLatestSharedSegmentCommandForUser(
+          db,
+          input.userId,
+          normalizedSegmentId,
+          input.commandType
+        );
+
+  return {
+    inserted,
+    commandId: command ? clampInteger(command.id) : commandId,
+    command,
+  };
+}
+
 async function findSharedOwnerJobSegmentForRelay(
   db: D1Database,
   userId: string,
@@ -19360,17 +20333,27 @@ async function updateSharedJobSegmentRow(
     requestId?: string | null;
     sourceCommandId?: number | null;
     lastError?: string | null;
+    allowEventMedia?: boolean | null;
+    preserveRunningCameraIds?: number[] | null;
     nowIso?: string;
   }
 ) {
   const nowIso = normalizeText(input.nowIso) || new Date().toISOString();
   const nextStatus = normalizeText(input.status);
+  const nextPreserveRunningCameraIds =
+    Array.isArray(input.preserveRunningCameraIds)
+      ? JSON.stringify(
+          [...new Set(input.preserveRunningCameraIds.map((cameraId) => clampInteger(cameraId)).filter((cameraId): cameraId is number => cameraId > 0))]
+        )
+      : null;
   await db.prepare(
     `UPDATE shared_job_segments
      SET status = COALESCE(NULLIF(?, ''), status),
          request_id = COALESCE(NULLIF(?, ''), request_id),
          source_command_id = COALESCE(?, source_command_id),
          last_error = COALESCE(NULLIF(?, ''), last_error),
+         allow_event_media = COALESCE(?, allow_event_media),
+         preserve_running_camera_ids_json = COALESCE(NULLIF(?, ''), preserve_running_camera_ids_json),
          started_at = CASE
            WHEN COALESCE(NULLIF(?, ''), status) = 'running' THEN COALESCE(started_at, ?)
            ELSE started_at
@@ -19395,6 +20378,8 @@ async function updateSharedJobSegmentRow(
         ? Number(input.sourceCommandId)
         : null,
       normalizeText(input.lastError) || null,
+      typeof input.allowEventMedia === "boolean" ? (input.allowEventMedia ? 1 : 0) : null,
+      nextPreserveRunningCameraIds,
       nextStatus || null,
       nowIso,
       nextStatus || null,
@@ -19510,7 +20495,7 @@ function buildSharedJobExecutionOptions(): JobSharedExecutionOptions {
               operator_camera_ids: input.segment.operator_camera_ids,
               owner_camera_ids: input.segment.owner_camera_ids,
               camera_id_map: input.segment.camera_id_map,
-              allow_event_media: false,
+              allow_event_media: input.segment.allow_event_media !== false,
               federated_cross_camera: input.federatedCrossCamera,
               payload: input.segment.payload,
             },
@@ -19657,7 +20642,7 @@ async function ensureSharedFindRelayForBackgroundUser(
   if (userId && shouldLogSharedFindRelayBackgroundFailure(`${source}:${userId}`)) {
     console.warn("[SHARED FIND RELAY] Background relay is unavailable for runtime user", {
       source,
-      userId,
+      user_id_present: true,
     });
   }
   return null;
@@ -20646,6 +21631,32 @@ async function handleSharedJobStartRelayMessage(
     const ownerCameraIds = parsePositiveIntegerArrayJson(message.owner_camera_ids);
     const operatorCameraIds = parsePositiveIntegerArrayJson(message.operator_camera_ids);
     const cameraIdMap = parseSharedJobCameraIdMap(message.camera_id_map);
+    const resolvedOwnerCameraIds =
+      ownerCameraIds.length > 0
+        ? ownerCameraIds
+        : Array.isArray(payload.all_camera_ids)
+          ? (payload.all_camera_ids as unknown[])
+              .map((value) => clampInteger(value))
+              .filter((value): value is number => value > 0)
+          : [];
+    const reverseCameraIdMap = buildReverseSharedJobCameraIdMap(cameraIdMap);
+    const preserveOwnerCameraIds = await loadSharedJobPreserveRunningCameraIds(
+      context.env.DB,
+      context.appUserId,
+      resolvedOwnerCameraIds
+    );
+    const preserveOperatorCameraIds = preserveOwnerCameraIds
+      .map((cameraId) => clampInteger(reverseCameraIdMap[String(cameraId)]))
+      .filter(
+        (cameraId: number, index: number, source: number[]): cameraId is number =>
+          cameraId > 0 && source.indexOf(cameraId) === index
+      );
+    const existingStartCommand = await getLatestSharedSegmentCommandForUser(
+      context.env.DB,
+      context.appUserId,
+      segmentId,
+      "job_start"
+    );
     const payloadJob =
       payload.job && typeof payload.job === "object" && !Array.isArray(payload.job)
         ? ({ ...(payload.job as Record<string, unknown>) } as Record<string, unknown>)
@@ -20674,6 +21685,8 @@ async function handleSharedJobStartRelayMessage(
          current_camera_ids_json,
          remote_camera_ids_json,
          camera_id_map_json,
+         preserve_running_camera_ids_json,
+         allow_event_media,
          status,
          request_id,
          trigger_type,
@@ -20682,7 +21695,7 @@ async function handleSharedJobStartRelayMessage(
          created_at,
          updated_at,
          started_at
-       ) VALUES (?, 'owner', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
+       ) VALUES (?, 'owner', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, NULL)
        ON CONFLICT(segment_id) DO UPDATE SET
          job_id = excluded.job_id,
          job_run_id = excluded.job_run_id,
@@ -20692,12 +21705,22 @@ async function handleSharedJobStartRelayMessage(
          current_camera_ids_json = excluded.current_camera_ids_json,
          remote_camera_ids_json = excluded.remote_camera_ids_json,
          camera_id_map_json = excluded.camera_id_map_json,
-         status = 'running',
+         preserve_running_camera_ids_json = COALESCE(
+           excluded.preserve_running_camera_ids_json,
+           shared_job_segments.preserve_running_camera_ids_json
+         ),
+         allow_event_media = COALESCE(excluded.allow_event_media, shared_job_segments.allow_event_media),
+         status = CASE
+           WHEN shared_job_segments.status IN ('completed', 'failed', 'stopped', 'cancelled')
+             THEN shared_job_segments.status
+           WHEN NULLIF(shared_job_segments.status, '') IS NOT NULL
+             THEN shared_job_segments.status
+           ELSE 'queued'
+         END,
          request_id = excluded.request_id,
          trigger_type = excluded.trigger_type,
          trigger_json = excluded.trigger_json,
          cross_camera_federation_required = excluded.cross_camera_federation_required,
-         started_at = COALESCE(shared_job_segments.started_at, excluded.started_at),
          updated_at = excluded.updated_at`
     )
       .bind(
@@ -20708,9 +21731,11 @@ async function handleSharedJobStartRelayMessage(
         runtimeExecutionDomain,
         context.publicId,
         operatorPublicId,
-        JSON.stringify(ownerCameraIds),
+        JSON.stringify(resolvedOwnerCameraIds),
         JSON.stringify(operatorCameraIds),
         JSON.stringify(cameraIdMap),
+        JSON.stringify(preserveOwnerCameraIds),
+        allowEventMedia ? 1 : 0,
         requestId,
         normalizeText(message.trigger_type) || "manual",
         JSON.stringify({
@@ -20721,46 +21746,122 @@ async function handleSharedJobStartRelayMessage(
         }),
         federatedCrossCamera ? 1 : 0,
         now,
-        now,
         now
       )
       .run();
 
-    const commandResult = await context.env.DB.prepare(
-      `INSERT INTO commands (
-         user_id,
-         camera_id,
-         command_type,
-         payload,
-         status,
-         created_at,
-         updated_at,
-         job_run_id,
-         execution_domain,
-         remote_owner_public_id,
-         shared_segment_id
-       )
-       VALUES (?, NULL, 'job_start', ?, 'pending', ?, ?, ?, ?, ?, ?)`
-    )
-      .bind(
-        context.appUserId,
-        JSON.stringify(payload),
-        now,
-        now,
-        operatorJobRunId,
-        runtimeExecutionDomain,
+    if (existingStartCommand && clampInteger(existingStartCommand.id) > 0) {
+      await updateSharedJobSegmentRow(context.env.DB, {
+        segmentId,
+        requestId,
+        sourceCommandId: clampInteger(existingStartCommand.id),
+        nowIso: now,
+      });
+      console.warn("[SHARED JOB] Ignoring duplicate shared job start relay message", {
+        appUserId: context.appUserId,
         operatorPublicId,
-        segmentId
-      )
-      .run();
+        operatorJobRunId,
+        segmentId,
+        requestId,
+        existingCommandId: existingStartCommand.id,
+      });
+      sendSharedFindRelayClientMessage(context.publicId, {
+        type: "shared_job_start_ack",
+        operator_public_id: operatorPublicId,
+        operator_job_run_id: operatorJobRunId,
+        request_id: requestId,
+        segment_id: segmentId,
+        accepted: true,
+        allow_event_media: allowEventMedia,
+        preserve_running_camera_ids: preserveOperatorCameraIds,
+        target_client_id: normalizeText(existingStartCommand.target_client_id) || null,
+        target_exe_id: normalizeText(existingStartCommand.target_exe_id) || null,
+      });
+      return;
+    }
+
+    const commandTargetResolution = await resolveSharedJobOwnerCommandTarget(
+      context.env.DB,
+      context.appUserId,
+      resolvedOwnerCameraIds
+    );
+    if (!commandTargetResolution.target) {
+      const errorMessage =
+        normalizeText(commandTargetResolution.error) ||
+        "No fresh owner desktop runtime is connected for this shared task.";
+      console.warn("[SHARED JOB] Rejecting shared job start without a connected owner target", {
+        appUserId: context.appUserId,
+        operatorPublicId,
+        operatorJobRunId,
+        segmentId,
+        ownerCameraIds: resolvedOwnerCameraIds,
+        error: errorMessage,
+      });
+      sendSharedFindRelayClientMessage(context.publicId, {
+        type: "shared_job_error",
+        operator_public_id: operatorPublicId,
+        operator_job_run_id: operatorJobRunId,
+        request_id: requestId,
+        segment_id: segmentId,
+        ack_kind: "start",
+        error: errorMessage,
+      });
+      return;
+    }
+    const commandTarget = commandTargetResolution.target;
+    const startCameraPayloads = await buildLocalSegmentStartCameraPayloads(
+      context.env,
+      context.appUserId,
+      resolvedOwnerCameraIds,
+      now
+    );
+    const hasUsableStartPayload = Object.values(startCameraPayloads).some(
+      (value) => !!value && typeof value === "object" && !Array.isArray(value)
+    );
+    if (!hasUsableStartPayload) {
+      sendSharedFindRelayClientMessage(context.publicId, {
+        type: "shared_job_error",
+        operator_public_id: operatorPublicId,
+        operator_job_run_id: operatorJobRunId,
+        request_id: requestId,
+        segment_id: segmentId,
+        ack_kind: "start",
+        error: "The owner runtime could not build a valid camera start payload for this shared task.",
+      });
+      return;
+    }
+    payload.start_camera_payloads = startCameraPayloads;
+
+    const commandResult = await insertSharedSegmentCommandOnce(context.env.DB, {
+      userId: context.appUserId,
+      commandType: "job_start",
+      payload,
+      nowIso: now,
+      jobRunId: operatorJobRunId,
+      executionDomain: runtimeExecutionDomain,
+      remoteOwnerPublicId: operatorPublicId,
+      sharedSegmentId: segmentId,
+      targetClientId: commandTarget.clientId,
+      targetExeId: commandTarget.exeId,
+    });
 
     await updateSharedJobSegmentRow(context.env.DB, {
       segmentId,
-      status: "running",
       requestId,
-      sourceCommandId: Number((commandResult as any)?.meta?.last_row_id || 0),
+      sourceCommandId: Number(commandResult.commandId || 0),
       nowIso: now,
     });
+
+    if (!commandResult.inserted) {
+      console.warn("[SHARED JOB] Ignoring duplicate shared job start relay message", {
+        appUserId: context.appUserId,
+        operatorPublicId,
+        operatorJobRunId,
+        segmentId,
+        requestId,
+        existingCommandId: commandResult.commandId,
+      });
+    }
 
     sendSharedFindRelayClientMessage(context.publicId, {
       type: "shared_job_start_ack",
@@ -20769,6 +21870,11 @@ async function handleSharedJobStartRelayMessage(
       request_id: requestId,
       segment_id: segmentId,
       accepted: true,
+      allow_event_media: allowEventMedia,
+      preserve_running_camera_ids: preserveOperatorCameraIds,
+      target_client_id:
+        normalizeText(commandResult.command?.target_client_id) || commandTarget.clientId,
+      target_exe_id: normalizeText(commandResult.command?.target_exe_id) || commandTarget.exeId,
     });
   } catch (error) {
     sendSharedFindRelayClientMessage(context.publicId, {
@@ -20850,40 +21956,40 @@ async function handleSharedJobStopRelayMessage(
       if (isTerminalSharedJobSegmentStatus(row.status)) {
         continue;
       }
-      await context.env.DB.prepare(
-        `INSERT INTO commands (
-           user_id,
-           camera_id,
-           command_type,
-           payload,
-           status,
-           created_at,
-           updated_at,
-           job_run_id,
-           execution_domain,
-           remote_owner_public_id,
-           shared_segment_id
-         )
-         VALUES (?, NULL, 'job_stop', ?, 'pending', ?, ?, ?, ?, ?, ?)`
-      )
-        .bind(
-          context.appUserId,
-          JSON.stringify({
-            job: {
-              id: clampInteger(row.job_id),
-              name: "Shared job segment",
-            },
-            requested_at_utc: now,
-            reason: normalizeText(message.reason) || "operator_stop_requested",
-          }),
-          now,
-          now,
-          operatorJobRunId,
-          normalizeText(row.execution_domain) || `shared_operator:${operatorPublicId}`,
+      const stopCommandTarget = await resolveSharedJobStopCommandTarget(
+        context.env.DB,
+        context.appUserId,
+        row
+      );
+      const stopCommandResult = await insertSharedSegmentCommandOnce(context.env.DB, {
+        userId: context.appUserId,
+        commandType: "job_stop",
+        payload: {
+          job: {
+            id: clampInteger(row.job_id),
+            name: "Shared job segment",
+          },
+          requested_at_utc: now,
+          reason: normalizeText(message.reason) || "operator_stop_requested",
+        },
+        nowIso: now,
+        jobRunId: operatorJobRunId,
+        executionDomain: normalizeText(row.execution_domain) || `shared_operator:${operatorPublicId}`,
+        remoteOwnerPublicId: operatorPublicId,
+        sharedSegmentId: row.segment_id,
+        targetClientId: stopCommandTarget?.clientId || null,
+        targetExeId: stopCommandTarget?.exeId || null,
+      });
+      if (!stopCommandResult.inserted) {
+        console.warn("[SHARED JOB] Ignoring duplicate shared job stop relay message", {
+          appUserId: context.appUserId,
           operatorPublicId,
-          row.segment_id
-        )
-        .run();
+          operatorJobRunId,
+          segmentId: row.segment_id,
+          requestId,
+          existingCommandId: stopCommandResult.commandId,
+        });
+      }
       await updateSharedJobSegmentRow(context.env.DB, {
         segmentId: row.segment_id,
         status: "stopping",
@@ -21038,6 +22144,10 @@ async function materializeSharedJobRelayEvent(
   relayDetails.shared_execution_domain = segmentRow.execution_domain;
   relayDetails.shared_owner_public_id =
     normalizeText(segmentRow.owner_public_id) || senderPublicId || null;
+  (relayDetails as any).shared_allow_event_media = sharedJobSegmentAllowsEventMedia(
+    segmentRow,
+    relayDetails
+  );
   if (operatorCameraId > 0) {
     relayDetails.camera_id = operatorCameraId;
     relayDetails.operator_camera_id = operatorCameraId;
@@ -21111,6 +22221,17 @@ async function handleSharedJobCommandResultRelayMessage(
       status: "stopped",
       nowIso: now,
     });
+    const refreshedSegmentRow = await getSharedJobSegmentByIdForUser(
+      context.env.DB,
+      context.appUserId,
+      segmentId,
+      "operator"
+    );
+    await clearSharedSegmentCameraRunningState(
+      context.env.DB,
+      context.appUserId,
+      refreshedSegmentRow
+    );
     await maybeFinalizeSharedJobRunFromSegments(context.env, {
       userId: context.appUserId,
       jobRunId: normalizeText(segmentRow.job_run_id),
@@ -21192,9 +22313,35 @@ async function relaySharedJobEventFromOwner(
   relayDetails.shared_segment_id = segmentRow.segment_id;
   relayDetails.shared_execution_domain = segmentRow.execution_domain;
   relayDetails.shared_owner_public_id = centralContext.publicId;
+  relayDetails.shared_allow_event_media = sharedJobSegmentAllowsEventMedia(segmentRow, relayDetails);
 
   if (!allowsSharedJobRelayEventMedia(relayDetails)) {
     stripSharedJobEventMedia(relayDetails);
+  }
+
+  const lifecycleStatus =
+    input.eventType === "job_started"
+      ? "running"
+      : input.eventType === "job_stop_requested"
+        ? "stopping"
+        : input.eventType === "job_completed"
+          ? "completed"
+          : input.eventType === "job_failed"
+            ? "failed"
+            : input.eventType === "job_stopped" || input.eventType === "job_staled"
+              ? "stopped"
+              : "";
+  if (lifecycleStatus) {
+    await updateSharedJobSegmentRow(env.DB, {
+      segmentId: segmentRow.segment_id,
+      status: lifecycleStatus,
+      lastError:
+        lifecycleStatus === "failed"
+          ? normalizeText(input.details.error_message ?? input.details.error ?? input.message) || null
+          : null,
+      allowEventMedia: sharedJobSegmentAllowsEventMedia(segmentRow, relayDetails),
+      nowIso: new Date().toISOString(),
+    });
   }
 
   const sent = sendSharedFindRelayClientMessage(centralContext.publicId, {
@@ -21409,6 +22556,16 @@ async function maybeHandleSharedJobLifecycleEvent(
     nowIso: input.nowIso,
   });
 
+  if (nextStatus === "completed" || nextStatus === "failed" || nextStatus === "stopped") {
+    const refreshedSegmentRow = await getSharedJobSegmentByIdForUser(
+      env.DB,
+      input.userId,
+      segmentRow.segment_id,
+      "operator"
+    );
+    await clearSharedSegmentCameraRunningState(env.DB, input.userId, refreshedSegmentRow);
+  }
+
   await maybeFinalizeSharedJobRunFromSegments(env, {
     userId: input.userId,
     jobRunId,
@@ -21539,6 +22696,14 @@ async function handleSharedFindRelayInboundMessage(
         segmentId,
         status: type === "shared_job_stop_ack" ? "stopping" : "running",
         requestId: normalizeText(message.request_id) || null,
+        allowEventMedia:
+          type === "shared_job_start_ack"
+            ? normalizeDbBoolean(message.allow_event_media, true)
+            : undefined,
+        preserveRunningCameraIds:
+          type === "shared_job_start_ack"
+            ? parsePositiveIntegerArrayJson(message.preserve_running_camera_ids)
+            : undefined,
         nowIso: new Date().toISOString(),
       });
     }
@@ -21897,6 +23062,7 @@ async function serverUserHandleExists(
   handle: string,
   options?: {
     excludePublicId?: string | null;
+    brandId?: RequestEffectiveBrandId | null;
   }
 ): Promise<boolean> {
   const normalizedHandle = normalizeUserHandleInput(handle);
@@ -21904,27 +23070,58 @@ async function serverUserHandleExists(
     return false;
   }
 
+  const brandId = normalizeServerIdentityBrandId(options?.brandId);
   const excludePublicId =
     typeof options?.excludePublicId === "string" ? options.excludePublicId.trim() : "";
+  const shouldTreatLegacyAsDefaultBrand = isLegacyServerIdentityDefaultBrand(brandId);
   const row = excludePublicId
     ? await db
         .prepare(
-          `SELECT 1
-           FROM server_users
-           WHERE handle = ?
-             AND public_id <> ?
-           LIMIT 1`
+          shouldTreatLegacyAsDefaultBrand
+            ? `SELECT 1
+               FROM server_users
+               WHERE LOWER(handle) = LOWER(?)
+                 AND (
+                   COALESCE(brand_id, '') = ?
+                   OR COALESCE(brand_id, '') = ''
+                 )
+                 AND public_id <> ?
+               LIMIT 1`
+            : `SELECT 1
+               FROM server_users
+               WHERE COALESCE(brand_id, '') = ?
+                 AND LOWER(handle) = LOWER(?)
+                 AND public_id <> ?
+               LIMIT 1`
         )
-        .bind(normalizedHandle, excludePublicId)
+        .bind(
+          ...(shouldTreatLegacyAsDefaultBrand
+            ? [normalizedHandle, brandId, excludePublicId]
+            : [brandId, normalizedHandle, excludePublicId])
+        )
         .first()
     : await db
         .prepare(
-          `SELECT 1
-           FROM server_users
-           WHERE handle = ?
-           LIMIT 1`
+          shouldTreatLegacyAsDefaultBrand
+            ? `SELECT 1
+               FROM server_users
+               WHERE LOWER(handle) = LOWER(?)
+                 AND (
+                   COALESCE(brand_id, '') = ?
+                   OR COALESCE(brand_id, '') = ''
+                 )
+               LIMIT 1`
+            : `SELECT 1
+               FROM server_users
+               WHERE COALESCE(brand_id, '') = ?
+                 AND LOWER(handle) = LOWER(?)
+               LIMIT 1`
         )
-        .bind(normalizedHandle)
+        .bind(
+          ...(shouldTreatLegacyAsDefaultBrand
+            ? [normalizedHandle, brandId]
+            : [brandId, normalizedHandle])
+        )
         .first();
 
   return Boolean(row);
@@ -21933,6 +23130,7 @@ async function serverUserHandleExists(
 async function findAvailableServerHandle(
   db: D1Database,
   input: {
+    brandId?: RequestEffectiveBrandId | null;
     email: string;
     preferredHandle?: string | null;
     excludePublicId?: string | null;
@@ -21947,6 +23145,7 @@ async function findAvailableServerHandle(
     const candidate = buildHandleCandidate(baseHandle, collisionIndex);
     if (
       !(await serverUserHandleExists(db, candidate, {
+        brandId: input.brandId || null,
         excludePublicId: input.excludePublicId || null,
       }))
     ) {
@@ -21958,6 +23157,7 @@ async function findAvailableServerHandle(
     const candidate = `${baseHandle}${Date.now().toString(36)}${attempt + 1}`;
     if (
       !(await serverUserHandleExists(db, candidate, {
+        brandId: input.brandId || null,
         excludePublicId: input.excludePublicId || null,
       }))
     ) {
@@ -21996,6 +23196,7 @@ async function ensureServerUserHandle(
   }
 
   const publicId = String(serverUser.public_id || "").trim();
+  const brandId = normalizeServerIdentityBrandId((serverUser as any).brand_id) || null;
   const email = normalizeEmail(String(serverUser.email || ""));
   const existingHandle = normalizeUserHandleInput(serverUser.handle);
   if (existingHandle) {
@@ -22006,6 +23207,7 @@ async function ensureServerUserHandle(
   }
 
   const resolvedHandle = await findAvailableServerHandle(db, {
+    brandId,
     email,
     preferredHandle: options?.preferredHandle || null,
     excludePublicId: publicId,
@@ -22243,6 +23445,59 @@ async function getAppUserRowById(
   return (row as any) || null;
 }
 
+async function adoptLegacyServerUserIntoBrandRealm(
+  db: D1Database,
+  serverUser: any,
+  brandId: RequestEffectiveBrandId | null | undefined
+): Promise<any> {
+  const normalizedBrandId = normalizeRequestEffectiveBrandIdInput(brandId);
+  if (!serverUser || !normalizedBrandId || !isLegacyServerIdentityDefaultBrand(normalizedBrandId)) {
+    return serverUser;
+  }
+
+  if (normalizeServerIdentityBrandId((serverUser as any)?.brand_id)) {
+    return serverUser;
+  }
+
+  const publicId = normalizeText((serverUser as any)?.public_id);
+  const email = normalizeEmail(String((serverUser as any)?.email || ""));
+  if (!publicId) {
+    return serverUser;
+  }
+
+  if (email) {
+    const conflictingBrandRow = await db
+      .prepare(
+        `SELECT public_id
+         FROM server_users
+         WHERE brand_id = ?
+           AND LOWER(email) = LOWER(?)
+           AND public_id <> ?
+         ORDER BY created_at ASC, id ASC
+         LIMIT 1`
+      )
+      .bind(normalizedBrandId, email, publicId)
+      .first();
+    if (conflictingBrandRow) {
+      return serverUser;
+    }
+  }
+
+  const nowIso = new Date().toISOString();
+  await db
+    .prepare(
+      `UPDATE server_users
+       SET brand_id = ?,
+           updated_at = ?
+       WHERE public_id = ?
+         AND COALESCE(brand_id, '') = ''`
+    )
+    .bind(normalizedBrandId, nowIso, publicId)
+    .run();
+
+  return (await getServerUserByPublicId(db, publicId)) || serverUser;
+}
+
 async function getAppUserRowByEmail(
   db: D1Database,
   email: string | null | undefined
@@ -22431,20 +23686,281 @@ async function registerLocalSecretRecoveryFailure(
   };
 }
 
+async function getServerUserByHandle(
+  db: D1Database,
+  handle: string | null | undefined,
+  options?: {
+    brandId?: RequestEffectiveBrandId | null;
+    allowLegacyFallback?: boolean;
+  }
+): Promise<any | null> {
+  const normalizedHandle = normalizeUserHandleInput(handle);
+  if (!normalizedHandle) {
+    return null;
+  }
+
+  const brandId = normalizeRequestEffectiveBrandIdInput(options?.brandId);
+  if (brandId) {
+    if (isLegacyServerIdentityDefaultBrand(brandId)) {
+      const preferred = await db
+        .prepare(
+          `SELECT *
+           FROM server_users
+           WHERE LOWER(handle) = LOWER(?)
+             AND (
+               COALESCE(brand_id, '') = ?
+               OR COALESCE(brand_id, '') = ''
+             )
+           ORDER BY CASE WHEN COALESCE(brand_id, '') = '' THEN 0 ELSE 1 END,
+                    created_at ASC,
+                    id ASC
+           LIMIT 1`
+        )
+        .bind(normalizedHandle, brandId)
+        .first();
+      if (preferred) {
+        return (preferred as any) || null;
+      }
+
+      return null;
+    }
+
+    const exact = await db
+      .prepare(
+        `SELECT *
+         FROM server_users
+         WHERE brand_id = ?
+           AND LOWER(handle) = LOWER(?)
+         ORDER BY created_at ASC, id ASC
+         LIMIT 1`
+      )
+      .bind(brandId, normalizedHandle)
+      .first();
+    if (exact) {
+      return (exact as any) || null;
+    }
+
+    if (options?.allowLegacyFallback !== false) {
+      const legacy = await db
+        .prepare(
+          `SELECT *
+           FROM server_users
+           WHERE COALESCE(brand_id, '') = ''
+             AND LOWER(handle) = LOWER(?)
+           ORDER BY created_at ASC, id ASC
+           LIMIT 1`
+        )
+        .bind(normalizedHandle)
+        .first();
+      if (legacy) {
+        return (legacy as any) || null;
+      }
+    }
+
+    return null;
+  }
+
+  const row = await db
+    .prepare(
+      `SELECT *
+       FROM server_users
+       WHERE LOWER(handle) = LOWER(?)
+       ORDER BY CASE WHEN COALESCE(brand_id, '') = '' THEN 0 ELSE 1 END,
+                created_at ASC,
+                id ASC
+       LIMIT 1`
+    )
+    .bind(normalizedHandle)
+    .first();
+  return (row as any) || null;
+}
+
 async function getServerUserByEmail(
   db: D1Database,
-  email: string | null | undefined
+  email: string | null | undefined,
+  options?: {
+    brandId?: RequestEffectiveBrandId | null;
+    allowLegacyFallback?: boolean;
+  }
 ): Promise<any | null> {
   const normalizedEmail = normalizeEmail(email || "");
   if (!normalizedEmail) {
     return null;
   }
 
+  const brandId = normalizeRequestEffectiveBrandIdInput(options?.brandId);
+  if (brandId) {
+    if (isLegacyServerIdentityDefaultBrand(brandId)) {
+      const preferred = await db
+        .prepare(
+          `SELECT *
+           FROM server_users
+           WHERE LOWER(email) = LOWER(?)
+             AND (
+               COALESCE(brand_id, '') = ?
+               OR COALESCE(brand_id, '') = ''
+             )
+           ORDER BY CASE WHEN COALESCE(brand_id, '') = '' THEN 0 ELSE 1 END,
+                    created_at ASC,
+                    id ASC
+           LIMIT 1`
+        )
+        .bind(normalizedEmail, brandId)
+        .first();
+      if (preferred) {
+        return (preferred as any) || null;
+      }
+
+      return null;
+    }
+
+    const exact = await db
+      .prepare(
+        `SELECT *
+         FROM server_users
+         WHERE brand_id = ?
+           AND LOWER(email) = LOWER(?)
+         ORDER BY created_at ASC, id ASC
+         LIMIT 1`
+      )
+      .bind(brandId, normalizedEmail)
+      .first();
+    if (exact) {
+      return (exact as any) || null;
+    }
+
+    if (options?.allowLegacyFallback !== false) {
+      const legacy = await db
+        .prepare(
+          `SELECT *
+           FROM server_users
+           WHERE COALESCE(brand_id, '') = ''
+             AND LOWER(email) = LOWER(?)
+           ORDER BY created_at ASC, id ASC
+           LIMIT 1`
+        )
+        .bind(normalizedEmail)
+        .first();
+      if (legacy) {
+        return (legacy as any) || null;
+      }
+    }
+
+    return null;
+  }
+
   const row = await db
-    .prepare(`SELECT * FROM server_users WHERE LOWER(email) = LOWER(?) LIMIT 1`)
+    .prepare(
+      `SELECT *
+       FROM server_users
+       WHERE LOWER(email) = LOWER(?)
+       ORDER BY CASE WHEN COALESCE(brand_id, '') = '' THEN 0 ELSE 1 END,
+                created_at ASC,
+                id ASC
+       LIMIT 1`
+    )
     .bind(normalizedEmail)
     .first();
   return (row as any) || null;
+}
+
+async function listServerUsersByHandleAcrossBrands(
+  db: D1Database,
+  handle: string | null | undefined
+): Promise<Array<Record<string, unknown>>> {
+  const normalizedHandle = normalizeUserHandleInput(handle);
+  if (!normalizedHandle) {
+    return [];
+  }
+
+  const { results } = await db
+    .prepare(
+      `SELECT *
+       FROM server_users
+       WHERE LOWER(handle) = LOWER(?)
+       ORDER BY CASE
+                  WHEN COALESCE(brand_id, '') = 'drakon' THEN 0
+                  WHEN COALESCE(brand_id, '') = 'perceptrum' THEN 1
+                  WHEN COALESCE(brand_id, '') = '' THEN 2
+                  ELSE 3
+                END,
+                created_at ASC,
+                id ASC`
+    )
+    .bind(normalizedHandle)
+    .all();
+
+  return Array.isArray(results) ? (results as Array<Record<string, unknown>>) : [];
+}
+
+async function listServerUsersByEmailAcrossBrands(
+  db: D1Database,
+  email: string | null | undefined
+): Promise<Array<Record<string, unknown>>> {
+  const normalizedEmail = normalizeEmail(email || "");
+  if (!normalizedEmail) {
+    return [];
+  }
+
+  const { results } = await db
+    .prepare(
+      `SELECT *
+       FROM server_users
+       WHERE LOWER(email) = LOWER(?)
+       ORDER BY CASE
+                  WHEN COALESCE(brand_id, '') = 'drakon' THEN 0
+                  WHEN COALESCE(brand_id, '') = 'perceptrum' THEN 1
+                  WHEN COALESCE(brand_id, '') = '' THEN 2
+                  ELSE 3
+                END,
+                created_at ASC,
+                id ASC`
+    )
+    .bind(normalizedEmail)
+    .all();
+
+  return Array.isArray(results) ? (results as Array<Record<string, unknown>>) : [];
+}
+
+function pickCrossBrandServerUserCandidate(
+  rows: Array<Record<string, unknown>>,
+  options?: {
+    allowLegacyFallback?: boolean;
+  }
+): Record<string, unknown> | null {
+  const dedupedRows: Array<Record<string, unknown>> = [];
+  const seenPublicIds = new Set<string>();
+
+  for (const row of rows) {
+    const publicId = normalizeText((row as any)?.public_id);
+    if (publicId && seenPublicIds.has(publicId)) {
+      continue;
+    }
+    if (publicId) {
+      seenPublicIds.add(publicId);
+    }
+    dedupedRows.push(row);
+  }
+
+  const brandSpecificRows = dedupedRows.filter(
+    (row) => normalizeServerIdentityBrandId((row as any)?.brand_id) !== ""
+  );
+  if (brandSpecificRows.length === 1) {
+    return brandSpecificRows[0];
+  }
+
+  if (brandSpecificRows.length > 1) {
+    return null;
+  }
+
+  if (options?.allowLegacyFallback === false) {
+    return null;
+  }
+
+  const legacyRows = dedupedRows.filter(
+    (row) => normalizeServerIdentityBrandId((row as any)?.brand_id) === ""
+  );
+  return legacyRows.length === 1 ? legacyRows[0] : null;
 }
 
 async function getServerSecretRecoveryRow(
@@ -22939,6 +24455,7 @@ async function syncLocalIdentityCacheFromGrant(
     serverHandle?: string | null;
     verifiedGrant: VerifiedCentralIdentityGrant;
     deviceSession?: CentralIdentityDeviceSessionPayload | null;
+    allowCentralIdentityRelink?: boolean;
   }
 ): Promise<{
   localUserId: number;
@@ -22960,7 +24477,8 @@ async function syncLocalIdentityCacheFromGrant(
     existing &&
     typeof existing.server_public_id === "string" &&
     existing.server_public_id.trim() &&
-    existing.server_public_id.trim() !== claims.public_id
+    existing.server_public_id.trim() !== claims.public_id &&
+    !input.allowCentralIdentityRelink
   ) {
     throw new Error(
       "The local user cache is linked to a different central identity for this email."
@@ -23147,6 +24665,7 @@ async function createLocalAuthSession(c: any, localUserId: number): Promise<void
 async function createServerUserRecord(
   db: D1Database,
   input: {
+    brandId: RequestEffectiveBrandId;
     email: string;
     passwordHash: string;
     preferredHandle?: string | null;
@@ -23154,15 +24673,21 @@ async function createServerUserRecord(
   }
 ): Promise<any> {
   const nowIso = new Date().toISOString();
+  const brandId = normalizeRequestEffectiveBrandIdInput(input.brandId);
   const email = normalizeEmail(input.email);
   const normalizedCountryCode = normalizeCountryCode(input.countryCode, null);
   const isPgLike = String((db as any)?.constructor?.name || "")
     .toLowerCase()
     .includes("pgd1");
 
+  if (!brandId) {
+    throw new Error("A valid central identity brand id is required.");
+  }
+
   for (let attempt = 0; attempt < 25; attempt += 1) {
     const publicId = generateUUID();
     const resolvedHandle = await findAvailableServerHandle(db, {
+      brandId,
       email,
       preferredHandle: input.preferredHandle || null,
     });
@@ -23172,6 +24697,7 @@ async function createServerUserRecord(
         .prepare(
           `INSERT INTO server_users (
              public_id,
+             brand_id,
              email,
              handle,
              country_code,
@@ -23181,10 +24707,11 @@ async function createServerUserRecord(
              created_at,
              updated_at
            )
-           VALUES (?, ?, ?, ?, ?, ${isPgLike ? "TRUE" : "1"}, 1, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ${isPgLike ? "TRUE" : "1"}, 1, ?, ?)`
         )
         .bind(
           publicId,
+          brandId,
           email,
           resolvedHandle,
           normalizedCountryCode,
@@ -23202,7 +24729,7 @@ async function createServerUserRecord(
       if (
         isDatabaseUniqueConstraintError(error, [
           "server_users.handle",
-          "idx_server_users_handle_unique",
+          "idx_server_users_brand_handle_unique",
           "handle",
         ])
       ) {
@@ -23267,6 +24794,7 @@ async function issueCentralIdentityGrantResponse(
     user: {
       server_id: String(resolvedServerUser.id || ""),
       public_id: String(resolvedServerUser.public_id || ""),
+      brand_id: normalizeServerIdentityBrandId((resolvedServerUser as any).brand_id) || null,
       email: String(resolvedServerUser.email || ""),
       handle: normalizeUserHandleInput(resolvedServerUser.handle),
       country_code: normalizeCountryCode(
@@ -25944,59 +27472,100 @@ async function loadAccountMembershipResourceGrantPayload(
 }
 
 async function loadAccountUsersResourceCatalog(db: D1Database, accountUserId: string) {
+  const hasTable = async (tableName: string) => {
+    try {
+      await db.prepare(`SELECT 1 FROM ${tableName} LIMIT 1`).first();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const [hasCameras, hasJobs, hasJobSteps, hasCameraAlgorithms, hasJobStepAgents] =
+    await Promise.all([
+      hasTable("cameras"),
+      hasTable("jobs"),
+      hasTable("job_steps"),
+      hasTable("camera_algorithms"),
+      hasTable("job_step_agents"),
+    ]);
+
+  const emptyResults = { results: [] as Array<Record<string, unknown>> };
   const [cameraResults, jobResults, cameraAgentResults, jobStepAgentResults] = await Promise.all([
-    db
-      .prepare(
-        `SELECT id, name, description, is_service_running, is_online, updated_at
-         FROM cameras
-         WHERE user_id = ?
-         ORDER BY created_at DESC, id DESC`
-      )
-      .bind(accountUserId)
-      .all(),
-    db
-      .prepare(
-        `SELECT j.id,
-                j.name,
-                j.status,
-                j.schedule_mode,
-                j.updated_at,
-                COUNT(js.id) AS step_count
-         FROM jobs j
-         LEFT JOIN job_steps js ON js.job_id = j.id
-         WHERE j.user_id = ?
-         GROUP BY j.id, j.name, j.status, j.schedule_mode, j.updated_at
-         ORDER BY j.created_at DESC, j.id DESC`
-      )
-      .bind(accountUserId)
-      .all(),
-    db
-      .prepare(
-        `SELECT ca.*,
-                c.name AS camera_name
-         FROM camera_algorithms ca
-         JOIN cameras c ON c.id = ca.camera_id
-         WHERE c.user_id = ?
-         ORDER BY c.name ASC, ca.updated_at DESC, ca.id DESC`
-      )
-      .bind(accountUserId)
-      .all(),
-    db
-      .prepare(
-        `SELECT jsa.*,
-                js.job_id,
-                js.name AS step_name,
-                j.name AS job_name,
-                c.name AS camera_name
-         FROM job_step_agents jsa
-         JOIN job_steps js ON js.id = jsa.step_id
-         JOIN jobs j ON j.id = js.job_id
-         LEFT JOIN cameras c ON c.id = jsa.camera_id
-         WHERE j.user_id = ?
-         ORDER BY j.name ASC, js.step_order ASC, jsa.is_active DESC, jsa.updated_at DESC, jsa.id DESC`
-      )
-      .bind(accountUserId)
-      .all(),
+    hasCameras
+      ? db
+          .prepare(
+            `SELECT id, name, description, is_service_running, is_online, updated_at
+             FROM cameras
+             WHERE user_id = ?
+             ORDER BY created_at DESC, id DESC`
+          )
+          .bind(accountUserId)
+          .all()
+      : emptyResults,
+    hasJobs && hasJobSteps
+      ? db
+          .prepare(
+            `SELECT j.id,
+                    j.name,
+                    j.status,
+                    j.schedule_mode,
+                    j.updated_at,
+                    COUNT(js.id) AS step_count
+             FROM jobs j
+             LEFT JOIN job_steps js ON js.job_id = j.id
+             WHERE j.user_id = ?
+             GROUP BY j.id, j.name, j.status, j.schedule_mode, j.updated_at
+             ORDER BY j.created_at DESC, j.id DESC`
+          )
+          .bind(accountUserId)
+          .all()
+      : hasJobs
+      ? db
+          .prepare(
+            `SELECT id,
+                    name,
+                    status,
+                    schedule_mode,
+                    updated_at,
+                    0 AS step_count
+             FROM jobs
+             WHERE user_id = ?
+             ORDER BY created_at DESC, id DESC`
+          )
+          .bind(accountUserId)
+          .all()
+      : emptyResults,
+    hasCameras && hasCameraAlgorithms
+      ? db
+          .prepare(
+            `SELECT ca.*,
+                    c.name AS camera_name
+             FROM camera_algorithms ca
+             JOIN cameras c ON c.id = ca.camera_id
+             WHERE c.user_id = ?
+             ORDER BY c.name ASC, ca.updated_at DESC, ca.id DESC`
+          )
+          .bind(accountUserId)
+          .all()
+      : emptyResults,
+    hasCameras && hasJobs && hasJobSteps && hasJobStepAgents
+      ? db
+          .prepare(
+            `SELECT jsa.*,
+                    js.job_id,
+                    js.name AS step_name,
+                    j.name AS job_name,
+                    c.name AS camera_name
+             FROM job_step_agents jsa
+             JOIN job_steps js ON js.id = jsa.step_id
+             JOIN jobs j ON j.id = js.job_id
+             LEFT JOIN cameras c ON c.id = jsa.camera_id
+             WHERE j.user_id = ?
+             ORDER BY j.name ASC, js.step_order ASC, jsa.is_active DESC, jsa.updated_at DESC, jsa.id DESC`
+          )
+          .bind(accountUserId)
+          .all()
+      : emptyResults,
   ]);
 
   return {
@@ -26450,7 +28019,9 @@ const anyAuthMiddleware = async (c: any, next: any) => {
     const session = await getLocalSessionUserByToken(c.env.DB, localSessionToken);
 
     if (session) {
-      const sessionData = session as any;
+      const sessionData = shouldDetachLegacyCentralIdentityLinks()
+        ? await detachLocalUserFromCentralIdentityLink(c.env.DB, session as any)
+        : (session as any);
       const userId = resolveCanonicalAppUserIdFromLocalUserRow(sessionData);
 
       // Ensure app_users row exists
@@ -27411,6 +28982,22 @@ function openMonitorBuildCameraRows(
       camera_name:
         payload.camera_name ||
         (typeof configuredCamera?.name === "string" ? configuredCamera.name : `Camera #${cameraId}`),
+      connection_method:
+        typeof payload.connection_method === "string" && payload.connection_method.trim()
+          ? payload.connection_method.trim()
+          : null,
+      active_source:
+        typeof payload.active_source === "string" && payload.active_source.trim()
+          ? payload.active_source.trim()
+          : null,
+      thumbnail_path:
+        typeof payload.thumbnail_path === "string" && payload.thumbnail_path.trim()
+          ? payload.thumbnail_path.trim()
+          : null,
+      clip_directory:
+        typeof payload.clip_directory === "string" && payload.clip_directory.trim()
+          ? payload.clip_directory.trim()
+          : null,
       actual_fps:
         row?.actual_fps !== undefined && row?.actual_fps !== null ? Number(row.actual_fps) || 0 : null,
       expected_fps:
@@ -27445,6 +29032,9 @@ function openMonitorBuildCameraRows(
       height: payload.height !== undefined ? Number(payload.height) || 0 : null,
       use_gpu: payload.use_gpu !== undefined ? Boolean(payload.use_gpu) : null,
       stream_online: payload.stream_online !== undefined ? Boolean(payload.stream_online) : null,
+      input_rate: payload.input_rate !== undefined ? Number(payload.input_rate) || 0 : null,
+      processing_rate:
+        payload.processing_rate !== undefined ? Number(payload.processing_rate) || 0 : null,
       capture_read_latency_ms:
         payload.capture_read_latency_ms !== undefined
           ? Number(payload.capture_read_latency_ms) || 0
@@ -28104,10 +29694,18 @@ app.post("/api/account-security/setup", anyAuthMiddleware, async (c) => {
     normalizeText((localIdentity as any)?.server_public_id) || appUserState?.publicId
   );
 
-  if (isCentralIdentityClientConfigured(c.env) && hasCentralLink) {
+  if (
+    isCentralIdentityClientConfigured(c.env) &&
+    shouldAutoLinkLocalAccountsToCentralIdentity() &&
+    hasCentralLink
+  ) {
     let centralContext: CentralUserRelayContext;
     try {
-      centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+      centralContext = await resolveCurrentUserCentralRelayContext(
+        c.env,
+        user,
+        resolveRequestEffectiveBrandId(c)
+      );
     } catch (error) {
       return c.json(
         {
@@ -28232,7 +29830,7 @@ app.post("/api/auth/recovery/question", async (c) => {
     });
   }
 
-  if (isCentralIdentityClientConfigured(c.env)) {
+  if (isCentralIdentityClientConfigured(c.env) && shouldAutoLinkLocalAccountsToCentralIdentity()) {
     try {
       const remote = await callCentralIdentityEndpoint(
         c.env,
@@ -28371,6 +29969,19 @@ app.post("/api/auth/recovery/reset", async (c) => {
       email,
       serverPublicId: localMirror.appUserId,
     });
+    const appUserRow = await getAppUserRowById(c.env.DB, localMirror.appUserId);
+    if (
+      shouldAutoLinkLocalAccountsToCentralIdentity() &&
+      hasCentralIdentityLink({
+        localUser: localUser as any,
+        appUser: appUserRow,
+      })
+    ) {
+      return c.json(
+        buildCentralPasswordSyncRequiredError(CENTRAL_PASSWORD_SYNC_REQUIRED_ERROR),
+        409
+      );
+    }
 
     if (localUser) {
       await c.env.DB
@@ -28383,7 +29994,6 @@ app.post("/api/auth/recovery/reset", async (c) => {
         .bind(passwordHash, new Date().toISOString(), (localUser as any).id)
         .run();
     } else {
-      const appUserRow = await getAppUserRowById(c.env.DB, localMirror.appUserId);
       localUser = await ensureLocalPasswordIdentityForAppUser(c.env.DB, {
         appUserId: localMirror.appUserId,
         email,
@@ -28402,7 +30012,7 @@ app.post("/api/auth/recovery/reset", async (c) => {
     });
   }
 
-  if (isCentralIdentityClientConfigured(c.env)) {
+  if (isCentralIdentityClientConfigured(c.env) && shouldAutoLinkLocalAccountsToCentralIdentity()) {
     let remote: Awaited<ReturnType<typeof callCentralIdentityEndpoint>>;
     try {
       remote = await callCentralIdentityEndpoint(
@@ -28477,6 +30087,7 @@ app.post("/api/identity/signup", async (c) => {
   }
 
   try {
+    const requestBrandId = resolveRequestEffectiveBrandId(c);
     const body = await c.req.json<{
       email: string;
       password: string;
@@ -28495,16 +30106,17 @@ app.post("/api/identity/signup", async (c) => {
       return c.json({ error: "Password must be at least 8 characters" }, 400);
     }
 
-    const existing = await c.env.DB
-      .prepare(`SELECT * FROM server_users WHERE LOWER(email) = LOWER(?) LIMIT 1`)
-      .bind(email)
-      .first();
+    const existing = await getServerUserByEmail(c.env.DB, email, {
+      brandId: requestBrandId,
+      allowLegacyFallback: false,
+    });
     if (existing) {
       return c.json({ error: "Email already registered" }, 409);
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
     const createdUser = await createServerUserRecord(c.env.DB, {
+      brandId: requestBrandId,
       email,
       passwordHash,
       preferredHandle: body.handle,
@@ -28533,25 +30145,28 @@ app.post("/api/identity/login", async (c) => {
   }
 
   try {
+    const requestBrandId = resolveRequestEffectiveBrandId(c);
     const body = await c.req.json<{
       email: string;
       password: string;
       handle?: string;
       country_code?: string;
+      allow_legacy_fallback?: boolean;
     }>();
 
     const email = normalizeEmail(body.email);
     const password = body.password;
     const countryCode = normalizeCountryCode(body.country_code, null);
+    const allowLegacyFallback = body.allow_legacy_fallback !== false;
 
     if (!isValidEmail(email) || !password) {
       return c.json({ error: "Invalid email or password" }, 400);
     }
 
-    const existing = await c.env.DB
-      .prepare(`SELECT * FROM server_users WHERE LOWER(email) = LOWER(?) LIMIT 1`)
-      .bind(email)
-      .first();
+    let existing = await getServerUserByEmail(c.env.DB, email, {
+      brandId: requestBrandId,
+      allowLegacyFallback,
+    });
     if (!existing) {
       return c.json({ error: "Invalid email or password" }, 401);
     }
@@ -28563,6 +30178,8 @@ app.post("/api/identity/login", async (c) => {
     if (!passwordMatches) {
       return c.json({ error: "Invalid email or password" }, 401);
     }
+
+    existing = await adoptLegacyServerUserIntoBrandRealm(c.env.DB, existing, requestBrandId);
 
     const nowIso = new Date().toISOString();
     await updateServerUserLoginMetadata(c.env.DB, (existing as any).id, {
@@ -28606,25 +30223,28 @@ app.post("/api/identity/migrate-login", async (c) => {
   }
 
   try {
+    const requestBrandId = resolveRequestEffectiveBrandId(c);
     const body = await c.req.json<{
       email: string;
       password: string;
       handle?: string;
       country_code?: string;
+      allow_legacy_fallback?: boolean;
     }>();
 
     const email = normalizeEmail(body.email);
     const password = body.password;
     const countryCode = normalizeCountryCode(body.country_code, null);
+    const allowLegacyFallback = body.allow_legacy_fallback === true;
 
     if (!isValidEmail(email) || !password) {
       return c.json({ error: "Invalid email or password" }, 400);
     }
 
-    const existing = await c.env.DB
-      .prepare(`SELECT * FROM server_users WHERE LOWER(email) = LOWER(?) LIMIT 1`)
-      .bind(email)
-      .first();
+    let existing = await getServerUserByEmail(c.env.DB, email, {
+      brandId: requestBrandId,
+      allowLegacyFallback,
+    });
 
     if (existing) {
       const passwordMatches = await bcrypt.compare(
@@ -28634,6 +30254,8 @@ app.post("/api/identity/migrate-login", async (c) => {
       if (!passwordMatches) {
         return c.json({ error: "Invalid email or password" }, 401);
       }
+
+      existing = await adoptLegacyServerUserIntoBrandRealm(c.env.DB, existing, requestBrandId);
 
       const nowIso = new Date().toISOString();
       await updateServerUserLoginMetadata(c.env.DB, (existing as any).id, {
@@ -28666,6 +30288,7 @@ app.post("/api/identity/migrate-login", async (c) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
     const createdUser = await createServerUserRecord(c.env.DB, {
+      brandId: requestBrandId,
       email,
       passwordHash,
       preferredHandle: body.handle,
@@ -28722,6 +30345,12 @@ app.post("/api/identity/refresh", async (c) => {
     );
     if (!serverUser) {
       return c.json({ error: "Central identity user not found." }, 404);
+    }
+    const requestBrandId = resolveRequestEffectiveBrandId(c);
+    if (
+      !isServerIdentityVisibleInBrandRealm(serverUser as any, requestBrandId)
+    ) {
+      return c.json({ error: "This account does not belong to this application realm." }, 403);
     }
 
     const response = await issueCentralIdentityGrantResponse(c.env, c.env.DB, serverUser, {
@@ -28798,6 +30427,7 @@ app.post("/api/identity/google-upsert", async (c) => {
   const googleSubject = getGoogleSubject(googleUser);
   const countryCode = normalizeCountryCode(body.country_code, null);
   const preferredHandle = normalizeUserHandleInput(body.handle);
+  const requestBrandId = resolveRequestEffectiveBrandId(c);
 
   if (!isValidEmail(email)) {
     return c.json({ error: "Google account email is invalid." }, 400);
@@ -28806,10 +30436,10 @@ app.post("/api/identity/google-upsert", async (c) => {
     return c.json({ error: "Google account subject is missing." }, 400);
   }
 
-  let existing = await c.env.DB
-    .prepare(`SELECT * FROM server_users WHERE LOWER(email) = LOWER(?) LIMIT 1`)
-    .bind(email)
-    .first();
+  let existing = await getServerUserByEmail(c.env.DB, email, {
+    brandId: requestBrandId,
+    allowLegacyFallback: true,
+  });
 
   const nowIso = new Date().toISOString();
   let statusCode = 200;
@@ -28820,6 +30450,7 @@ app.post("/api/identity/google-upsert", async (c) => {
     }
 
     existing = await createServerUserRecord(c.env.DB, {
+      brandId: requestBrandId,
       email,
       passwordHash: `!google_oauth:${googleSubject}`,
       preferredHandle,
@@ -28954,7 +30585,11 @@ app.post("/api/identity/recovery/question", async (c) => {
     return c.json({ error: "Invalid email format" }, 400);
   }
 
-  const serverUser = await getServerUserByEmail(c.env.DB, email);
+  const requestBrandId = resolveRequestEffectiveBrandId(c);
+  const serverUser = await getServerUserByEmail(c.env.DB, email, {
+    brandId: requestBrandId,
+    allowLegacyFallback: true,
+  });
   if (!serverUser) {
     return c.json({ error: "Password recovery is not configured for this account." }, 404);
   }
@@ -29009,7 +30644,11 @@ app.post("/api/identity/recovery/reset-password", async (c) => {
     return c.json({ error: "Password must be at least 8 characters" }, 400);
   }
 
-  const serverUser = await getServerUserByEmail(c.env.DB, email);
+  const requestBrandId = resolveRequestEffectiveBrandId(c);
+  const serverUser = await getServerUserByEmail(c.env.DB, email, {
+    brandId: requestBrandId,
+    allowLegacyFallback: true,
+  });
   if (!serverUser) {
     return c.json({ error: "Password recovery is not configured for this account." }, 404);
   }
@@ -29107,6 +30746,7 @@ app.patch("/api/identity/handle", async (c) => {
     if (
       await serverUserHandleExists(c.env.DB, normalizedHandle, {
         excludePublicId: publicId,
+        brandId: normalizeServerIdentityBrandId((serverUser as any).brand_id) || null,
       })
     ) {
       return c.json({ error: "Handle already in use." }, 409);
@@ -29125,7 +30765,7 @@ app.patch("/api/identity/handle", async (c) => {
       if (
         isDatabaseUniqueConstraintError(error, [
           "server_users.handle",
-          "idx_server_users_handle_unique",
+          "idx_server_users_brand_handle_unique",
           "handle",
         ])
       ) {
@@ -29214,13 +30854,20 @@ app.post("/api/find-share-users/resolve", async (c) => {
   const body = await c.req
     .json<{
       query?: string;
+      target_brand_id?: string;
     }>()
     .catch(() => null);
   if (!body) {
     return c.json({ error: "Invalid request body" }, 400);
   }
 
-  const resolved = await resolveCentralFindShareUserByQuery(c.env.DB, body.query);
+  const explicitTargetBrandId = normalizeRequestEffectiveBrandIdInput(body.target_brand_id);
+  const targetBrandId = explicitTargetBrandId || resolveRequestEffectiveBrandId(c);
+  const resolved = await resolveCentralFindShareUserByQuery(c.env.DB, body.query, {
+    brandId: targetBrandId,
+    allowLegacyFallback: true,
+    allowCrossBrandFallback: true,
+  });
   if (!resolved) {
     return c.json({ error: "No user matched the provided handle or email." }, 404);
   }
@@ -29248,6 +30895,7 @@ app.post("/api/find-shares", async (c) => {
     .json<{
       invitee_public_id?: string;
       query?: string;
+      target_brand_id?: string;
       origin_brand_id?: string;
       permission_profile?: string;
       access_config_json?: string | Record<string, unknown>;
@@ -29264,11 +30912,15 @@ app.post("/api/find-shares", async (c) => {
   }
 
   const inviteePublicId = normalizeText(body.invitee_public_id);
+  const explicitTargetBrandId = normalizeRequestEffectiveBrandIdInput(body.target_brand_id);
+  const targetBrandId = explicitTargetBrandId || resolveRequestEffectiveBrandId(c);
   const resolvedInvitee = inviteePublicId
-    ? {
-        public_id: inviteePublicId,
-      }
-    : await resolveCentralFindShareUserByQuery(c.env.DB, body.query);
+    ? await getServerUserByPublicId(c.env.DB, inviteePublicId)
+    : await resolveCentralFindShareUserByQuery(c.env.DB, body.query, {
+        brandId: targetBrandId,
+        allowLegacyFallback: true,
+        allowCrossBrandFallback: true,
+      });
   if (!resolvedInvitee?.public_id) {
     return c.json({ error: "No user matched the provided handle or email." }, 404);
   }
@@ -29396,7 +31048,8 @@ app.post("/api/find-shares/:shareId/revoke", async (c) => {
 
 app.post("/api/workspace-access/users/resolve", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29412,7 +31065,10 @@ app.post("/api/workspace-access/users/resolve", async (c) => {
     return c.json({ error: "Invalid request body" }, 400);
   }
 
-  const resolved = await resolveCentralFindShareUserByQuery(c.env.DB, body.query);
+  const resolved = await resolveCentralFindShareUserByQuery(c.env.DB, body.query, {
+    brandId: requestBrand.id,
+    allowLegacyFallback: true,
+  });
   if (!resolved) {
     return c.json({ error: "No user matched the provided handle or email." }, 404);
   }
@@ -29432,7 +31088,8 @@ app.post("/api/workspace-access/users/resolve", async (c) => {
 
 app.post("/api/workspace-access/invites", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29456,8 +31113,17 @@ app.post("/api/workspace-access/invites", async (c) => {
 
   const inviteePublicId = normalizeText(body.invitee_public_id);
   const resolvedInvitee = inviteePublicId
-    ? { public_id: inviteePublicId }
-    : await resolveCentralFindShareUserByQuery(c.env.DB, body.query);
+    ? await getServerUserByPublicId(c.env.DB, inviteePublicId)
+    : await resolveCentralFindShareUserByQuery(c.env.DB, body.query, {
+        brandId: requestBrand.id,
+        allowLegacyFallback: true,
+      });
+  if (
+    resolvedInvitee &&
+    !isServerIdentityVisibleInBrandRealm(resolvedInvitee as any, requestBrand.id)
+  ) {
+    return c.json({ error: "No user matched the provided handle or email." }, 404);
+  }
   if (!resolvedInvitee?.public_id) {
     return c.json({ error: "No user matched the provided handle or email." }, 404);
   }
@@ -29465,7 +31131,7 @@ app.post("/api/workspace-access/invites", async (c) => {
   try {
     const accessConfig = resolveRequestedWorkspaceAccessConfiguration(body);
     const invite = await createOrUpdateCentralWorkspaceAccessInvite(c.env.DB, {
-      brandId: brand.id,
+      brandId: requestBrand.id,
       ownerPublicId: verified.claims.public_id,
       inviteePublicId: resolvedInvitee.public_id,
       permissionProfile: accessConfig.fullAccess
@@ -29488,7 +31154,8 @@ app.post("/api/workspace-access/invites", async (c) => {
 
 app.get("/api/workspace-access/invites/incoming", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29498,14 +31165,15 @@ app.get("/api/workspace-access/invites/incoming", async (c) => {
   const invites = await listCentralWorkspaceAccessInvites(c.env.DB, {
     role: "incoming",
     publicId: verified.claims.public_id,
-    brandId: brand.id,
+    brandId: requestBrand.id,
   });
   return c.json({ invites });
 });
 
 app.get("/api/workspace-access/invites/outgoing", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29515,14 +31183,15 @@ app.get("/api/workspace-access/invites/outgoing", async (c) => {
   const invites = await listCentralWorkspaceAccessInvites(c.env.DB, {
     role: "outgoing",
     publicId: verified.claims.public_id,
-    brandId: brand.id,
+    brandId: requestBrand.id,
   });
   return c.json({ invites });
 });
 
 app.get("/api/workspace-access/available", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29530,7 +31199,7 @@ app.get("/api/workspace-access/available", async (c) => {
   if ("error" in verified) return verified.error;
 
   const accesses = await listCentralWorkspaceAvailableAccesses(c.env.DB, {
-    brandId: brand.id,
+    brandId: requestBrand.id,
     inviteePublicId: verified.claims.public_id,
   });
   return c.json({ accesses });
@@ -29538,7 +31207,8 @@ app.get("/api/workspace-access/available", async (c) => {
 
 app.post("/api/workspace-access/invites/:inviteId/accept", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29558,7 +31228,8 @@ app.post("/api/workspace-access/invites/:inviteId/accept", async (c) => {
 
 app.post("/api/workspace-access/invites/:inviteId/deny", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29578,7 +31249,8 @@ app.post("/api/workspace-access/invites/:inviteId/deny", async (c) => {
 
 app.post("/api/workspace-access/invites/:inviteId/revoke", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29598,7 +31270,8 @@ app.post("/api/workspace-access/invites/:inviteId/revoke", async (c) => {
 
 app.post("/api/workspace-access/presence", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29616,7 +31289,7 @@ app.post("/api/workspace-access/presence", async (c) => {
     .catch(() => ({}));
 
   const presence = await upsertCentralWorkspaceHostPresence(c.env.DB, {
-    brandId: brand.id,
+    brandId: requestBrand.id,
     ownerPublicId: verified.claims.public_id,
     appInstanceId: normalizeText(body?.app_instance_id) || `desktop_${generateUUID()}`,
     connectionPolicy: normalizeWorkspaceConnectionPolicy(body?.connection_policy),
@@ -29630,7 +31303,8 @@ app.post("/api/workspace-access/presence", async (c) => {
 
 app.post("/api/workspace-access/sessions", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29650,7 +31324,7 @@ app.post("/api/workspace-access/sessions", async (c) => {
     c.env.DB,
     clampInteger(body.invite_id)
   );
-  if (!invite || invite.brand_id !== brand.id) {
+  if (!invite || invite.brand_id !== requestBrand.id) {
     return c.json({ error: "Workspace invite not found." }, 404);
   }
   if (invite.invitee_public_id !== verified.claims.public_id || invite.status !== "accepted") {
@@ -29695,7 +31369,8 @@ app.post("/api/workspace-access/sessions", async (c) => {
 
 app.get("/api/workspace-access/sessions", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29705,7 +31380,7 @@ app.get("/api/workspace-access/sessions", async (c) => {
   const role = normalizeText(c.req.query("role")) === "operator" ? "operator" : "owner";
   const statuses = normalizeWorkspaceSessionStatusFilters(c.req.query("status"));
   const sessions = await listCentralWorkspaceAccessSessions(c.env.DB, {
-    brandId: brand.id,
+    brandId: requestBrand.id,
     role,
     publicId: verified.claims.public_id,
     statuses,
@@ -29716,7 +31391,8 @@ app.get("/api/workspace-access/sessions", async (c) => {
 
 app.get("/api/workspace-access/sessions/:sessionId", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29727,7 +31403,7 @@ app.get("/api/workspace-access/sessions/:sessionId", async (c) => {
     c.env.DB,
     c.req.param("sessionId")
   );
-  if (!session || session.brand_id !== brand.id) {
+  if (!session || session.brand_id !== requestBrand.id) {
     return c.json({ error: "Workspace session not found." }, 404);
   }
   if (
@@ -29742,7 +31418,8 @@ app.get("/api/workspace-access/sessions/:sessionId", async (c) => {
 
 app.post("/api/workspace-access/sessions/:sessionId/approve", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29762,7 +31439,8 @@ app.post("/api/workspace-access/sessions/:sessionId/approve", async (c) => {
 
 app.post("/api/workspace-access/sessions/:sessionId/deny", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29783,7 +31461,8 @@ app.post("/api/workspace-access/sessions/:sessionId/deny", async (c) => {
 
 app.post("/api/workspace-access/sessions/:sessionId/activate", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29803,7 +31482,8 @@ app.post("/api/workspace-access/sessions/:sessionId/activate", async (c) => {
 
 app.post("/api/workspace-access/sessions/:sessionId/end", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -29833,7 +31513,8 @@ app.post("/api/workspace-access/sessions/:sessionId/end", async (c) => {
 
 app.post("/api/workspace-relay/session", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
-  if (!brand.features.workspaceAccessEnabled) {
+  const requestBrand = resolveRequestEffectiveBrand(c);
+  if (!requestBrand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
   }
 
@@ -30506,6 +32187,7 @@ app.post("/api/shared-find/users/resolve", anyAuthMiddleware, async (c) => {
   const body = await c.req
     .json<{
       query?: string;
+      target_brand_id?: string;
     }>()
     .catch(() => null);
   if (!body) {
@@ -30515,16 +32197,25 @@ app.post("/api/shared-find/users/resolve", anyAuthMiddleware, async (c) => {
     return c.json({ error: "Central identity server is not configured." }, 503);
   }
 
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const centralContext = await resolveCurrentUserCentralRelayContext(
+    c.env,
+    user,
+    resolveRequestEffectiveBrandId(c)
+  );
+  const explicitTargetBrandId = normalizeRequestEffectiveBrandIdInput(body.target_brand_id);
+  const remoteBody: Record<string, unknown> = {
+    query: body.query,
+  };
+  if (explicitTargetBrandId) {
+    remoteBody.target_brand_id = explicitTargetBrandId;
+  }
   const remote = await callCentralIdentityAuthorizedEndpoint(
     c.env,
     "/api/find-share-users/resolve",
     {
       method: "POST",
       token: centralContext.grantToken,
-      body: {
-        query: body.query,
-      },
+      body: remoteBody,
     }
   );
 
@@ -30540,7 +32231,10 @@ app.get("/api/shared-find/incoming", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const synced = await syncSharedFindCameraCacheForUser(c.env, user);
   return c.json({
-    shares: synced.incoming,
+    shares: synced.incoming.filter(
+      (share: CentralCameraFindShareRow) =>
+        share.status !== "revoked" && share.status !== "denied"
+    ),
     sync_error: synced.sync_error,
   });
 });
@@ -30552,9 +32246,15 @@ app.get("/api/shared-find/outgoing", anyAuthMiddleware, async (c) => {
   const shares =
     cameraId > 0
       ? synced.outgoing.filter(
-          (share: CentralCameraFindShareRow) => share.owner_local_camera_id === cameraId
+          (share: CentralCameraFindShareRow) =>
+            share.owner_local_camera_id === cameraId &&
+            share.status !== "revoked" &&
+            share.status !== "denied"
         )
-      : synced.outgoing;
+      : synced.outgoing.filter(
+          (share: CentralCameraFindShareRow) =>
+            share.status !== "revoked" && share.status !== "denied"
+        );
   return c.json({
     shares,
     sync_error: synced.sync_error,
@@ -30580,13 +32280,30 @@ app.get("/api/shared-find/cameras", anyAuthMiddleware, async (c) => {
   return c.json({ cameras });
 });
 
+function buildSharedFindActionErrorResponse(c: any, error: unknown, fallback: string) {
+  const message = normalizeText((error as any)?.message) || fallback;
+  const normalized = message.toLowerCase();
+  const status = normalized.includes("central identity refresh")
+    ? 409
+    : normalized === "central identity server is not configured."
+      ? 503
+      : normalized.includes("not allowed to use shared find")
+        ? 403
+        : normalized.includes("not found")
+          ? 404
+          : 502;
+  return c.json({ error: message }, status as any);
+}
+
 async function createSharedFindInvitationForOwnedCamera(
   env: any,
   user: any,
   cameraRow: Record<string, unknown>,
+  originBrandId: RequestEffectiveBrandId,
   body: {
     query?: unknown;
     invitee_public_id?: unknown;
+    target_brand_id?: unknown;
     permission_profile?: unknown;
     access_config?: Record<string, unknown> | null;
   }
@@ -30608,30 +32325,39 @@ async function createSharedFindInvitationForOwnedCamera(
     };
   }
 
-  const centralContext = await resolveCurrentUserCentralRelayContext(env, user);
+  const centralContext = await resolveCurrentUserCentralRelayContext(
+    env,
+    user,
+    originBrandId
+  );
+  const explicitTargetBrandId = normalizeRequestEffectiveBrandIdInput(body.target_brand_id);
+  const remoteBody: Record<string, unknown> = {
+    query: body.query,
+    invitee_public_id: normalizeText(body.invitee_public_id),
+    origin_brand_id: originBrandId,
+    permission_profile: normalizeSharedCameraPermissionProfile(
+      body.permission_profile,
+      "shared_job_execution"
+    ),
+    access_config:
+      (body.access_config && typeof body.access_config === "object"
+        ? body.access_config
+        : buildSharedCameraAccessPayload(
+            buildDefaultSharedCameraAccessConfiguration("shared_job_execution")
+          )) || {},
+    owner_local_camera_id: cameraId,
+    camera_name: normalizeText(cameraRow.name),
+    city: normalizeOptionalText(cameraRow.city),
+    state_code: normalizeOptionalText(cameraRow.state_code),
+    country_code: normalizeCountryCode(cameraRow.country_code, null) || "BR",
+  };
+  if (explicitTargetBrandId) {
+    remoteBody.target_brand_id = explicitTargetBrandId;
+  }
   const remote = await callCentralIdentityAuthorizedEndpoint(env, "/api/find-shares", {
     method: "POST",
     token: centralContext.grantToken,
-    body: {
-      query: body.query,
-      invitee_public_id: normalizeText(body.invitee_public_id),
-      origin_brand_id: brand.id,
-      permission_profile: normalizeSharedCameraPermissionProfile(
-        body.permission_profile,
-        "shared_job_execution"
-      ),
-      access_config:
-        (body.access_config && typeof body.access_config === "object"
-          ? body.access_config
-          : buildSharedCameraAccessPayload(
-              buildDefaultSharedCameraAccessConfiguration("shared_job_execution")
-            )) || {},
-      owner_local_camera_id: cameraId,
-      camera_name: normalizeText(cameraRow.name),
-      city: normalizeOptionalText(cameraRow.city),
-      state_code: normalizeOptionalText(cameraRow.state_code),
-      country_code: normalizeCountryCode(cameraRow.country_code, null) || "BR",
-    },
+    body: remoteBody,
   });
 
   if (remote.response.ok) {
@@ -30679,69 +32405,114 @@ app.post("/api/shared-find/cameras/:cameraId/shares", anyAuthMiddleware, async (
     return c.json({ error: "Camera not found." }, 404);
   }
 
-  const shareResult = await createSharedFindInvitationForOwnedCamera(
-    c.env,
-    user,
-    cameraRow as Record<string, unknown>,
-    body
-  );
+  try {
+    const shareResult = await createSharedFindInvitationForOwnedCamera(
+      c.env,
+      user,
+      cameraRow as Record<string, unknown>,
+      resolveRequestEffectiveBrandId(c),
+      body
+    );
 
-  return c.json(shareResult.data, shareResult.status as any);
+    return c.json(shareResult.data, shareResult.status as any);
+  } catch (error) {
+    return buildSharedFindActionErrorResponse(
+      c,
+      error,
+      "Failed to create the shared camera invitation."
+    );
+  }
 });
 
 app.post("/api/shared-find/shares/:shareId/accept", anyAuthMiddleware, async (c) => {
-  const user = c.get("user")!;
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
-  const remote = await callCentralIdentityAuthorizedEndpoint(
-    c.env,
-    `/api/find-shares/${encodeURIComponent(String(clampInteger(c.req.param("shareId"))))}/accept`,
-    {
-      method: "POST",
-      token: centralContext.grantToken,
-      body: {},
+  try {
+    const user = c.get("user")!;
+    const centralContext = await resolveCurrentUserCentralRelayContext(
+      c.env,
+      user,
+      resolveRequestEffectiveBrandId(c)
+    );
+    const remote = await callCentralIdentityAuthorizedEndpoint(
+      c.env,
+      `/api/find-shares/${encodeURIComponent(String(clampInteger(c.req.param("shareId"))))}/accept`,
+      {
+        method: "POST",
+        token: centralContext.grantToken,
+        body: {},
+      }
+    );
+    if (remote.response.ok) {
+      await syncSharedFindCameraCacheForUser(c.env, user);
+      await maybeEnsureSharedFindRelayForUser(c.env, user);
     }
-  );
-  if (remote.response.ok) {
-    await syncSharedFindCameraCacheForUser(c.env, user);
-    await maybeEnsureSharedFindRelayForUser(c.env, user);
+    return c.json(remote.data || {}, (remote.response.status || 502) as any);
+  } catch (error) {
+    return buildSharedFindActionErrorResponse(
+      c,
+      error,
+      "Failed to accept the shared camera invitation."
+    );
   }
-  return c.json(remote.data || {}, (remote.response.status || 502) as any);
 });
 
 app.post("/api/shared-find/shares/:shareId/deny", anyAuthMiddleware, async (c) => {
-  const user = c.get("user")!;
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
-  const remote = await callCentralIdentityAuthorizedEndpoint(
-    c.env,
-    `/api/find-shares/${encodeURIComponent(String(clampInteger(c.req.param("shareId"))))}/deny`,
-    {
-      method: "POST",
-      token: centralContext.grantToken,
-      body: {},
+  try {
+    const user = c.get("user")!;
+    const centralContext = await resolveCurrentUserCentralRelayContext(
+      c.env,
+      user,
+      resolveRequestEffectiveBrandId(c)
+    );
+    const remote = await callCentralIdentityAuthorizedEndpoint(
+      c.env,
+      `/api/find-shares/${encodeURIComponent(String(clampInteger(c.req.param("shareId"))))}/deny`,
+      {
+        method: "POST",
+        token: centralContext.grantToken,
+        body: {},
+      }
+    );
+    if (remote.response.ok) {
+      await syncSharedFindCameraCacheForUser(c.env, user);
     }
-  );
-  if (remote.response.ok) {
-    await syncSharedFindCameraCacheForUser(c.env, user);
+    return c.json(remote.data || {}, (remote.response.status || 502) as any);
+  } catch (error) {
+    return buildSharedFindActionErrorResponse(
+      c,
+      error,
+      "Failed to deny the shared camera invitation."
+    );
   }
-  return c.json(remote.data || {}, (remote.response.status || 502) as any);
 });
 
 app.post("/api/shared-find/shares/:shareId/revoke", anyAuthMiddleware, async (c) => {
-  const user = c.get("user")!;
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
-  const remote = await callCentralIdentityAuthorizedEndpoint(
-    c.env,
-    `/api/find-shares/${encodeURIComponent(String(clampInteger(c.req.param("shareId"))))}/revoke`,
-    {
-      method: "POST",
-      token: centralContext.grantToken,
-      body: {},
+  try {
+    const user = c.get("user")!;
+    const centralContext = await resolveCurrentUserCentralRelayContext(
+      c.env,
+      user,
+      resolveRequestEffectiveBrandId(c)
+    );
+    const remote = await callCentralIdentityAuthorizedEndpoint(
+      c.env,
+      `/api/find-shares/${encodeURIComponent(String(clampInteger(c.req.param("shareId"))))}/revoke`,
+      {
+        method: "POST",
+        token: centralContext.grantToken,
+        body: {},
+      }
+    );
+    if (remote.response.ok) {
+      await syncSharedFindCameraCacheForUser(c.env, user);
     }
-  );
-  if (remote.response.ok) {
-    await syncSharedFindCameraCacheForUser(c.env, user);
+    return c.json(remote.data || {}, (remote.response.status || 502) as any);
+  } catch (error) {
+    return buildSharedFindActionErrorResponse(
+      c,
+      error,
+      "Failed to revoke the shared camera invitation."
+    );
   }
-  return c.json(remote.data || {}, (remote.response.status || 502) as any);
 });
 
 app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/settings`, anyAuthMiddleware, async (c) => {
@@ -30790,7 +32561,14 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/heartbeat`, anyAuthMiddleware, as
 
   const user = c.get("user")!;
   if (!isCentralIdentityClientConfigured(c.env)) {
-    return c.json({ error: "Central identity server is not configured." }, 503);
+    return c.json(
+      buildLocalWorkspaceAccessDegradedPayload(c.env, {
+        ok: false,
+        presence: {
+          owner_online: false,
+        },
+      })
+    );
   }
 
   const body: {
@@ -30803,16 +32581,45 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/heartbeat`, anyAuthMiddleware, as
       .catch(() => ({}))) || {};
 
   const connectionPolicy = await getWorkspaceAccessConnectionPolicyForUser(c.env.DB, user.id);
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
-  await maybeEnsureWorkspaceRelayForUser(c.env, user);
-  const remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/workspace-access/presence", {
-    method: "POST",
-    token: centralContext.grantToken,
-    body: {
-      app_instance_id: normalizeText(body.app_instance_id) || `desktop_${generateUUID()}`,
-      connection_policy: connectionPolicy,
-    },
-  });
+  let centralContext: CentralUserRelayContext;
+  try {
+    centralContext = await resolveCurrentUserCentralRelayContext(
+      c.env,
+      user,
+      resolveRequestEffectiveBrandId(c)
+    );
+    await maybeEnsureWorkspaceRelayForUser(c.env, user);
+  } catch {
+    return c.json(
+      buildLocalWorkspaceAccessDegradedPayload(c.env, {
+        ok: false,
+        presence: {
+          owner_online: false,
+        },
+      })
+    );
+  }
+
+  let remote: Awaited<ReturnType<typeof callCentralIdentityAuthorizedEndpoint>>;
+  try {
+    remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/workspace-access/presence", {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {
+        app_instance_id: normalizeText(body.app_instance_id) || `desktop_${generateUUID()}`,
+        connection_policy: connectionPolicy,
+      },
+    });
+  } catch {
+    return c.json(
+      buildLocalWorkspaceAccessDegradedPayload(c.env, {
+        ok: false,
+        presence: {
+          owner_online: false,
+        },
+      })
+    );
+  }
 
   return c.json(remote.data || {}, (remote.response.status || 502) as any);
 });
@@ -30835,18 +32642,35 @@ app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/active-sessions`, anyAuthMiddlewar
 
   const user = c.get("user")!;
   if (!isCentralIdentityClientConfigured(c.env)) {
-    return c.json({ error: "Central identity server is not configured." }, 503);
+    return c.json(
+      buildLocalWorkspaceAccessDegradedPayload(c.env, {
+        sessions: [],
+      })
+    );
   }
 
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
-  const remote = await callCentralIdentityAuthorizedEndpoint(
-    c.env,
-    "/api/workspace-access/sessions?role=owner&status=active",
-    {
-      method: "GET",
-      token: centralContext.grantToken,
-    }
-  );
+  let remote: Awaited<ReturnType<typeof callCentralIdentityAuthorizedEndpoint>>;
+  try {
+    const centralContext = await resolveCurrentUserCentralRelayContext(
+      c.env,
+      user,
+      resolveRequestEffectiveBrandId(c)
+    );
+    remote = await callCentralIdentityAuthorizedEndpoint(
+      c.env,
+      "/api/workspace-access/sessions?role=owner&status=active",
+      {
+        method: "GET",
+        token: centralContext.grantToken,
+      }
+    );
+  } catch {
+    return c.json(
+      buildLocalWorkspaceAccessDegradedPayload(c.env, {
+        sessions: [],
+      })
+    );
+  }
 
   if (!remote.response.ok) {
     return c.json(
@@ -30904,7 +32728,11 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/users/resolve`, anyAuthMiddleware
     return c.json({ error: "Central identity server is not configured." }, 503);
   }
 
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const centralContext = await resolveCurrentUserCentralRelayContext(
+    c.env,
+    user,
+    resolveRequestEffectiveBrandId(c)
+  );
   const remote = await callCentralIdentityAuthorizedEndpoint(
     c.env,
     "/api/workspace-access/users/resolve",
@@ -30976,7 +32804,11 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites`, anyAuthMiddleware, asyn
     return c.json({ error: "Invalid request body" }, 400);
   }
 
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const centralContext = await resolveCurrentUserCentralRelayContext(
+    c.env,
+    user,
+    resolveRequestEffectiveBrandId(c)
+  );
   const accessConfig = resolveRequestedWorkspaceAccessConfiguration(body);
   const accessPayload = buildWorkspaceAccessPayload(accessConfig);
   const remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/workspace-access/invites", {
@@ -31004,15 +32836,28 @@ app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites/incoming`, anyAuthMiddlewa
   }
 
   const user = c.get("user")!;
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
-  const remote = await callCentralIdentityAuthorizedEndpoint(
-    c.env,
-    "/api/workspace-access/invites/incoming",
-    {
-      method: "GET",
-      token: centralContext.grantToken,
-    }
-  );
+  let remote: Awaited<ReturnType<typeof callCentralIdentityAuthorizedEndpoint>>;
+  try {
+    const centralContext = await resolveCurrentUserCentralRelayContext(
+      c.env,
+      user,
+      resolveRequestEffectiveBrandId(c)
+    );
+    remote = await callCentralIdentityAuthorizedEndpoint(
+      c.env,
+      "/api/workspace-access/invites/incoming",
+      {
+        method: "GET",
+        token: centralContext.grantToken,
+      }
+    );
+  } catch {
+    return c.json(
+      buildLocalWorkspaceAccessDegradedPayload(c.env, {
+        invites: [],
+      })
+    );
+  }
   return c.json(remote.data || {}, (remote.response.status || 502) as any);
 });
 
@@ -31022,15 +32867,28 @@ app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites/outgoing`, anyAuthMiddlewa
   }
 
   const user = c.get("user")!;
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
-  const remote = await callCentralIdentityAuthorizedEndpoint(
-    c.env,
-    "/api/workspace-access/invites/outgoing",
-    {
-      method: "GET",
-      token: centralContext.grantToken,
-    }
-  );
+  let remote: Awaited<ReturnType<typeof callCentralIdentityAuthorizedEndpoint>>;
+  try {
+    const centralContext = await resolveCurrentUserCentralRelayContext(
+      c.env,
+      user,
+      resolveRequestEffectiveBrandId(c)
+    );
+    remote = await callCentralIdentityAuthorizedEndpoint(
+      c.env,
+      "/api/workspace-access/invites/outgoing",
+      {
+        method: "GET",
+        token: centralContext.grantToken,
+      }
+    );
+  } catch {
+    return c.json(
+      buildLocalWorkspaceAccessDegradedPayload(c.env, {
+        invites: [],
+      })
+    );
+  }
   return c.json(remote.data || {}, (remote.response.status || 502) as any);
 });
 
@@ -31040,11 +32898,24 @@ app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/available`, anyAuthMiddleware, asy
   }
 
   const user = c.get("user")!;
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
-  const remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/workspace-access/available", {
-    method: "GET",
-    token: centralContext.grantToken,
-  });
+  let remote: Awaited<ReturnType<typeof callCentralIdentityAuthorizedEndpoint>>;
+  try {
+    const centralContext = await resolveCurrentUserCentralRelayContext(
+      c.env,
+      user,
+      resolveRequestEffectiveBrandId(c)
+    );
+    remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/workspace-access/available", {
+      method: "GET",
+      token: centralContext.grantToken,
+    });
+  } catch {
+    return c.json(
+      buildLocalWorkspaceAccessDegradedPayload(c.env, {
+        accesses: [],
+      })
+    );
+  }
   return c.json(remote.data || {}, (remote.response.status || 502) as any);
 });
 
@@ -31054,7 +32925,14 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites/:inviteId/accept`, anyAut
   }
 
   const user = c.get("user")!;
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  if (!isCentralIdentityClientConfigured(c.env)) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
+  }
+  const centralContext = await resolveCurrentUserCentralRelayContext(
+    c.env,
+    user,
+    resolveRequestEffectiveBrandId(c)
+  );
   const remote = await callCentralIdentityAuthorizedEndpoint(
     c.env,
     `/api/workspace-access/invites/${encodeURIComponent(
@@ -31078,7 +32956,14 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites/:inviteId/deny`, anyAuthM
   }
 
   const user = c.get("user")!;
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  if (!isCentralIdentityClientConfigured(c.env)) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
+  }
+  const centralContext = await resolveCurrentUserCentralRelayContext(
+    c.env,
+    user,
+    resolveRequestEffectiveBrandId(c)
+  );
   const remote = await callCentralIdentityAuthorizedEndpoint(
     c.env,
     `/api/workspace-access/invites/${encodeURIComponent(
@@ -31099,7 +32984,14 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites/:inviteId/revoke`, anyAut
   }
 
   const user = c.get("user")!;
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  if (!isCentralIdentityClientConfigured(c.env)) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
+  }
+  const centralContext = await resolveCurrentUserCentralRelayContext(
+    c.env,
+    user,
+    resolveRequestEffectiveBrandId(c)
+  );
   const remote = await callCentralIdentityAuthorizedEndpoint(
     c.env,
     `/api/workspace-access/invites/${encodeURIComponent(
@@ -31120,6 +33012,9 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions`, anyAuthMiddleware, asy
   }
 
   const user = c.get("user")!;
+  if (!isCentralIdentityClientConfigured(c.env)) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
+  }
   const body = await c.req
     .json<{
       invite_id?: number;
@@ -31129,7 +33024,11 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions`, anyAuthMiddleware, asy
     return c.json({ error: "Invalid request body" }, 400);
   }
 
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const centralContext = await resolveCurrentUserCentralRelayContext(
+    c.env,
+    user,
+    resolveRequestEffectiveBrandId(c)
+  );
   await maybeEnsureWorkspaceRelayForUser(c.env, user);
   const remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/workspace-access/sessions", {
     method: "POST",
@@ -31232,7 +33131,11 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions/:sessionId/approve`, any
   }
 
   const user = c.get("user")!;
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const centralContext = await resolveCurrentUserCentralRelayContext(
+    c.env,
+    user,
+    resolveRequestEffectiveBrandId(c)
+  );
   const remote = await callCentralIdentityAuthorizedEndpoint(
     c.env,
     `/api/workspace-access/sessions/${encodeURIComponent(c.req.param("sessionId"))}/approve`,
@@ -31252,7 +33155,11 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions/:sessionId/deny`, anyAut
   }
 
   const user = c.get("user")!;
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const centralContext = await resolveCurrentUserCentralRelayContext(
+    c.env,
+    user,
+    resolveRequestEffectiveBrandId(c)
+  );
   const remote = await callCentralIdentityAuthorizedEndpoint(
     c.env,
     `/api/workspace-access/sessions/${encodeURIComponent(c.req.param("sessionId"))}/deny`,
@@ -31280,7 +33187,11 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions/:sessionId/end`, anyAuth
         reason?: string;
       }>()
       .catch(() => ({}))) || {};
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const centralContext = await resolveCurrentUserCentralRelayContext(
+    c.env,
+    user,
+    resolveRequestEffectiveBrandId(c)
+  );
   const remote = await callCentralIdentityAuthorizedEndpoint(
     c.env,
     `/api/workspace-access/sessions/${encodeURIComponent(c.req.param("sessionId"))}/end`,
@@ -31379,13 +33290,15 @@ app.post("/api/auth/local/signup", async (c) => {
       return c.json({ error: "Email already registered" }, 400);
     }
 
-    if (isCentralIdentityClientConfigured(c.env)) {
+    if (isCentralIdentityClientConfigured(c.env) && shouldAutoLinkLocalAccountsToCentralIdentity()) {
       let centralResult: Awaited<ReturnType<typeof callCentralIdentityEndpoint>>;
       try {
         centralResult = await callCentralIdentityEndpoint(c.env, "/api/identity/signup", {
           email,
           password,
           country_code: countryCode,
+        }, {
+          requestBrandId: resolveRequestEffectiveBrandId(c),
         });
       } catch (error) {
         console.error("[AUTH] Central signup request failed:", error);
@@ -31416,6 +33329,7 @@ app.post("/api/auth/local/signup", async (c) => {
         deviceSession: normalizeCentralIdentityDeviceSessionPayload(
           centralResult.data?.device_session
         ),
+        allowCentralIdentityRelink: true,
       });
 
       if (!centralResult.verifiedGrant.claims.login_allowed) {
@@ -31524,6 +33438,9 @@ app.post("/api/auth/local/login", async (c) => {
 
     const email = normalizeEmail(body.email);
     const password = body.password;
+    const appUser = await getAppUserRowByEmail(c.env.DB, email);
+    const preferredCentralHandle =
+      normalizeUserHandleInput((appUser as any)?.handle) || deriveHandleFromEmail(email);
 
     // Validate inputs
     if (!isValidEmail(email) || !password) {
@@ -31541,7 +33458,7 @@ app.post("/api/auth/local/login", async (c) => {
     let effectiveLocalUser = userData;
 
     if (!effectiveLocalUser || !passwordMatches) {
-      if (!isCentralIdentityClientConfigured(c.env)) {
+      if (!isCentralIdentityClientConfigured(c.env) || !shouldAutoLinkLocalAccountsToCentralIdentity()) {
         return c.json({ error: "Invalid email or password" }, 401);
       }
 
@@ -31550,8 +33467,11 @@ app.post("/api/auth/local/login", async (c) => {
         centralLoginResult = await callCentralIdentityEndpoint(c.env, "/api/identity/login", {
           email,
           password,
-          handle: deriveHandleFromEmail(email),
+          handle: preferredCentralHandle,
           country_code: normalizeCountryCode((userData as any)?.country_code, null),
+          allow_legacy_fallback: !userData,
+        }, {
+          requestBrandId: resolveRequestEffectiveBrandId(c),
         });
       } catch (error) {
         console.error("[AUTH] Central login request failed during local login:", error);
@@ -31585,6 +33505,7 @@ app.post("/api/auth/local/login", async (c) => {
         deviceSession: normalizeCentralIdentityDeviceSessionPayload(
           centralLoginResult.data?.device_session
         ),
+        allowCentralIdentityRelink: true,
       });
       effectiveLocalUser = await c.env.DB
         .prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`)
@@ -31614,16 +33535,18 @@ app.post("/api/auth/local/login", async (c) => {
         throw new Error("Failed to reload the local user after login.");
       }
 
-      effectiveLocalUser = refreshedLocalUser as any;
+      effectiveLocalUser = shouldDetachLegacyCentralIdentityLinks()
+        ? await detachLocalUserFromCentralIdentityLink(c.env.DB, refreshedLocalUser as any)
+        : (refreshedLocalUser as any);
       const refreshedAppUserId = resolveCanonicalAppUserIdFromLocalUserRow(
-        refreshedLocalUser as any
+        effectiveLocalUser as any
       );
       await ensureAppUserRow(c.env.DB, {
         id: refreshedAppUserId,
-        email: String((refreshedLocalUser as any).email || ""),
+        email: String((effectiveLocalUser as any).email || ""),
         auth_provider: "local",
-        country_code: (refreshedLocalUser as any).country_code || null,
-        locale: (refreshedLocalUser as any).locale || null,
+        country_code: (effectiveLocalUser as any).country_code || null,
+        locale: (effectiveLocalUser as any).locale || null,
       });
       const refreshedAccountAccess = await resolveAccountAccessContext(
         c.env.DB,
@@ -31642,14 +33565,26 @@ app.post("/api/auth/local/login", async (c) => {
         refreshedAccountAccess.passwordManagementMode === "admin_managed" &&
         !refreshedAccountAccess.isOwner;
 
-      if (!shouldSkipCentralSyncForManagedSubaccount && isCentralIdentityClientConfigured(c.env)) {
+      if (
+        !shouldSkipCentralSyncForManagedSubaccount &&
+        isCentralIdentityClientConfigured(c.env) &&
+        shouldAutoLinkLocalAccountsToCentralIdentity()
+      ) {
+        const refreshedAppUser = await getAppUserRowById(c.env.DB, refreshedAppUserId);
+        const hasCentralLink = hasCentralIdentityLink({
+          localUser: effectiveLocalUser as any,
+          appUser: refreshedAppUser,
+        });
         let centralResult: Awaited<ReturnType<typeof callCentralIdentityEndpoint>> | null = null;
         try {
           centralResult = await callCentralIdentityEndpoint(c.env, "/api/identity/migrate-login", {
             email,
             password,
-            handle: deriveHandleFromEmail(email),
+            handle: preferredCentralHandle,
             country_code: normalizeCountryCode((refreshedLocalUser as any).country_code, null),
+            allow_legacy_fallback: false,
+          }, {
+            requestBrandId: resolveRequestEffectiveBrandId(c),
           });
         } catch (error) {
           console.error("[AUTH] Central migrate-login request failed during local login:", error);
@@ -31658,27 +33593,67 @@ app.post("/api/auth/local/login", async (c) => {
         if (centralResult?.response.ok && centralResult.verifiedGrant) {
           const synced = await syncLocalIdentityCacheFromGrant(c.env.DB, {
             email,
-            passwordHash: String((refreshedLocalUser as any).password_hash || ""),
+            passwordHash: String((effectiveLocalUser as any).password_hash || ""),
             countryCode:
               normalizeCountryCode(centralResult.data?.user?.country_code, null) ||
-              normalizeCountryCode((refreshedLocalUser as any).country_code, null),
-            locale: normalizeOptionalLocale((refreshedLocalUser as any).locale),
+              normalizeCountryCode((effectiveLocalUser as any).country_code, null),
+            locale: normalizeOptionalLocale((effectiveLocalUser as any).locale),
             serverHandle: normalizeUserHandleInput(centralResult.data?.user?.handle),
             verifiedGrant: centralResult.verifiedGrant,
             deviceSession: normalizeCentralIdentityDeviceSessionPayload(
               centralResult.data?.device_session
             ),
+            allowCentralIdentityRelink: true,
           });
           effectiveLocalUser =
             (await c.env.DB
               .prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`)
               .bind(synced.localUserId)
               .first()) || effectiveLocalUser;
-        } else if (centralResult) {
-          console.error(
-            "[AUTH] Central migrate-login rejected local login session refresh:",
-            centralResult.response.status,
-            centralResult.data
+        } else {
+          if (centralResult) {
+            console.error(
+              "[AUTH] Central migrate-login rejected local login session refresh:",
+              centralResult.response.status,
+              centralResult.data
+            );
+            if (
+              hasCentralLink &&
+              (centralResult.response.status === 401 || centralResult.response.status === 403)
+            ) {
+              await invalidateAppUserCentralSession(c.env.DB, {
+                appUserId: refreshedAppUserId,
+                clearGrant: true,
+              });
+              return c.json(
+                buildCentralReauthRequiredError(
+                  centralResult.response.status === 403
+                    ? normalizeResponseErrorMessage(
+                        centralResult.data,
+                        CENTRAL_REAUTH_REQUIRED_ERROR
+                      )
+                    : CENTRAL_REAUTH_REQUIRED_ERROR
+                ),
+                409
+              );
+            }
+
+            return c.json(
+              {
+                error: normalizeResponseErrorMessage(
+                  centralResult.data,
+                  CENTRAL_LOGIN_VALIDATION_REQUIRED_ERROR
+                ),
+              },
+              (centralResult.response.status || 502) as any
+            );
+          }
+
+          return c.json(
+            {
+              error: "Unable to reach the central identity server.",
+            },
+            502
           );
         }
       }
@@ -31827,7 +33802,9 @@ app.get("/api/auth/me", async (c) => {
     const session = await getLocalSessionUserByToken(c.env.DB, localCookie);
 
     if (session) {
-      const sessionData = session as any;
+      const sessionData = shouldDetachLegacyCentralIdentityLinks()
+        ? await detachLocalUserFromCentralIdentityLink(c.env.DB, session as any)
+        : (session as any);
       const appUserId = resolveCanonicalAppUserIdFromLocalUserRow(sessionData);
       await ensureAppUserRow(c.env.DB, {
         id: appUserId,
@@ -31926,7 +33903,11 @@ app.get("/api/account/deletion-preview", anyAuthMiddleware, async (c) => {
       remote.unavailable_reason = "Central identity server is not configured.";
     } else {
       try {
-        const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+        const centralContext = await resolveCurrentUserCentralRelayContext(
+          c.env,
+          user,
+          resolveRequestEffectiveBrandId(c)
+        );
         const remoteResult = await callCentralIdentityAuthorizedEndpoint(
           c.env,
           "/api/identity/account/preview",
@@ -32029,7 +34010,11 @@ app.delete("/api/account", anyAuthMiddleware, async (c) => {
 
     let centralContext: CentralUserRelayContext;
     try {
-      centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+      centralContext = await resolveCurrentUserCentralRelayContext(
+        c.env,
+        user,
+        resolveRequestEffectiveBrandId(c)
+      );
     } catch (error) {
       return c.json(
         {
@@ -32143,10 +34128,14 @@ app.patch("/api/user-profile", anyAuthMiddleware, async (c) => {
       : null;
   const hasLegacyCentralLink = Boolean(normalizeText((localIdentity as any)?.server_public_id));
 
-  if (isCentralIdentityClientConfigured(c.env)) {
+  if (isCentralIdentityClientConfigured(c.env) && shouldAutoLinkLocalAccountsToCentralIdentity()) {
     let centralContext: CentralUserRelayContext | null = null;
     try {
-      centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+      centralContext = await resolveCurrentUserCentralRelayContext(
+        c.env,
+        user,
+        resolveRequestEffectiveBrandId(c)
+      );
     } catch (error) {
       if (hasLegacyCentralLink) {
         return c.json(
@@ -32191,7 +34180,7 @@ app.patch("/api/user-profile", anyAuthMiddleware, async (c) => {
         );
       }
     }
-  } else if (hasLegacyCentralLink) {
+  } else if (hasLegacyCentralLink && shouldAutoLinkLocalAccountsToCentralIdentity()) {
     return c.json({ error: "Central identity server is not configured." }, 503);
   }
 
@@ -32554,6 +34543,19 @@ app.post("/api/account-users/:memberId/password", anyAuthMiddleware, async (c) =
   if (!localUser) {
     return c.json({ error: "This subaccount does not have a local password identity." }, 404);
   }
+  const targetAppUser = await getAppUserRowById(c.env.DB, targetMembership.actorUserId);
+  if (
+    shouldAutoLinkLocalAccountsToCentralIdentity() &&
+    hasCentralIdentityLink({
+      localUser: localUser as any,
+      appUser: targetAppUser,
+    })
+  ) {
+    return c.json(
+      buildCentralPasswordSyncRequiredError(CENTRAL_SUBACCOUNT_PASSWORD_SYNC_REQUIRED_ERROR),
+      409
+    );
+  }
 
   const passwordHash = await bcrypt.hash(password, 10);
   const nowIso = new Date().toISOString();
@@ -32638,8 +34640,10 @@ app.post("/api/sessions", async (c) => {
         : await resolveExistingGoogleAppUser(c.env.DB, googleUser);
     let googleProfile = await getAppUserProfile(c.env.DB, canonicalUserId);
 
-    const requireCentralGoogleSync = googleIntent === "signup";
-    if (isCentralIdentityClientConfigured(c.env)) {
+    const requireCentralGoogleSync =
+      isCentralIdentityClientConfigured(c.env) &&
+      shouldAutoLinkLocalAccountsToCentralIdentity();
+    if (requireCentralGoogleSync) {
       if (!googleUser.google_id_token) {
         if (requireCentralGoogleSync) {
           clearGoogleOAuthFlowCookies(c);
@@ -32659,6 +34663,9 @@ app.post("/api/sessions", async (c) => {
               id_token: googleUser.google_id_token,
               country_code: requestedCountryCode,
               handle: googleProfile.handle,
+            },
+            {
+              requestBrandId: resolveRequestEffectiveBrandId(c),
             }
           );
         } catch (error) {
@@ -32754,6 +34761,12 @@ app.post("/api/sessions", async (c) => {
               );
             }
           }
+        } else if (requireCentralGoogleSync) {
+          clearGoogleOAuthFlowCookies(c);
+          return c.json(
+            { error: "Unable to reach the central identity server." },
+            502
+          );
         }
       }
     }
@@ -32799,19 +34812,14 @@ app.post("/api/sessions", async (c) => {
   } catch (error) {
     console.error("[GOOGLE LOGIN] Failed to resolve canonical user:", error);
     clearGoogleOAuthFlowCookies(c);
-
-    if (shouldClearGoogleSessionOnAuthFailure(error)) {
-      const errorMessage =
-        error instanceof Error ? error.message : "Google login not allowed";
-      const status =
-        errorMessage.toLowerCase().includes("no local account found") ? 404 : 403;
-      return c.json(
-        { error: errorMessage },
-        status as any
-      );
-    }
-
-    return c.json({ error: "Failed to complete Google login" }, 500);
+    const errorMessage =
+      error instanceof Error && error.message
+        ? error.message
+        : "Failed to complete Google login";
+    return c.json(
+      { error: errorMessage },
+      getGoogleAuthFailureStatus(error) as any
+    );
   }
 
   return c.json({ error: "Failed to authenticate with Google" }, 502);
@@ -32832,7 +34840,9 @@ app.get("/api/users/me", async (c) => {
     const session = await getLocalSessionUserByToken(c.env.DB, localSessionToken);
 
     if (session) {
-      const sessionData = session as any;
+      const sessionData = shouldDetachLegacyCentralIdentityLinks()
+        ? await detachLocalUserFromCentralIdentityLink(c.env.DB, session as any)
+        : (session as any);
       const appUserId = resolveCanonicalAppUserIdFromLocalUserRow(sessionData);
       await ensureAppUserRow(c.env.DB, {
         id: appUserId,
@@ -33582,59 +35592,110 @@ app.get("/api/camera-recordings/*", anyAuthMiddleware, async (c) => {
   return c.body(stream as any, { headers });
 });
 
-// Job alert clips (local disk)
-app.get("/api/job-clips/*", anyAuthMiddleware, async (c) => {
-  const forceDownload = c.req.query("download") === "1";
-  let rel = c.req.path.replace(/^\/api\/job-clips\//, "");
-  if (!rel) {
-    return c.json({ error: "Invalid path" }, 400);
-  }
-
-  try {
-    rel = decodeURIComponent(rel);
-  } catch {
-    // Keep original if decode fails
-  }
-
-  if (!rel || rel.includes("..") || rel.startsWith("/") || rel.startsWith("\\")) {
-    return c.json({ error: "Invalid path" }, 400);
-  }
-
-  const baseDir = brand.dataPaths.jobAlertClips;
-
+async function resolveLocalJobAlertMediaFile(c: any, relInput: string, kind: "clip" | "image") {
   let fs: any;
   let pathMod: any;
   try {
     fs = await import("node:fs");
     pathMod = await import("node:path");
   } catch {
-    return c.json({ error: "Filesystem not available in this runtime" }, 501);
+    return { error: "Filesystem not available in this runtime", status: 501 as const };
   }
 
-  if (pathMod.isAbsolute(rel)) {
-    return c.json({ error: "Invalid path" }, 400);
+  let rel = relInput;
+  try {
+    rel = decodeURIComponent(rel);
+  } catch {
+    // Keep original if decode fails.
   }
 
-  const baseResolved = pathMod.resolve(baseDir);
-  const fullPath = pathMod.resolve(baseDir, rel);
-  const normalizedBase = (baseResolved.toLowerCase() + pathMod.sep);
+  if (!rel || rel.includes("..") || rel.startsWith("\\") || rel.includes("\0")) {
+    return { error: "Invalid path", status: 400 as const };
+  }
+
+  const env = (c.env || {}) as Record<string, unknown>;
+  const processEnv =
+    typeof process !== "undefined" && process.env ? process.env : ({} as Record<string, string | undefined>);
+  const readRoot = (...values: unknown[]) =>
+    values
+      .map((value) => (typeof value === "string" ? value.trim() : ""))
+      .find((value) => value.length > 0) || "";
+  const dataRoot = readRoot(env.APP_RUNTIME_DATA_ROOT, processEnv.APP_RUNTIME_DATA_ROOT);
+  const cacheRoot = readRoot(env.APP_RUNTIME_CACHE_ROOT, processEnv.APP_RUNTIME_CACHE_ROOT);
+  const localMediaRoot = readRoot(env.LOCAL_MEDIA_BASE_DIR, processEnv.LOCAL_MEDIA_BASE_DIR);
+  const homeRoot = readRoot(processEnv.HOME);
+  const defaultCacheRoot = homeRoot ? pathMod.join(homeRoot, ".cache", "Perceptrum") : "";
+  const defaultDataRoot = homeRoot
+    ? pathMod.join(homeRoot, ".local", "share", "PerceptrumData")
+    : "";
+  const configuredBaseDir = kind === "clip" ? brand.dataPaths.jobAlertClips : brand.dataPaths.jobAlertImages;
+  const allowedRootCandidates = [
+    configuredBaseDir,
+    ...(brand.dataPaths.mediaBaseDirCandidates || []),
+    dataRoot,
+    cacheRoot,
+    localMediaRoot,
+    defaultDataRoot,
+    defaultCacheRoot,
+    dataRoot ? pathMod.join(dataRoot, "frames") : "",
+    cacheRoot ? pathMod.join(cacheRoot, "agentcore", "camera-thumbnails") : "",
+    defaultDataRoot ? pathMod.join(defaultDataRoot, "frames") : "",
+    defaultCacheRoot ? pathMod.join(defaultCacheRoot, "agentcore", "camera-thumbnails") : "",
+  ].filter((entry) => typeof entry === "string" && entry.trim().length > 0);
+
+  const localPrefix = "local/";
+  const isEncodedLocalAbsolute = rel.startsWith(localPrefix);
+  const fullPath = isEncodedLocalAbsolute
+    ? pathMod.resolve(rel.slice(localPrefix.length))
+    : pathMod.resolve(configuredBaseDir, rel);
+
+  if (!isEncodedLocalAbsolute && pathMod.isAbsolute(rel)) {
+    return { error: "Invalid path", status: 400 as const };
+  }
+  if (isEncodedLocalAbsolute && !pathMod.isAbsolute(rel.slice(localPrefix.length))) {
+    return { error: "Invalid path", status: 400 as const };
+  }
+
   const normalizedFull = fullPath.toLowerCase();
-
-  if (!normalizedFull.startsWith(normalizedBase)) {
-    return c.json({ error: "Invalid path" }, 400);
+  const allowed = allowedRootCandidates.some((root) => {
+    const resolvedRoot = pathMod.resolve(root);
+    const normalizedRoot = resolvedRoot.toLowerCase();
+    return normalizedFull === normalizedRoot || normalizedFull.startsWith(normalizedRoot + pathMod.sep);
+  });
+  if (!allowed) {
+    return { error: "Invalid path", status: 400 as const };
   }
 
   try {
     const stat = fs.statSync(fullPath);
     if (!stat.isFile()) {
-      return c.json({ error: "Not found" }, 404);
+      return { error: "Not found", status: 404 as const };
     }
+    return { fs, pathMod, fullPath, stat };
+  } catch {
+    return { error: "Not found", status: 404 as const };
+  }
+}
 
-    const stream = fs.createReadStream(fullPath);
+// Job alert clips (local disk)
+app.get("/api/job-clips/*", anyAuthMiddleware, async (c) => {
+  const forceDownload = c.req.query("download") === "1";
+  const rel = c.req.path.replace(/^\/api\/job-clips\//, "");
+  if (!rel) {
+    return c.json({ error: "Invalid path" }, 400);
+  }
+
+  const target = await resolveLocalJobAlertMediaFile(c, rel, "clip");
+  if ("error" in target) {
+    return c.json({ error: target.error }, target.status);
+  }
+
+  try {
+    const stream = target.fs.createReadStream(target.fullPath);
     c.header("content-type", "video/mp4");
     c.header("cache-control", "no-cache");
     if (forceDownload) {
-      const safeFilename = String(pathMod.basename(fullPath) || "job_clip.mp4").replace(/["\r\n]/g, "_");
+      const safeFilename = String(target.pathMod.basename(target.fullPath) || "job_clip.mp4").replace(/["\r\n]/g, "_");
       c.header("content-disposition", `attachment; filename="${safeFilename}"`);
     }
     return c.body(stream as any);
@@ -33646,52 +35707,18 @@ app.get("/api/job-clips/*", anyAuthMiddleware, async (c) => {
 // Job alert images (local disk)
 app.get("/api/job-images/*", anyAuthMiddleware, async (c) => {
   const forceDownload = c.req.query("download") === "1";
-  let rel = c.req.path.replace(/^\/api\/job-images\//, "");
+  const rel = c.req.path.replace(/^\/api\/job-images\//, "");
   if (!rel) {
     return c.json({ error: "Invalid path" }, 400);
   }
 
-  try {
-    rel = decodeURIComponent(rel);
-  } catch {
-    // Keep original if decode fails
-  }
-
-  if (!rel || rel.includes("..") || rel.startsWith("/") || rel.startsWith("\\")) {
-    return c.json({ error: "Invalid path" }, 400);
-  }
-
-  const baseDir = brand.dataPaths.jobAlertImages;
-
-  let fs: any;
-  let pathMod: any;
-  try {
-    fs = await import("node:fs");
-    pathMod = await import("node:path");
-  } catch {
-    return c.json({ error: "Filesystem not available in this runtime" }, 501);
-  }
-
-  if (pathMod.isAbsolute(rel)) {
-    return c.json({ error: "Invalid path" }, 400);
-  }
-
-  const baseResolved = pathMod.resolve(baseDir);
-  const fullPath = pathMod.resolve(baseDir, rel);
-  const normalizedBase = (baseResolved.toLowerCase() + pathMod.sep);
-  const normalizedFull = fullPath.toLowerCase();
-
-  if (!normalizedFull.startsWith(normalizedBase)) {
-    return c.json({ error: "Invalid path" }, 400);
+  const target = await resolveLocalJobAlertMediaFile(c, rel, "image");
+  if ("error" in target) {
+    return c.json({ error: target.error }, target.status);
   }
 
   try {
-    const stat = fs.statSync(fullPath);
-    if (!stat.isFile()) {
-      return c.json({ error: "Not found" }, 404);
-    }
-
-    const ext = String(pathMod.extname(fullPath) || "").toLowerCase();
+    const ext = String(target.pathMod.extname(target.fullPath) || "").toLowerCase();
     const imageContentType =
       ext === ".png"
         ? "image/png"
@@ -33705,11 +35732,11 @@ app.get("/api/job-images/*", anyAuthMiddleware, async (c) => {
         ? "image/jpeg"
         : "application/octet-stream";
 
-    const stream = fs.createReadStream(fullPath);
+    const stream = target.fs.createReadStream(target.fullPath);
     c.header("content-type", imageContentType);
     c.header("cache-control", "no-cache");
     if (forceDownload) {
-      const safeFilename = String(pathMod.basename(fullPath) || "job_image.jpg").replace(/["\r\n]/g, "_");
+      const safeFilename = String(target.pathMod.basename(target.fullPath) || "job_image.jpg").replace(/["\r\n]/g, "_");
       c.header("content-disposition", `attachment; filename="${safeFilename}"`);
     }
     return c.body(stream as any);
@@ -35759,7 +37786,7 @@ app.get("/api/dashboard-alerts", anyAuthMiddleware, async (c) => {
     limit,
   };
 
-  const page = await fetchDashboardAlertsPage(c.env.DB, user.id, filters);
+  const page = await fetchDashboardAlertsPage(c.env.DB, user.id, filters, c.env as unknown as Record<string, unknown>);
   const responseBody: Record<string, unknown> = {
     alerts: page.alerts,
     has_more: page.hasMore,
@@ -37542,7 +39569,27 @@ async function enqueueStartCameraCommand(
     const pairing = await env.DB.prepare(pairingQuery).bind(...pairingQueryArgs).first();
 
     if (!pairing) {
-      return { success: false, error: "No EXE connected" };
+      return {
+        success: false,
+        error: "Linux agent is not running or is not polling commands.",
+        error_code: "linux_agent_not_running",
+        http_status: 409,
+      };
+    }
+
+    const heartbeat = buildExeHeartbeatSummary(pairing);
+    if (!heartbeat.is_heartbeat_fresh) {
+      return {
+        success: false,
+        error: "Linux agent is not running or is not polling commands.",
+        error_code: "linux_agent_not_running",
+        http_status: 409,
+        failure_details: {
+          last_seen_at: heartbeat.last_seen_at,
+          last_seen_age_seconds: heartbeat.last_seen_age_seconds,
+          effective_status: heartbeat.effective_status,
+        },
+      };
     }
 
     // Fetch camera info
@@ -37698,6 +39745,7 @@ async function enqueueStartCameraCommand(
 
     // Fetch Telegram settings for this camera's owner
     const telegram = await getTelegramSettingsForUser(env.DB, cam.user_id);
+    const wasRunningBefore = Number(cam.is_service_running) === 1;
 
     // Build payload for EXE including effective analysis_speed and model_tier
     const cameraSessionId = generateUUID();
@@ -37716,6 +39764,7 @@ async function enqueueStartCameraCommand(
       manufacturer: normalizeCameraTransportField(cam.manufacturer),
       connection_method: normalizeCameraTransportField(cam.connection_method),
       start_origin: "direct",
+      was_service_running_before: wasRunningBefore,
       direct_capture_on_motion_only: directCaptureOnMotionOnly,
       enabled_algorithms: enabledAlgorithms,
       store_frames: cam.store_frames === 1,
@@ -37737,7 +39786,6 @@ async function enqueueStartCameraCommand(
     const now = new Date().toISOString();
     const cameraName =
       normalizeCameraStartSummaryText(cam.name) || `Camera #${cameraId}`;
-    const wasRunningBefore = Number(cam.is_service_running) === 1;
 
     // Mark the service as running immediately, but keep camera offline until the agent
     // confirms the stream is actually online via camera_started/camera_online/camera_recovered.
@@ -37826,14 +39874,52 @@ async function enqueueStartCameraCommand(
 
     if (waitForTerminalResult && Number.isInteger(commandId) && commandId > 0) {
       const terminalResult = await waitForCommandTerminalResult(env.DB, userId, commandId, 5000, 250);
-      if (terminalResult && terminalResult.status === "failed") {
-        const resultPayload = parseJsonObject(terminalResult.envelope.result);
+      if (!terminalResult) {
+        const timeoutAt = new Date().toISOString();
+        await env.DB.prepare(
+          `UPDATE commands
+           SET status = 'failed', result = ?, updated_at = ?
+           WHERE id = ? AND user_id = ? AND (status IS NULL OR status IN ('pending', 'sent'))`
+        )
+          .bind(
+            JSON.stringify({
+              status: "failed",
+              result: null,
+              error: "camera start timed out waiting for Linux agent",
+              reported_at: timeoutAt,
+            }),
+            timeoutAt,
+            commandId,
+            userId
+          )
+          .run();
+        await persistImmediateCameraStartFailureState(env.DB, userId, {
+          cameraId,
+          cameraSessionId,
+          wasRunningBefore,
+          status: "failed",
+          nowIso: timeoutAt,
+        });
+        return {
+          success: false,
+          error: "Camera start timed out waiting for Linux agent",
+          error_code: "camera_start_timeout",
+          http_status: 400,
+        };
+      }
+      const completedPayload = parseJsonObject(terminalResult.envelope.result);
+      const completedContract = evaluateLinuxCameraStartResult(
+        terminalResult.status === "failed" ? "failed" : "completed",
+        completedPayload,
+        terminalResult.envelope.error
+      );
+      if (completedContract.failed) {
+        const resultPayload = completedPayload;
         const failureMessage =
-          normalizeText(resultPayload.error) ||
-          normalizeText(terminalResult.envelope.error) ||
+          completedContract.errorMessage ||
           "Failed to start camera";
         const failureCode =
-          normalizeText(resultPayload.error_code) || "camera_start_failed";
+          completedContract.errorCode || "camera_start_failed";
         const failureStatus = isCameraStartMemoryBlockedPayload(resultPayload) ? "blocked" : "failed";
 
         if (failureStatus === "blocked") {
@@ -38458,6 +40544,66 @@ type CameraCommandTarget = {
   source: "camera_runtime" | "pairing_latest";
 };
 
+async function resolveFreshConnectedExeTarget(
+  db: D1Database,
+  userId: string,
+  options?: {
+    requestedTargetClientId?: string | null;
+    requestedTargetExeId?: string | null;
+    source?: CameraCommandTarget["source"];
+  }
+): Promise<CameraCommandTarget | null> {
+  const requestedTargetClientId =
+    typeof options?.requestedTargetClientId === "string" && options.requestedTargetClientId.trim()
+      ? options.requestedTargetClientId.trim()
+      : null;
+  const requestedTargetExeId =
+    typeof options?.requestedTargetExeId === "string" && options.requestedTargetExeId.trim()
+      ? options.requestedTargetExeId.trim()
+      : null;
+
+  let pairingQuery =
+    `SELECT client_id, exe_id, status, last_seen_at, paired_at
+     FROM exe_pairings
+     WHERE user_id = ? AND status = 'connected'`;
+  const pairingQueryArgs: Array<string | null> = [userId];
+
+  if (requestedTargetClientId) {
+    pairingQuery += ` AND client_id = ?`;
+    pairingQueryArgs.push(requestedTargetClientId);
+  }
+  if (requestedTargetExeId) {
+    pairingQuery += ` AND exe_id = ?`;
+    pairingQueryArgs.push(requestedTargetExeId);
+  }
+
+  pairingQuery += ` ORDER BY COALESCE(last_seen_at, paired_at) DESC LIMIT 1`;
+
+  const pairing = await db.prepare(pairingQuery).bind(...pairingQueryArgs).first();
+  if (!pairing || !buildExeHeartbeatSummary(pairing).is_heartbeat_fresh) {
+    return null;
+  }
+
+  const clientId =
+    typeof (pairing as any)?.client_id === "string" && String((pairing as any).client_id).trim()
+      ? String((pairing as any).client_id).trim()
+      : null;
+  const exeId =
+    typeof (pairing as any)?.exe_id === "string" && String((pairing as any).exe_id).trim()
+      ? String((pairing as any).exe_id).trim()
+      : null;
+
+  if (!clientId) {
+    return null;
+  }
+
+  return {
+    clientId,
+    exeId,
+    source: options?.source || "pairing_latest",
+  };
+}
+
 async function resolveLatestConnectedExeTarget(
   db: D1Database,
   userId: string
@@ -38493,7 +40639,7 @@ async function resolveLatestConnectedExeTarget(
   };
 }
 
-async function resolveCameraCommandTarget(
+async function resolveCameraRuntimeTarget(
   db: D1Database,
   userId: string,
   cameraId: number
@@ -38515,19 +40661,132 @@ async function resolveCameraCommandTarget(
       ? String((runtimeTarget as any).client_id).trim()
       : null;
   const runtimeExeId =
-    typeof (runtimeTarget as any)?.exe_id === "string" && String((runtimeTarget as any).exe_id).trim()
+    typeof (runtimeTarget as any)?.exe_id === "string" &&
+    String((runtimeTarget as any).exe_id).trim()
       ? String((runtimeTarget as any).exe_id).trim()
       : null;
 
-  if (runtimeClientId) {
-    return {
-      clientId: runtimeClientId,
-      exeId: runtimeExeId,
-      source: "camera_runtime",
-    };
+  if (!runtimeClientId) {
+    return null;
+  }
+
+  return {
+    clientId: runtimeClientId,
+    exeId: runtimeExeId,
+    source: "camera_runtime",
+  };
+}
+
+async function resolveCameraCommandTarget(
+  db: D1Database,
+  userId: string,
+  cameraId: number
+): Promise<CameraCommandTarget | null> {
+  const runtimeTarget = await resolveCameraRuntimeTarget(db, userId, cameraId);
+  if (runtimeTarget) {
+    return runtimeTarget;
   }
 
   return resolveLatestConnectedExeTarget(db, userId);
+}
+
+async function resolveSharedJobOwnerCommandTarget(
+  db: D1Database,
+  userId: string,
+  ownerCameraIds: number[]
+): Promise<{ target: CameraCommandTarget | null; error?: string }> {
+  const normalizedOwnerCameraIds = Array.from(
+    new Set(ownerCameraIds.filter((value) => Number.isInteger(value) && value > 0))
+  );
+  const runtimeTargets = new Map<string, CameraCommandTarget>();
+
+  for (const cameraId of normalizedOwnerCameraIds) {
+    const runtimeTarget = await resolveCameraRuntimeTarget(db, userId, cameraId);
+    if (!runtimeTarget?.clientId) continue;
+    const key = `${runtimeTarget.clientId}::${runtimeTarget.exeId || ""}`;
+    runtimeTargets.set(key, runtimeTarget);
+  }
+
+  if (runtimeTargets.size > 1) {
+    return {
+      target: null,
+      error:
+        "This shared task targets cameras attached to different owner desktop runtimes. Reopen the owner's cameras on a single runtime and try again.",
+    };
+  }
+
+  if (runtimeTargets.size === 1) {
+    const runtimeTarget = Array.from(runtimeTargets.values())[0];
+    const freshRuntimeTarget = await resolveFreshConnectedExeTarget(db, userId, {
+      requestedTargetClientId: runtimeTarget.clientId,
+      requestedTargetExeId: runtimeTarget.exeId,
+      source: "camera_runtime",
+    });
+    if (freshRuntimeTarget) {
+      return { target: freshRuntimeTarget };
+    }
+    return {
+      target: null,
+      error:
+        "The owner's desktop runtime for this shared camera is not currently connected. Open the owner's app and try again.",
+    };
+  }
+
+  const fallbackTarget = await resolveFreshConnectedExeTarget(db, userId, {
+    source: "pairing_latest",
+  });
+  if (fallbackTarget) {
+    return { target: fallbackTarget };
+  }
+
+  return {
+    target: null,
+    error:
+      "No fresh owner desktop runtime is connected for this shared task. Open the owner's app and try again.",
+  };
+}
+
+async function resolveSharedJobStopCommandTarget(
+  db: D1Database,
+  userId: string,
+  row: SharedJobSegmentRow
+): Promise<CameraCommandTarget | null> {
+  const sourceCommandId = clampInteger(row.source_command_id);
+  if (sourceCommandId > 0) {
+    const sourceCommand = await db
+      .prepare(
+        `SELECT target_client_id, target_exe_id
+         FROM commands
+         WHERE id = ? AND user_id = ?
+         LIMIT 1`
+      )
+      .bind(sourceCommandId, userId)
+      .first();
+    const targetClientId =
+      typeof (sourceCommand as any)?.target_client_id === "string" &&
+      String((sourceCommand as any).target_client_id).trim()
+        ? String((sourceCommand as any).target_client_id).trim()
+        : null;
+    const targetExeId =
+      typeof (sourceCommand as any)?.target_exe_id === "string" &&
+      String((sourceCommand as any).target_exe_id).trim()
+        ? String((sourceCommand as any).target_exe_id).trim()
+        : null;
+    if (targetClientId) {
+      const target = await resolveFreshConnectedExeTarget(db, userId, {
+        requestedTargetClientId: targetClientId,
+        requestedTargetExeId: targetExeId,
+        source: "pairing_latest",
+      });
+      if (target) {
+        return target;
+      }
+    }
+  }
+
+  const ownerCameraIds = parsePositiveIntegerArrayJson(row.current_camera_ids_json);
+  const fallback = await resolveSharedJobOwnerCommandTarget(db, userId, ownerCameraIds);
+  return fallback.target;
 }
 
 async function enqueueCameraCaptureAccelerationProbeCommand(
@@ -38863,6 +41122,15 @@ async function enqueueWebcamProbeCommand(
       success: false,
       attemptedIndices,
       error: "No EXE connected",
+    };
+  }
+
+  const heartbeat = buildExeHeartbeatSummary(pairing);
+  if (!heartbeat.is_heartbeat_fresh) {
+    return {
+      success: false,
+      attemptedIndices,
+      error: "Linux agent is not running or is not polling commands.",
     };
   }
 
@@ -41418,6 +43686,8 @@ app.post("/api/cameras/:cameraId/custom-agents/enhance-prompt", anyAuthMiddlewar
     typeof body.alert_condition === "string" ? body.alert_condition.trim() : "";
   const negativeCondition =
     typeof body.negative_condition === "string" ? body.negative_condition.trim() : "";
+  const requestedLanguage =
+    normalizeAgentDesignText(body.language, 32) || PROMPT_ENHANCER_LANGUAGE_STRATEGY;
   if (!promptTemplate) {
     return c.json({ error: "Prompt Core is required" }, 400);
   }
@@ -41469,7 +43739,7 @@ app.post("/api/cameras/:cameraId/custom-agents/enhance-prompt", anyAuthMiddlewar
     prompt_core: promptTemplate,
     alert_condition: alertCondition,
     negative_condition: negativeCondition,
-    user_language: PROMPT_ENHANCER_LANGUAGE_STRATEGY,
+    user_language: requestedLanguage,
     model_name: "gpt-5.1",
     model_api_key: modelApiKey,
     analysis_regions: enhanceAnalysisRegions,
@@ -53129,6 +55399,7 @@ app.post("/api/chat/sessions/:id/camera-registration/confirm", anyAuthMiddleware
         c.env,
         user,
         createdCameraRow,
+        resolveRequestEffectiveBrandId(c),
         { query: effectiveShareInviteeQuery.value }
       );
       if (!shareResult.ok) {
@@ -53837,6 +56108,24 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
   const videoSearchBlockReason: string | null = null;
   const videoSearchBlockMessage: string | null = null;
   const videoSearchAllowed = true;
+  const cameraResolutionRows = await c.env.DB.prepare(
+    `SELECT id, name, description, connection_method, webcam_index
+     FROM cameras
+     WHERE user_id = ?
+     ORDER BY id ASC`
+  )
+    .bind(user.id)
+    .all();
+  const resolvedChatCamera = resolveChatCameraReferenceFromRows(
+    (cameraResolutionRows.results || []) as any[],
+    body.content,
+    body.camera_id
+  );
+  const resolvedChatCameraId = resolvedChatCamera.cameraId;
+  const resolvedChatCameraIdsText =
+    resolvedChatCamera.cameraIds.length > 0
+      ? resolvedChatCamera.cameraIds.map((id) => String(id)).join(",")
+      : null;
 
   const now = new Date().toISOString();
 
@@ -53914,33 +56203,46 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
     }
   }
 
-  // Store user message with video metadata
-  const videoMetadata = body.uploaded_video_id ? JSON.stringify({
-    uploaded_video_id: body.uploaded_video_id,
-    uploaded_video_url: uploadedVideoUrl,
-    uploaded_video_original_name: uploadedVideoOriginalName,
-    uploaded_video_mime_type: uploadedVideoMimeType,
-    uploaded_video_size_bytes: uploadedVideoSizeBytes,
-    uploaded_video_thumbnail_filename: uploadedVideoThumbnailFilename,
-    uploaded_video_thumbnail_url: uploadedVideoThumbnailUrl,
-    uploaded_video_thumbnail_width: uploadedVideoThumbnailWidth,
-    uploaded_video_thumbnail_height: uploadedVideoThumbnailHeight,
-    uploaded_video_duration_seconds: uploadedVideoDurationSeconds,
-    uploaded_video_preview_frame_seconds: uploadedVideoPreviewFrameSeconds,
-  }) : null;
+  const userCameraSelectionMetadata: Record<string, unknown> = {};
+  if (body.uploaded_video_id) {
+    Object.assign(userCameraSelectionMetadata, {
+      uploaded_video_id: body.uploaded_video_id,
+      uploaded_video_url: uploadedVideoUrl,
+      uploaded_video_original_name: uploadedVideoOriginalName,
+      uploaded_video_mime_type: uploadedVideoMimeType,
+      uploaded_video_size_bytes: uploadedVideoSizeBytes,
+      uploaded_video_thumbnail_filename: uploadedVideoThumbnailFilename,
+      uploaded_video_thumbnail_url: uploadedVideoThumbnailUrl,
+      uploaded_video_thumbnail_width: uploadedVideoThumbnailWidth,
+      uploaded_video_thumbnail_height: uploadedVideoThumbnailHeight,
+      uploaded_video_duration_seconds: uploadedVideoDurationSeconds,
+      uploaded_video_preview_frame_seconds: uploadedVideoPreviewFrameSeconds,
+    });
+  }
+  if (resolvedChatCameraId) {
+    userCameraSelectionMetadata.resolved_camera = {
+      id: resolvedChatCameraId,
+      name: resolvedChatCamera.cameraName,
+    };
+    userCameraSelectionMetadata.camera_selection = resolvedChatCamera.cameraSelection;
+  }
+  const userCameraSelectionJson =
+    Object.keys(userCameraSelectionMetadata).length > 0
+      ? JSON.stringify(userCameraSelectionMetadata)
+      : null;
 
   const userMessageInsert = await c.env.DB.prepare(
     `INSERT INTO chat_messages (user_id, session_id, role, content, camera_ids, tokens_used, message_type, uploaded_image_base64, camera_selection_json, created_at, updated_at)
      VALUES (?, ?, 'user', ?, ?, 0, 'final', ?, ?, ?, ?)`
   )
     .bind(
-      user.id, 
-      sessionId, 
-      body.content, 
-      body.camera_id ? String(body.camera_id) : null, 
+      user.id,
+      sessionId,
+      body.content,
+      resolvedChatCameraIdsText,
       body.uploaded_image_base64 || null,
-      videoMetadata,
-      now, 
+      userCameraSelectionJson,
+      now,
       now
     )
     .run();
@@ -54086,11 +56388,14 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
 
   // Create command for EXE to process with chat_session_id
   const chatQueryPayload = {
-    query: body.content,
-    chat_session_id: parseInt(sessionId),
-    chat_mode: "v2",
-    camera_id: body.camera_id || null,
-    app_language: appLanguage,
+	    query: body.content,
+	    chat_session_id: parseInt(sessionId),
+	    chat_mode: "v2",
+	    camera_id: resolvedChatCameraId,
+	    camera_ids: resolvedChatCamera.cameraIds,
+	    camera_name: resolvedChatCamera.cameraName,
+	    camera_selection: resolvedChatCamera.cameraSelection,
+	    app_language: appLanguage,
     query_language: queryLanguage,
     query_language_source: queryLanguageSource,
     prefer_identity_recall: preferIdentityRecall,
@@ -54149,9 +56454,9 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
      VALUES (?, ?, ?, ?, 'pending', ?, ?)`
   )
     .bind(
-      user.id,
-      null,
-      commandType,
+	      user.id,
+	      resolvedChatCameraId,
+	      commandType,
       JSON.stringify(chatQueryPayload),
       now,
       now
@@ -61413,11 +63718,10 @@ app.post("/api/agent/events", async (c) => {
     }
   } catch (relayError) {
     console.error("[SHARED JOB] Failed to relay owner event to operator", {
-      userId,
       eventType,
-      cameraId,
-      correlationIds,
-      error: relayError,
+      camera_id_present: Number.isInteger(Number(cameraId)) && Number(cameraId) > 0,
+      correlation_ids_present: Boolean(correlationIds && Object.keys(correlationIds).length > 0),
+      error: relayError instanceof Error ? relayError.message : normalizeText(relayError),
     });
     return c.json({ error: "Failed to relay shared job event to the operator." }, 500);
   }
@@ -62880,9 +65184,9 @@ app.post("/api/agent/events", async (c) => {
     });
   }
 
-  if (eventType === "camera_start_blocked" && cameraId) {
-    const cameraName = await readNotificationCameraName();
-    const device = readTrimmedString(detailsObject.device).toUpperCase() || "CPU/GPU";
+	  if (eventType === "camera_start_blocked" && cameraId) {
+	    const cameraName = await readNotificationCameraName();
+	    const device = readTrimmedString(detailsObject.device).toUpperCase() || "CPU/GPU";
     const title = cameraName ? `Camera Start Blocked - ${cameraName}` : "Camera Start Blocked";
     const notificationMessage =
       readTrimmedString(message) ||
@@ -62894,6 +65198,33 @@ app.post("/api/agent/events", async (c) => {
       type: "camera_start_blocked",
       title,
       message: notificationMessage,
+    });
+  }
+
+  if (eventType === "job_alert_triggered") {
+    const { jobId, jobName, hasJobId } = readJobNotificationContext();
+    const title = jobName ? `Job Alert: ${jobName}` : "Job Alert";
+    const fallbackMessage = jobName
+      ? `Job "${jobName}" triggered an alert.`
+      : hasJobId
+      ? `Job #${jobId} triggered an alert.`
+      : "A job triggered an alert.";
+    const notificationMessage =
+      readTrimmedString(
+        message,
+        detailsObject.answer,
+        detailsObject.summary,
+        detailsObject.alert_summary,
+        detailsObject.alertSummary
+      ) || fallbackMessage;
+
+    await insertBellNotification({
+      type: "job_alert_triggered",
+      title,
+      message: notificationMessage,
+      imageKey,
+      videoKey,
+      mediaType,
     });
   }
 
@@ -65877,11 +68208,16 @@ app.get("/api/agent/commands", async (c) => {
          OR TRIM(target_exe_id) = ''
          OR target_exe_id = ?
        )
+       AND (
+         not_before_utc IS NULL
+         OR TRIM(not_before_utc) = ''
+         OR not_before_utc <= ?
+       )
        AND (status IS NULL OR status = 'pending')
      ORDER BY created_at ASC
      LIMIT 20`
   )
-    .bind(userId, clientId, exeId)
+    .bind(userId, clientId, exeId, lastSeenTs)
     .all();
 
   if (!results || results.length === 0) {
@@ -65909,6 +68245,36 @@ app.get("/api/agent/commands", async (c) => {
         : null;
     jobRuntimeStatusCache.set(jobId, status);
     return status;
+  };
+
+  const loadJobRunStatus = async (jobId: number, jobRunId: string | null): Promise<string | null> => {
+    if (!Number.isInteger(jobId) || jobId <= 0) return null;
+    const row = jobRunId
+      ? await c.env.DB.prepare(
+          `SELECT status
+           FROM job_runs
+           WHERE job_id = ?
+             AND user_id = ?
+             AND job_run_id = ?
+           LIMIT 1`
+        )
+          .bind(jobId, userId, jobRunId)
+          .first()
+      : await c.env.DB.prepare(
+          `SELECT status
+           FROM job_runs
+           WHERE job_id = ?
+             AND user_id = ?
+             AND status = 'running'
+           ORDER BY updated_at DESC
+           LIMIT 1`
+        )
+          .bind(jobId, userId)
+          .first();
+
+    return typeof (row as any)?.status === "string" && (row as any).status.trim()
+      ? String((row as any).status).trim().toLowerCase()
+      : null;
   };
 
   const commands: Array<{
@@ -65945,7 +68311,14 @@ app.get("/api/agent/commands", async (c) => {
         jobId = parsedJobId;
         const runtimeStatus = await loadJobRuntimeStatus(parsedJobId);
         if (runtimeStatus === "stopping" || runtimeStatus === "stopped") {
-          ignoreReason = `job_runtime_${runtimeStatus}`;
+          const commandJobRunId =
+            normalizeText(row.job_run_id) ||
+            normalizeText(payload?.job_run_id) ||
+            normalizeText(payload?.jobRunId);
+          const jobRunStatus = await loadJobRunStatus(parsedJobId, commandJobRunId || null);
+          if (jobRunStatus !== "running") {
+            ignoreReason = `job_runtime_${runtimeStatus}`;
+          }
         }
       }
 
@@ -66164,6 +68537,492 @@ app.post("/api/agent/commands/:commandId/result", async (c) => {
     .run();
 
   const commandType = String((existingCommand as any)?.command_type || "");
+	  if (commandType === "start_camera") {
+    const payload = parseJsonObject((existingCommand as any)?.payload);
+    const resultObject =
+      body.result && typeof body.result === "object" && !Array.isArray(body.result)
+        ? (body.result as Record<string, unknown>)
+        : {};
+    const resolvedCameraId = Number(
+      (existingCommand as any)?.camera_id ??
+        payload.camera_id ??
+        resultObject.camera_id ??
+        0
+    );
+    const cameraSessionId =
+      normalizeText(payload.camera_session_id) ||
+      normalizeText(resultObject.camera_session_id);
+    const wasRunningBefore =
+      payload.was_service_running_before === true ||
+      payload.was_service_running_before === 1 ||
+      payload.was_service_running_before === "1" ||
+      payload.was_service_running_before === "true";
+    const startContract = evaluateLinuxCameraStartResult(
+      normalizedStatus,
+      resultObject,
+      body.error
+    );
+    const resultError = startContract.errorMessage;
+    const resultDetails = sanitizeReportValue({
+      command_id: commandId,
+      command_type: commandType,
+      camera_session_id: cameraSessionId || null,
+      status: normalizedStatus,
+      error_code: resultObject.error_code || (startContract.failed ? startContract.errorCode : null),
+      error: resultError || null,
+      started: startContract.started,
+      first_frame_captured: startContract.firstFrameCaptured,
+      result: resultObject,
+    }) as Record<string, unknown>;
+
+    if (Number.isInteger(resolvedCameraId) && resolvedCameraId > 0) {
+      if (!startContract.failed) {
+        await c.env.DB.prepare(
+          `UPDATE cameras
+           SET is_service_running = 1,
+               is_online = 1,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND user_id = ?`
+        )
+          .bind(resolvedCameraId, userId)
+          .run();
+        if (cameraSessionId) {
+          await c.env.DB.prepare(
+            `UPDATE camera_runtime_sessions
+             SET status = 'online',
+                 started_at = COALESCE(started_at, ?),
+                 online_at = COALESCE(online_at, ?),
+                 last_event_at = ?,
+                 updated_at = ?
+             WHERE camera_session_id = ?
+               AND user_id = ?`
+          )
+            .bind(now, now, now, now, cameraSessionId, userId)
+            .run();
+        }
+        await c.env.DB.prepare(
+          `INSERT INTO events (user_id, camera_id, event_type, message, details_json, is_unread, created_at, updated_at)
+           VALUES (?, ?, 'camera_started', ?, ?, 0, ?, ?)`
+        )
+          .bind(
+            userId,
+            resolvedCameraId,
+            "Camera started by Linux agent.",
+            JSON.stringify(resultDetails),
+            now,
+            now
+          )
+          .run();
+      } else {
+        await persistImmediateCameraStartFailureState(c.env.DB, userId, {
+          cameraId: resolvedCameraId,
+          cameraSessionId: cameraSessionId || null,
+          wasRunningBefore,
+          status: "failed",
+          nowIso: now,
+        });
+        await c.env.DB.prepare(
+          `INSERT INTO events (user_id, camera_id, event_type, message, details_json, is_unread, created_at, updated_at)
+           VALUES (?, ?, 'camera_connection_failed', ?, ?, 1, ?, ?)`
+        )
+          .bind(
+            userId,
+            resolvedCameraId,
+            resultError || "Linux agent failed to start the camera.",
+            JSON.stringify(resultDetails),
+            now,
+            now
+          )
+          .run();
+      }
+	    }
+	  }
+  if (commandType === "job_start") {
+    const payload = parseJsonObject((existingCommand as any)?.payload);
+    const resultObject =
+      body.result && typeof body.result === "object" && !Array.isArray(body.result)
+        ? (body.result as Record<string, unknown>)
+        : {};
+    const resultStatus = normalizeText(resultObject.status).toLowerCase();
+    const isLinuxOneShotJobResult =
+      normalizeText(resultObject.command) === "job_start" &&
+      (Boolean(resultObject.inference) ||
+        Boolean(resultObject.camera_artifacts) ||
+        Boolean(resultObject.jobs_inference_temp_root));
+    const shouldFinalizeLinuxJob =
+      normalizedStatus === "failed" ||
+      (normalizedStatus === "completed" &&
+        isLinuxOneShotJobResult &&
+        (!resultStatus || resultStatus === "completed" || resultStatus === "failed"));
+
+    if (shouldFinalizeLinuxJob) {
+      const payloadJob =
+        payload?.job && typeof payload.job === "object" && !Array.isArray(payload.job)
+          ? (payload.job as Record<string, unknown>)
+          : {};
+      const jobId = clampInteger(resultObject.job_id ?? payloadJob.id ?? payload.job_id);
+      const jobName =
+        normalizeText(resultObject.job_name) ||
+        normalizeText(payloadJob.name) ||
+        (jobId > 0 ? `Job #${jobId}` : "Job");
+      const jobRunId =
+        normalizeText(resultObject.job_run_id) ||
+        normalizeText((existingCommand as any)?.job_run_id) ||
+        normalizeText(payload.job_run_id) ||
+        normalizeText(payload.jobRunId);
+      const finalStatus =
+        normalizedStatus === "failed" || resultStatus === "failed" ? "failed" : "completed";
+      const eventType = finalStatus === "failed" ? "job_failed" : "job_completed";
+      const finalMessage =
+        finalStatus === "failed"
+          ? `Job "${jobName}" failed in the Linux runtime.`
+          : `Job "${jobName}" completed in the Linux runtime.`;
+      const lifecycleDetails = sanitizeReportValue({
+        ...resultObject,
+        job_id: jobId > 0 ? jobId : undefined,
+        job_name: jobName,
+        job_run_id: jobRunId || undefined,
+        command_id: commandId,
+        linux_one_shot_job: true,
+        error: typeof body.error === "string" ? body.error : undefined,
+      }) as Record<string, unknown>;
+      const externalEventId =
+        `linux_job_${jobRunId || commandId}_command_${commandId}_${eventType}`.slice(0, 160);
+
+      const triggerType = normalizeText(
+        (payload.trigger && typeof payload.trigger === "object"
+          ? (payload.trigger as Record<string, unknown>).trigger_type
+          : "") ||
+          payload.trigger_type ||
+          resultObject.trigger_type
+      ).toLowerCase();
+      const isContinuousLinuxJobCycle =
+        finalStatus === "completed" &&
+        isLinuxOneShotJobResult &&
+        (triggerType === "manual" || triggerType === "schedule");
+      let runtimeStatus = "";
+      let jobRunStatus = "";
+      if (isContinuousLinuxJobCycle && jobId > 0) {
+        const runtimeState = await c.env.DB.prepare(
+          `SELECT status FROM job_runtime_states WHERE job_id = ? AND user_id = ? LIMIT 1`
+        )
+          .bind(jobId, userId)
+          .first();
+        runtimeStatus = normalizeText((runtimeState as any)?.status).toLowerCase();
+      }
+      if (isContinuousLinuxJobCycle && jobId > 0 && jobRunId) {
+        const runningJobRun = await c.env.DB.prepare(
+          `SELECT status
+           FROM job_runs
+           WHERE job_id = ?
+             AND user_id = ?
+             AND job_run_id = ?
+           LIMIT 1`
+        )
+          .bind(jobId, userId, jobRunId)
+          .first();
+        jobRunStatus = normalizeText((runningJobRun as any)?.status).toLowerCase();
+      }
+
+      const readRunEveryCandidates = (value: unknown, output: number[], depth = 0) => {
+        if (depth > 5 || value === null || value === undefined) return;
+        if (typeof value !== "object") return;
+        if (Array.isArray(value)) {
+          for (const entry of value) {
+            readRunEveryCandidates(entry, output, depth + 1);
+          }
+          return;
+        }
+        const record = value as Record<string, unknown>;
+        const directRunEvery = Number(record.run_every ?? record.runEvery);
+        if (Number.isFinite(directRunEvery) && directRunEvery > 0) {
+          output.push(directRunEvery);
+        }
+        for (const key of ["steps", "agents", "inference_groups", "inferenceGroups"]) {
+          readRunEveryCandidates(record[key], output, depth + 1);
+        }
+      };
+      const runEveryCandidates: number[] = [];
+      readRunEveryCandidates(payload, runEveryCandidates);
+      readRunEveryCandidates(resultObject, runEveryCandidates);
+      const nextCycleDelaySeconds = Math.max(
+        5,
+        Math.min(300, Math.floor(Math.min(...(runEveryCandidates.length ? runEveryCandidates : [10]))))
+      );
+      const nextCycleAt = new Date(Date.parse(now) + nextCycleDelaySeconds * 1000).toISOString();
+      const shouldKeepLinuxJobRunning =
+        isContinuousLinuxJobCycle &&
+        jobId > 0 &&
+        Boolean(jobRunId) &&
+        (runtimeStatus === "running" ||
+          runtimeStatus === "" ||
+          (jobRunStatus === "running" && runtimeStatus !== "stopping"));
+
+      if (shouldKeepLinuxJobRunning) {
+        await c.env.DB.prepare(
+          `INSERT INTO job_runtime_states (
+             job_id,
+             user_id,
+             job_name,
+             status,
+             started_at_utc,
+             stopped_at_utc,
+             last_event_at_utc,
+             created_at,
+             updated_at
+           ) VALUES (?, ?, ?, 'running', ?, NULL, ?, ?, ?)
+           ON CONFLICT(job_id) DO UPDATE SET
+             status = 'running',
+             job_name = COALESCE(excluded.job_name, job_runtime_states.job_name),
+             stopped_at_utc = NULL,
+             last_event_at_utc = excluded.last_event_at_utc,
+             updated_at = excluded.updated_at`
+        )
+          .bind(jobId, userId, jobName, now, now, now, now)
+          .run();
+
+        await c.env.DB.prepare(
+          `UPDATE job_runs
+           SET status = 'running',
+               completed_at_utc = NULL,
+               failed_at_utc = NULL,
+               last_event_at_utc = ?,
+               updated_at = ?
+           WHERE job_run_id = ? AND user_id = ?`
+        )
+          .bind(now, now, jobRunId, userId)
+          .run();
+
+        const pendingCycle = await c.env.DB.prepare(
+          `SELECT id
+           FROM commands
+           WHERE user_id = ?
+             AND command_type = 'job_start'
+             AND job_run_id = ?
+             AND (status IS NULL OR status IN ('pending', 'sent'))
+           LIMIT 1`
+        )
+          .bind(userId, jobRunId)
+          .first();
+
+        if (!pendingCycle) {
+          await c.env.DB.prepare(
+            `INSERT INTO commands (
+               user_id,
+               camera_id,
+               command_type,
+               payload,
+               status,
+               created_at,
+               updated_at,
+               job_run_id,
+               not_before_utc,
+               target_client_id,
+               target_exe_id,
+               execution_domain,
+               remote_owner_public_id,
+               shared_segment_id
+             )
+             VALUES (?, NULL, 'job_start', ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+            .bind(
+              userId,
+              JSON.stringify(payload),
+              now,
+              now,
+              jobRunId,
+              nextCycleAt,
+              normalizeText((existingCommand as any)?.target_client_id) || null,
+              normalizeText((existingCommand as any)?.target_exe_id) || null,
+              normalizeText((existingCommand as any)?.execution_domain) || "local",
+              normalizeText((existingCommand as any)?.remote_owner_public_id) || null,
+              normalizeText((existingCommand as any)?.shared_segment_id) || null
+            )
+            .run();
+        }
+
+        console.log(
+          `[LINUX JOB] Completed one inference cycle for running job ${jobId}; next cycle at ${nextCycleAt}`
+        );
+      } else {
+      if (jobId > 0) {
+        await c.env.DB.prepare(
+          `INSERT INTO job_runtime_states (
+             job_id,
+             user_id,
+             job_name,
+             status,
+             stopped_at_utc,
+             last_event_at_utc,
+             created_at,
+             updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(job_id) DO UPDATE SET
+             status = excluded.status,
+             job_name = COALESCE(excluded.job_name, job_runtime_states.job_name),
+             stopped_at_utc = excluded.stopped_at_utc,
+             last_event_at_utc = excluded.last_event_at_utc,
+             updated_at = excluded.updated_at`
+        )
+          .bind(jobId, userId, jobName, finalStatus, now, now, now, now)
+          .run();
+      }
+
+      if (jobRunId) {
+        await c.env.DB.prepare(
+          `UPDATE job_runs
+           SET status = ?,
+               completed_at_utc = CASE WHEN ? = 'completed' THEN ? ELSE completed_at_utc END,
+               failed_at_utc = CASE WHEN ? = 'failed' THEN ? ELSE failed_at_utc END,
+               last_event_at_utc = ?,
+               updated_at = ?
+           WHERE job_run_id = ? AND user_id = ?`
+        )
+          .bind(finalStatus, finalStatus, now, finalStatus, now, now, now, jobRunId, userId)
+          .run();
+      }
+
+      const existingLifecycleEvent = await c.env.DB.prepare(
+        `SELECT id FROM events WHERE external_event_id = ? LIMIT 1`
+      )
+        .bind(externalEventId)
+        .first();
+      if (!existingLifecycleEvent) {
+        const eventResult = await c.env.DB.prepare(
+          `INSERT INTO events (
+             user_id,
+             camera_id,
+             event_type,
+             message,
+             details_json,
+             is_unread,
+             created_at,
+             updated_at,
+             external_event_id,
+             job_run_id
+           ) VALUES (?, NULL, ?, ?, ?, 1, ?, ?, ?, ?)`
+        )
+          .bind(
+            userId,
+            eventType,
+            finalMessage,
+            JSON.stringify(lifecycleDetails),
+            now,
+            now,
+            externalEventId,
+            jobRunId || null
+          )
+          .run();
+        const eventDbId = Number((eventResult as any)?.meta?.last_row_id || 0);
+        if (eventDbId > 0) {
+          const correlationIds = extractOperationalCorrelationIds({
+            externalEventId,
+            jobRunId,
+            details: lifecycleDetails,
+            fallbackExternalEventId: externalEventId,
+          });
+          await persistStructuredAgentEvent({
+            db: c.env.DB,
+            userId,
+            eventDbId,
+            eventType,
+            cameraId: null,
+            message: finalMessage,
+            details: lifecycleDetails,
+            correlationIds,
+            nowIso: now,
+          });
+        }
+      }
+      }
+    }
+  }
+	  if (commandType === "orchestrator_query" && normalizedStatus === "failed") {
+    const payload = parseJsonObject((existingCommand as any)?.payload);
+    const chatSessionId = Number(payload?.chat_session_id || payload?.chatSessionId || 0);
+    if (Number.isInteger(chatSessionId) && chatSessionId > 0) {
+      const languageRow = await c.env.DB
+        .prepare("SELECT language FROM user_preferences WHERE user_id = ? LIMIT 1")
+        .bind(userId)
+        .first();
+      const resultObject =
+        body.result && typeof body.result === "object" && !Array.isArray(body.result)
+          ? (body.result as Record<string, unknown>)
+          : {};
+      const rawError =
+        normalizeText(body.error) ||
+        normalizeText(resultObject.error) ||
+        normalizeText(resultObject.error_code) ||
+        "agent_command_failed";
+      const language = normalizeSupportedChatLanguage(
+        normalizeText(payload.reply_language) ||
+          normalizeText(payload.language) ||
+          normalizeText(payload.query_language) ||
+          (languageRow as any)?.language ||
+          "en",
+        "en"
+      );
+      const failureMessage = (() => {
+        if (rawError === "missing_camera_id") {
+          if (language.startsWith("pt")) {
+            return "Nao consegui identificar a camera mencionada. Selecione a camera ou escreva o nome exatamente como aparece na lista de cameras.";
+          }
+          if (language.startsWith("es")) {
+            return "No pude identificar la camara mencionada. Selecciona la camara o escribe el nombre exactamente como aparece en la lista.";
+          }
+          return "I could not identify the mentioned camera. Select the camera or type its name exactly as it appears in the camera list.";
+        }
+        if (language.startsWith("pt")) {
+          return `A consulta falhou no agente Linux: ${rawError}.`;
+        }
+        if (language.startsWith("es")) {
+          return `La consulta fallo en el agente Linux: ${rawError}.`;
+        }
+        return `The query failed in the Linux agent: ${rawError}.`;
+      })();
+
+      const pendingMessage = await c.env.DB
+        .prepare(
+          `SELECT id
+           FROM chat_messages
+           WHERE user_id = ? AND session_id = ? AND role = 'assistant' AND is_pending = 1
+           ORDER BY id DESC
+           LIMIT 1`
+        )
+        .bind(userId, chatSessionId)
+        .first();
+
+      if (pendingMessage) {
+        await c.env.DB
+          .prepare(
+            `UPDATE chat_messages
+             SET content = ?,
+                 message_type = 'final',
+                 is_pending = 0,
+                 progress_json = NULL,
+                 updated_at = ?
+             WHERE id = ?`
+          )
+          .bind(failureMessage, now, Number((pendingMessage as any).id || 0))
+          .run();
+
+        await c.env.DB
+          .prepare(`UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+          .bind(chatSessionId)
+          .run();
+
+        const { results } = await c.env.DB
+          .prepare("SELECT * FROM chat_messages WHERE user_id = ? AND session_id = ? ORDER BY id ASC")
+          .bind(userId, chatSessionId)
+          .all();
+
+        wsHandler.broadcast(chatSessionId, {
+          type: "message_update",
+          messages: results,
+        });
+      }
+    }
+  }
   if (commandType === "chat_identity_upsert" && normalizedStatus === "failed") {
     let payload: Record<string, unknown> | null = null;
     try {
@@ -66304,9 +69163,9 @@ app.post("/api/agent/commands/:commandId/result", async (c) => {
         });
       } catch (relayError) {
         console.error("[SHARED JOB] Failed to relay command result to operator", {
-          commandId,
-          sharedSegmentId,
-          error: relayError,
+          command_id_present: Number.isInteger(Number(commandId)) && Number(commandId) > 0,
+          shared_segment_id_present: Boolean(normalizeText(sharedSegmentId)),
+          error: relayError instanceof Error ? relayError.message : normalizeText(relayError),
         });
       }
     }
@@ -66416,7 +69275,11 @@ app.delete("/api/hub/items/:itemId", async (c) => {
     ) {
       let centralContext: CentralUserRelayContext;
       try {
-        centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+        centralContext = await resolveCurrentUserCentralRelayContext(
+          c.env,
+          user,
+          resolveRequestEffectiveBrandId(c)
+        );
       } catch (error: unknown) {
         return c.json(
           {
@@ -66677,7 +69540,11 @@ app.post("/api/hub/cache/sync", anyAuthMiddleware, async (c) => {
       let payload: { items: Array<Record<string, unknown>>; next_cursor: string | null; has_more: boolean };
 
       if (isCentralIdentityClientConfigured(c.env) && !isCentralIdentityServerConfigured(c.env)) {
-        const relayContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+        const relayContext = await resolveCurrentUserCentralRelayContext(
+          c.env,
+          user,
+          resolveRequestEffectiveBrandId(c)
+        );
         const syncUrl = new URL("/api/hub/sync", buildCentralIdentityEndpointUrl(c.env, "/"));
         if (cursor) syncUrl.searchParams.set("cursor", cursor);
         if (itemType) syncUrl.searchParams.set("type", itemType);
@@ -66814,7 +69681,11 @@ app.post("/api/hub/agents/publish-from-camera/:algorithmId", anyAuthMiddleware, 
 
   if (isCentralIdentityClientConfigured(c.env) && !isCentralIdentityServerConfigured(c.env)) {
     try {
-      const relayContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+      const relayContext = await resolveCurrentUserCentralRelayContext(
+        c.env,
+        user,
+        resolveRequestEffectiveBrandId(c)
+      );
       const remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/hub/items", {
         method: "POST",
         token: relayContext.grantToken,
@@ -66928,7 +69799,11 @@ app.post("/api/hub/tasks/publish-from-job/:jobId", anyAuthMiddleware, async (c) 
 
   if (isCentralIdentityClientConfigured(c.env) && !isCentralIdentityServerConfigured(c.env)) {
     try {
-      const relayContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+      const relayContext = await resolveCurrentUserCentralRelayContext(
+        c.env,
+        user,
+        resolveRequestEffectiveBrandId(c)
+      );
       const remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/hub/items", {
         method: "POST",
         token: relayContext.grantToken,
@@ -76230,6 +79105,8 @@ app.post("/api/job-steps/:stepId/agents/enhance-prompt", anyAuthMiddleware, asyn
   const alertCondition = typeof body.alert_condition === "string" ? body.alert_condition.trim() : "";
   const negativeCondition =
     typeof body.negative_condition === "string" ? body.negative_condition.trim() : "";
+  const requestedLanguage =
+    normalizeAgentDesignText(body.language, 32) || PROMPT_ENHANCER_LANGUAGE_STRATEGY;
   const analysisRegionsRaw = body.analysis_regions;
 
   if (!promptTemplate) {
@@ -76322,7 +79199,7 @@ app.post("/api/job-steps/:stepId/agents/enhance-prompt", anyAuthMiddleware, asyn
     prompt_core: promptTemplate,
     alert_condition: alertCondition,
     negative_condition: negativeCondition,
-    user_language: PROMPT_ENHANCER_LANGUAGE_STRATEGY,
+    user_language: requestedLanguage,
     model_name: "gpt-5.1",
     model_api_key: modelApiKey,
     analysis_regions: enhanceAnalysisRegions,
