@@ -1,8 +1,22 @@
+import fs from "fs";
+import os from "os";
 import path from "path";
 import dotenv from "dotenv";
 
 type RuntimeProfile = "local" | "server";
 type ProfileMode = RuntimeProfile | "auto";
+
+const initialEnvValues = new Map(
+  Object.entries(process.env).filter(([, value]) => value !== undefined) as Array<[string, string]>
+);
+
+const centralAuthClientKeys = new Set([
+  "CENTRAL_AUTH_BASE_URL",
+  "CENTRAL_AUTH_PUBLIC_KEY",
+  "CENTRAL_AUTH_PUBLIC_KEY_PATH",
+  "CENTRAL_AUTH_GRANT_TTL_HOURS",
+  "CENTRAL_AUTH_KEY_ID",
+]);
 
 function normalizeProfile(value: string | undefined): ProfileMode | null {
   if (!value) return null;
@@ -21,6 +35,96 @@ function loadIfExists(filePath: string) {
     throw result.error;
   }
   return true;
+}
+
+function normalizeText(value: string | undefined): string {
+  return (value || "").trim();
+}
+
+function hasInitialNonBlankEnvValue(key: string): boolean {
+  return normalizeText(initialEnvValues.get(key)).length > 0;
+}
+
+function loadParsedEnvFile(
+  filePath: string,
+  options: {
+    allowedKeys?: Set<string>;
+    overrideLoadedValues?: boolean;
+  } = {}
+) {
+  if (!fs.existsSync(filePath)) {
+    return false;
+  }
+
+  const parsed = dotenv.parse(fs.readFileSync(filePath, "utf8"));
+  for (const [key, value] of Object.entries(parsed)) {
+    if (options.allowedKeys && !options.allowedKeys.has(key)) {
+      continue;
+    }
+    if (hasInitialNonBlankEnvValue(key)) {
+      continue;
+    }
+
+    const currentValue = process.env[key];
+    if (options.overrideLoadedValues || normalizeText(currentValue).length === 0) {
+      process.env[key] = value;
+    }
+  }
+
+  return true;
+}
+
+function resolveUserPerceptrumConfigPath(fileName: string): string | null {
+  const home = os.homedir();
+  if (!home) {
+    return null;
+  }
+
+  if (process.platform === "win32") {
+    const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
+    return path.join(appData, "Perceptrum", fileName);
+  }
+
+  if (process.platform === "darwin") {
+    return path.join(home, "Library", "Application Support", "Perceptrum", fileName);
+  }
+
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME || path.join(home, ".config");
+  return path.join(xdgConfigHome, "Perceptrum", fileName);
+}
+
+function loadCentralAuthClientEnv(runtimeProfile: RuntimeProfile) {
+  if (runtimeProfile !== "local") {
+    return;
+  }
+
+  const explicitPath = normalizeText(process.env.CENTRAL_AUTH_CLIENT_ENV_FILE);
+  const runtimeConfigPath = normalizeText(process.env.APP_RUNTIME_CONFIG_ROOT)
+    ? path.join(process.env.APP_RUNTIME_CONFIG_ROOT as string, "central-auth-client.env")
+    : "";
+  const userConfigPath = resolveUserPerceptrumConfigPath("central-auth-client.env") || "";
+  const systemConfigPath = "/etc/perceptrum/central-auth-client.env";
+
+  const candidates = explicitPath
+    ? [explicitPath]
+    : [runtimeConfigPath, userConfigPath, systemConfigPath].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const resolved = path.resolve(candidate);
+    if (
+      loadParsedEnvFile(resolved, {
+        allowedKeys: centralAuthClientKeys,
+        overrideLoadedValues: true,
+      })
+    ) {
+      console.log(`[env] Loaded central identity client config: ${resolved}`);
+      return;
+    }
+  }
+
+  if (explicitPath) {
+    console.warn(`[env] CENTRAL_AUTH_CLIENT_ENV_FILE was set but not found: ${path.resolve(explicitPath)}`);
+  }
 }
 
 function detectProfile(): RuntimeProfile {
@@ -45,6 +149,7 @@ export function loadEnv() {
 
   process.env.APP_RUNTIME_ENV = runtimeProfile;
   dotenv.config();
+  loadCentralAuthClientEnv(runtimeProfile);
 
   if (process.env.ENV_PROFILE && !requestedProfile) {
     console.warn(

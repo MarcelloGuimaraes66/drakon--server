@@ -175,6 +175,57 @@ perceptrum-desktop --check-backend --print-web-root --no-open
 perceptrum-desktop
 ```
 
+## Configurar identidade central para workspace remoto
+
+O erro `Central identity server is not configured.` significa que o desktop local nao sabe qual servidor central deve usar para contas compartilhadas/workspace remoto. No Ubuntu, configure o cliente local com a URL do servidor central e a chave publica dele.
+
+Crie o arquivo:
+
+```bash
+mkdir -p ~/.config/Perceptrum
+nano ~/.config/Perceptrum/central-auth-client.env
+```
+
+Conteudo exemplo:
+
+```bash
+CENTRAL_AUTH_BASE_URL=https://auth.seu-dominio.com
+CENTRAL_AUTH_PUBLIC_KEY_PATH=/home/SEU_USUARIO/.config/Perceptrum/central-auth-public.pem
+CENTRAL_AUTH_GRANT_TTL_HOURS=72
+CENTRAL_AUTH_KEY_ID=central-auth-v1
+```
+
+Copie a chave publica do servidor central para o caminho indicado:
+
+```bash
+cp /caminho/central-auth-public.pem ~/.config/Perceptrum/central-auth-public.pem
+chmod 600 ~/.config/Perceptrum/central-auth-client.env ~/.config/Perceptrum/central-auth-public.pem
+```
+
+Depois feche e abra novamente o desktop:
+
+```bash
+perceptrum-desktop --check-backend --print-web-root --no-open
+perceptrum-desktop
+```
+
+Se quiser usar outro caminho de arquivo, exporte:
+
+```bash
+export CENTRAL_AUTH_CLIENT_ENV_FILE=/caminho/central-auth-client.env
+perceptrum-desktop
+```
+
+Nao coloque `CENTRAL_AUTH_PRIVATE_KEY` no desktop. A chave privada fica apenas no servidor central.
+
+Tambem existe um script para evitar erro manual:
+
+```bash
+./Perceptrum/linux-desktop/configure-central-auth-client.sh \
+  --base-url https://auth.seu-dominio.com \
+  --public-key /caminho/central-auth-public.pem
+```
+
 Comando final para diagnostico rapido de camera depois de abrir o app:
 
 ```bash

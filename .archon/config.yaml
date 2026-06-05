@@ -1,0 +1,8 @@
+assistant: codex
+
+assistants:
+  codex:
+    codexBinaryPath: /home/marcello-guimaraes/.npm-global/bin/codex
+    model: gpt-5.5
+    modelReasoningEffort: high
+    webSearchMode: live
