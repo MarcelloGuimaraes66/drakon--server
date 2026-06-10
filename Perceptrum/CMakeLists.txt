@@ -226,8 +226,29 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../brand.config.json")
             "$<TARGET_FILE_DIR:perceptrum-desktop>/brand.config.json")
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../brand.txt")
+    add_custom_command(TARGET perceptrum-agent POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../brand.txt"
+            "$<TARGET_FILE_DIR:perceptrum-agent>/brand.txt")
+    add_custom_command(TARGET perceptrum-desktop POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../brand.txt"
+            "$<TARGET_FILE_DIR:perceptrum-desktop>/brand.txt")
+endif()
+
 install(TARGETS perceptrum-agent perceptrum-desktop
     RUNTIME DESTINATION "${PERCEPTRUM_INSTALL_BINDIR}")
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../brand.config.json")
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../brand.config.json"
+        DESTINATION "${PERCEPTRUM_INSTALL_BINDIR}")
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../brand.txt")
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../brand.txt"
+        DESTINATION "${PERCEPTRUM_INSTALL_BINDIR}")
+endif()
 
 if(PERCEPTRUM_BUILD_WEB OR EXISTS "${PERCEPTRUM_WEB_DIST_DIR}/index.html")
     install(DIRECTORY "${PERCEPTRUM_WEB_DIST_DIR}/"
